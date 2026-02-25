@@ -92,6 +92,15 @@ def find_sessions_in_dir(dir_path: Path, source: str = "auto") -> List[Path]:
     return files
 
 
+def _resolve_copilot_session_path(path: Path) -> Path:
+    """Resolve a copilot session path: if directory, return events.jsonl inside it."""
+    if path.is_dir():
+        events = path / "events.jsonl"
+        if events.exists():
+            return events
+    return path
+
+
 def find_session_by_id(
     session_id: str, source: str = "auto"
 ) -> List[Tuple[Path, str]]:
@@ -117,12 +126,17 @@ def find_session_by_id(
             except (json.JSONDecodeError, OSError):
                 pass
 
-    # Copilot CLI: filename is {uuid}.jsonl
+    # Copilot CLI: {uuid}.jsonl files or {uuid}/ directories with events.jsonl
     copilot_dir = Path.home() / ".copilot" / "session-state"
     if copilot_dir.exists() and source in ("auto", "copilot"):
         for f in copilot_dir.glob("*.jsonl"):
             if session_id in f.stem:
                 results.append((f, "copilot"))
+        for d in copilot_dir.iterdir():
+            if d.is_dir() and session_id in d.name:
+                events = d / "events.jsonl"
+                if events.exists():
+                    results.append((events, "copilot"))
 
     return results
 
@@ -140,12 +154,17 @@ def find_latest_sessions(
             if source in ("auto", "codex"):
                 candidates.append((f, "codex", f.stat().st_mtime))
 
-    # Copilot CLI sessions
+    # Copilot CLI sessions (flat .jsonl files and directory-format sessions)
     copilot_dir = Path.home() / ".copilot" / "session-state"
     if copilot_dir.exists():
         for f in copilot_dir.glob("*.jsonl"):
             if source in ("auto", "copilot"):
                 candidates.append((f, "copilot", f.stat().st_mtime))
+        for d in copilot_dir.iterdir():
+            if d.is_dir() and source in ("auto", "copilot"):
+                events = d / "events.jsonl"
+                if events.exists():
+                    candidates.append((events, "copilot", events.stat().st_mtime))
 
     # Sort by mtime descending, take top N
     candidates.sort(key=lambda x: x[2], reverse=True)
@@ -232,7 +251,15 @@ def main() -> None:
 
     if args.session_file:
         p = Path(args.session_file)
-        if p.exists():
+        if p.is_dir():
+            # Directory-format session: resolve to events.jsonl inside it
+            p = _resolve_copilot_session_path(p)
+            if p.exists():
+                sessions_to_eval.append((p, args.source))
+            else:
+                print(f"Error: directory has no events.jsonl: {args.session_file}", file=sys.stderr)
+                sys.exit(1)
+        elif p.exists():
             sessions_to_eval.append((p, args.source))
         else:
             # Treat as session ID and search for it
