@@ -137,131 +137,120 @@ def _render_hexagon(
     axes: Dict[str, float],
     use_color: bool,
 ) -> List[str]:
-    """Render a 6-axis hexagonal radar chart as text lines.
+    """Render a proper 6-vertex hexagonal radar chart.
 
     Layout (clockwise from top):
-                  SNR: 82
-                    ▲
-                 ╱     ╲
-     DEPTH: 70 ╱    ●    ╲  STATE: 91
-               │         │
-     CTX: 65   ╲    ●    ╱  REACT: 78
-                 ╲     ╱
-                    ▼
-                 CONV: 85
-
-    Uses a simple coordinate approach: 6 axes at 60° intervals.
-    Each axis is normalized to 0–5 scale for grid points.
+                     SNR
+                      ▲
+                    ╱   ╲
+                  ╱       ╲
+      DEPTH:66  ●─────●─────●  STATE:100
+                │     ·     │
+                │   · ● ·   │
+                │     ·     │
+      CTX:30    ●─────●─────●  REACT:100
+                  ╲       ╱
+                    ╲   ╱
+                      ▼
+                     CONV
     """
-    # Axis order (clockwise from top): SNR, STATE, REACT, CONV, CTX, DEPTH
     axis_names = ["SNR", "STATE", "REACT", "CONV", "CTX", "DEPTH"]
     vals = {k: axes.get(k, 0) for k in axis_names}
 
-    def norm(v: float) -> int:
-        return max(0, min(5, round(v / 20)))
-
-    nv = {k: norm(v) for k, v in vals.items()}
+    CW = 54  # content width (+ "  " prefix = 56 = box W)
+    cx = CW // 2  # 27
+    HW = 9  # half-width from center to side vertices
+    lv = cx - HW  # 18  left vertex column
+    rv = cx + HW  # 36  right vertex column
 
     lines: List[str] = []
-    CW = 54  # chart area width
-    cx = CW // 2  # center x
 
-    # Row layout for hexagon (using fixed text art):
-    # The hexagon has 6 vertices. We'll build it row by row.
-    #
-    # Key positions (r=radius=6 chars):
-    #   Top:          (cx, 0)        SNR
-    #   Top-right:    (cx+10, 3)     STATE
-    #   Bot-right:    (cx+10, 9)     REACT
-    #   Bottom:       (cx, 12)       CONV
-    #   Bot-left:     (cx-10, 9)     CTX
-    #   Top-left:     (cx-10, 3)     DEPTH
-
-    R = 6  # half-height of hexagon in rows
-    HR = 10  # half-width of hexagon in cols
-
-    # Top label
-    snr_lbl = f"SNR(信噪比): {vals['SNR']:.0f}"
-    snr_vlen = _visible_len(snr_lbl)
-    snr_pad = (CW - snr_vlen) // 2
+    # ── SNR label (top, centered) ──
+    snr_lbl = f"SNR({_DIM_LABELS['SNR']}): {vals['SNR']:.0f}"
+    snr_pad = (CW - _visible_len(snr_lbl)) // 2
     lines.append("  " + " " * snr_pad + snr_lbl)
 
-    # Row 0: top vertex
+    # ── Top vertex ▲ ──
     lines.append("  " + " " * cx + "▲")
 
-    # Rows 1–5: upper sides expanding
-    for i in range(1, R):
+    # ── Upper diagonal (2 rows, expanding toward upper vertices) ──
+    diag_offsets = [3, 6]
+    for off in diag_offsets:
         row = list(" " * CW)
-        # Left edge: cx - (HR*i//R)
-        # Right edge: cx + (HR*i//R)
-        lx = cx - (HR * i // R)
-        rx = cx + (HR * i // R)
-        row[lx] = "╱"
-        row[rx] = "╲"
-        # Fill center dot based on SNR score
-        if i <= nv["SNR"]:
+        row[cx - off] = "╱"
+        row[cx + off] = "╲"
+        if vals["SNR"] >= (60 if off == 3 else 30):
             row[cx] = "·"
         lines.append("  " + "".join(row))
 
-    # Row 6: top-left and top-right vertex row (widest point, upper)
-    row = list(" " * CW)
-    lx = cx - HR
-    rx = cx + HR
-    row[lx] = "●"
-    row[rx] = "●"
-    for c in range(lx + 1, rx):
-        row[c] = "─"
-    row[cx] = "●"  # center
-    # Build with labels
+    # ── Upper vertex row: DEPTH ●─────●─────● STATE ──
+    def _vertex_row(left_label: str, right_label: str) -> str:
+        row = list(" " * CW)
+        row[lv] = "●"
+        row[rv] = "●"
+        row[cx] = "●"
+        for c in range(lv + 1, cx):
+            row[c] = "─"
+        for c in range(cx + 1, rv):
+            row[c] = "─"
+        # Overlay left label (right-justified before vertex)
+        start_l = lv - len(left_label) - 1
+        for i, ch in enumerate(left_label):
+            if 0 <= start_l + i < lv:
+                row[start_l + i] = ch
+        # Overlay right label (left-justified after vertex)
+        start_r = rv + 2
+        for i, ch in enumerate(right_label):
+            if start_r + i < CW:
+                row[start_r + i] = ch
+        return "  " + "".join(row)
+
     depth_lbl = f"DEPTH:{vals['DEPTH']:.0f}"
     state_lbl = f"STATE:{vals['STATE']:.0f}"
-    row_str = "".join(row)
-    left_part = depth_lbl + " " + row_str[len(depth_lbl) + 1 : CW - len(state_lbl) - 1] + " " + state_lbl
-    lines.append("  " + left_part)
+    lines.append(_vertex_row(depth_lbl, state_lbl))
 
-    # Rows 7–11: lower sides contracting (mirror)
-    for i in range(R - 1, 0, -1):
+    # ── Middle vertical section (3 rows with │ sides) ──
+    for m in range(3):
         row = list(" " * CW)
-        lx = cx - (HR * i // R)
-        rx = cx + (HR * i // R)
-        row[lx] = "╲"
-        row[rx] = "╱"
-        if i <= nv["CONV"]:
+        row[lv] = "│"
+        row[rv] = "│"
+        if m == 1:
+            # Center row: ● and diagonal axis hints
+            row[cx] = "●"
+            if vals["DEPTH"] >= 50:
+                row[cx - 4] = "·"
+            if vals["STATE"] >= 50:
+                row[cx + 4] = "·"
+            if vals["CTX"] >= 50:
+                row[cx - 4] = "·"
+            if vals["REACT"] >= 50:
+                row[cx + 4] = "·"
+        else:
+            # Vertical axis dot
             row[cx] = "·"
         lines.append("  " + "".join(row))
 
-    # Row 12: bottom vertex
+    # ── Lower vertex row: CTX ●─────●─────● REACT ──
+    ctx_lbl = f"CTX:{vals['CTX']:.0f}"
+    react_lbl = f"REACT:{vals['REACT']:.0f}"
+    lines.append(_vertex_row(ctx_lbl, react_lbl))
+
+    # ── Lower diagonal (2 rows, contracting toward bottom vertex) ──
+    for off in reversed(diag_offsets):
+        row = list(" " * CW)
+        row[cx - off] = "╲"
+        row[cx + off] = "╱"
+        if vals["CONV"] >= (60 if off == 3 else 30):
+            row[cx] = "·"
+        lines.append("  " + "".join(row))
+
+    # ── Bottom vertex ▼ ──
     lines.append("  " + " " * cx + "▼")
 
-    # Bottom label
-    conv_lbl = f"CONV(收斂力): {vals['CONV']:.0f}"
-    conv_vlen = _visible_len(conv_lbl)
-    conv_pad = (CW - conv_vlen) // 2
+    # ── CONV label (bottom, centered) ──
+    conv_lbl = f"CONV({_DIM_LABELS['CONV']}): {vals['CONV']:.0f}"
+    conv_pad = (CW - _visible_len(conv_lbl)) // 2
     lines.append("  " + " " * conv_pad + conv_lbl)
-
-    # Side labels (REACT on right, CTX on left) — add as annotation
-    # Insert at middle rows: the widest point ± 2
-    mid_idx = R + 1  # index of the widest row in our lines list (after top label + top vertex)
-    # Add REACT label 2 rows below widest
-    react_note = f"  REACT(反應指標): {vals['REACT']:.0f}"
-    ctx_note = f"  CTX(記憶留存): {vals['CTX']:.0f}"
-    # We'll add right-side labels at specific rows
-    # Modify rows: insert labels after the main hexagon
-    # Actually, let's add them as separate lines below for clarity
-
-    # Add dimension legend below the chart
-    lines.append("")
-    # Use fixed-width columns with CJK awareness
-    # Left column ~26 chars visible, gap, right column
-    ll1 = f"    DEPTH(推理深度): {vals['DEPTH']:3.0f}"
-    lr1 = f"STATE(狀態完整度):{vals['STATE']:3.0f}"
-    pad1 = max(1, CW - 2 - _visible_len(ll1) - _visible_len(lr1))
-    lines.append("  " + ll1 + " " * pad1 + lr1)
-
-    ll2 = f"    CTX(記憶留存)  : {vals['CTX']:3.0f}"
-    lr2 = f"REACT(反應指標)  :{vals['REACT']:3.0f}"
-    pad2 = max(1, CW - 2 - _visible_len(ll2) - _visible_len(lr2))
-    lines.append("  " + ll2 + " " * pad2 + lr2)
 
     return lines
 
