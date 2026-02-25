@@ -27,6 +27,13 @@ from lib.parser_copilot import parse_copilot_session
 from lib.scorer import score_session, SessionScore
 from lib.radar import render_radar, render_table, render_json
 from lib.html_report import render_html
+from lib.agent_analysis import (
+    prepare_analysis_prompt,
+    call_agent,
+    render_agent_html_section,
+    render_agent_terminal,
+    AgentAnalysis,
+)
 
 
 def detect_source(path: Path) -> str:
@@ -198,6 +205,16 @@ def main() -> None:
         action="store_true",
         help="Show per-turn breakdown",
     )
+    parser.add_argument(
+        "--analyze", "-a",
+        action="store_true",
+        help="Run AI agent analysis on the session (single session only)",
+    )
+    parser.add_argument(
+        "--test-agent",
+        action="store_true",
+        help="Use test agent (copilot/gpt-5-mini) instead of production chain",
+    )
 
     args = parser.parse_args()
 
@@ -243,6 +260,7 @@ def main() -> None:
 
     # Evaluate each session
     scores: List[SessionScore] = []
+    parsed_sessions: List[Session] = []
     for path, source in sessions_to_eval:
         try:
             session = parse_session(path, source)
@@ -250,6 +268,7 @@ def main() -> None:
                 continue
             sc = score_session(session)
             scores.append(sc)
+            parsed_sessions.append(session)
         except Exception as e:
             print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
             continue
@@ -259,24 +278,39 @@ def main() -> None:
         sys.exit(1)
 
     # Output
-    for sc in scores:
+    for idx, sc in enumerate(scores):
+        # Run agent analysis if requested (single session only)
+        analysis = AgentAnalysis()
+        if args.analyze and len(scores) == 1:
+            prompt = prepare_analysis_prompt(sc, parsed_sessions[idx])
+            analysis = call_agent(prompt, test_mode=args.test_agent)
+
         if args.format == "html":
-            html_content = render_html(sc)
+            # Always print terminal summary first
+            print(render_radar(sc, use_color))
+            # Print agent analysis in terminal too
+            if analysis.success:
+                print(render_agent_terminal(analysis))
+            # Then write HTML report
+            agent_html = render_agent_html_section(analysis)
+            html_content = render_html(sc, agent_section=agent_html)
             out_path = args.output
             if not out_path:
                 safe_id = (sc.session_id or "session")[:16].replace("/", "_")
                 out_path = f"session-health-{safe_id}.html"
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(html_content)
-            print(f"✓ HTML report saved to: {out_path}", file=sys.stderr)
+            print(f"\n✓ HTML report saved to: {out_path}", file=sys.stderr)
         elif args.format == "radar":
             print(render_radar(sc, use_color))
+            if analysis.success:
+                print(render_agent_terminal(analysis))
         elif args.format == "table":
             print(render_table(sc, use_color))
         elif args.format == "json":
             print(render_json(sc))
 
-        if args.verbose and args.format not in ("json", "html"):
+        if args.verbose and args.format not in ("json",):
             _print_turn_breakdown(sc, use_color)
 
         if len(scores) > 1:
@@ -290,13 +324,13 @@ def main() -> None:
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
     """Print per-turn score breakdown."""
     print(f"\n  Turn breakdown ({sc.turn_count} turns):")
-    print(f"  {'#':>4s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'COMP':>6s}")
-    print(f"  {'─'*4} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6}")
+    print(f"  {'#':>4s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'TOOL':>6s} {'COMP':>6s}")
+    print(f"  {'─'*4} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6}")
     for ts in sc.turn_scores:
         print(
             f"  {ts.index:4d} "
             f"{ts.snr:6.1f} {ts.state:6.1f} {ts.context:6.1f} "
-            f"{ts.reaction:6.1f} {ts.depth:6.1f} {ts.composite:6.1f}"
+            f"{ts.reaction:6.1f} {ts.depth:6.1f} {ts.tool_efficiency:6.1f} {ts.composite:6.1f}"
         )
 
 

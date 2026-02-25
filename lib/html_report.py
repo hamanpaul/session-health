@@ -17,7 +17,7 @@ from .scorer import SessionScore
 
 # ── Dimension metadata ──
 
-DIM_ORDER = ["SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV"]
+DIM_ORDER = ["SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"]
 
 DIM_META = {
     "SNR": {
@@ -163,6 +163,31 @@ DIM_META = {
             "poor": "Session 未能收斂，可能有 abort 或嚴重偏離目標。需要：(1) 將大任務拆分為多個 session (2) 在 system prompt 中加入 milestone 檢查點 (3) 實作 auto-recovery 機制。",
         },
     },
+    "TOOL": {
+        "name": "工具效率",
+        "en": "Tool Efficiency",
+        "icon": "🔧",
+        "color": "#26c6da",
+        "description": (
+            "衡量 Agent 對工具的使用是否高效且有成效。"
+            "包括工具呼叫的成功率、是否有冗餘重複的呼叫、"
+            "以及工具輸出是否被後續回應有效利用。"
+            "高效的工具使用代表 Prompt 成功引導模型選擇正確的工具並善用結果。"
+        ),
+        "what_measured": [
+            "工具呼叫成功率（success / total ratio）",
+            "冗餘呼叫偵測（連續相同 tool + 相同 arguments）",
+            "工具輸出利用率（output 是否被後續回應引用）",
+            "失敗後的恢復策略（是否調整參數重試）",
+        ],
+        "suggestions": {
+            "excellent": "工具使用精準高效，幾乎所有呼叫都成功且輸出被有效利用。維持現有策略。",
+            "good": "工具使用效率良好，少量失敗但能自主修正。可微調 tool selection 邏輯。",
+            "fair": "部分工具呼叫冗餘或失敗。建議：檢查是否有重複的 tool call，減少不必要的嘗試。",
+            "needs_improvement": "工具使用效率偏低。建議：(1) 減少盲目的 trial-and-error (2) 在 tool call 前先確認參數正確性 (3) 避免對同一 tool 重複相同 arguments。",
+            "poor": "工具使用混亂，大量失敗或冗餘呼叫。需要：(1) 在 system prompt 中加入 tool usage 指引 (2) 限制同一 tool 的最大連續呼叫次數 (3) 實作 tool call validation 機制。",
+        },
+    },
 }
 
 
@@ -199,7 +224,7 @@ def _score_css_color(score: float) -> str:
         return "#f44336"
 
 
-def render_html(score: SessionScore) -> str:
+def render_html(score: SessionScore, agent_section: str = "") -> str:
     """Generate a complete standalone HTML report."""
     axes = score.radar_axes
 
@@ -226,6 +251,7 @@ def render_html(score: SessionScore) -> str:
         grade_label=_grade_label(score.composite),
         radar_svg=radar_svg,
         dim_cards=dim_cards,
+        agent_section=agent_section,
         compaction_count=score.compaction_count,
         abort_count=score.abort_count,
         composite_min=f"{score.composite_min:.1f}",
@@ -236,19 +262,19 @@ def render_html(score: SessionScore) -> str:
 
 
 def _build_radar_svg(axes: Dict[str, float]) -> str:
-    """Build SVG hexagonal radar chart."""
+    """Build SVG radar chart (supports N axes)."""
     cx, cy = 200, 200  # center
     r = 160  # max radius
-    n = 6
-    # Axis order matching DIM_ORDER for hexagon layout
     order = DIM_ORDER
+    n = len(order)
+    angle_step = 360.0 / n
 
     # Grid lines (20%, 40%, 60%, 80%, 100%)
     grid_lines = []
     for pct in [0.2, 0.4, 0.6, 0.8, 1.0]:
         pts = []
         for i in range(n):
-            angle = math.radians(-90 + i * 60)
+            angle = math.radians(-90 + i * angle_step)
             x = cx + r * pct * math.cos(angle)
             y = cy + r * pct * math.sin(angle)
             pts.append(f"{x:.1f},{y:.1f}")
@@ -257,7 +283,7 @@ def _build_radar_svg(axes: Dict[str, float]) -> str:
     # Axis lines
     axis_lines = []
     for i in range(n):
-        angle = math.radians(-90 + i * 60)
+        angle = math.radians(-90 + i * angle_step)
         x = cx + r * math.cos(angle)
         y = cy + r * math.sin(angle)
         axis_lines.append(f'<line x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" class="axis-line"/>')
@@ -266,7 +292,7 @@ def _build_radar_svg(axes: Dict[str, float]) -> str:
     data_pts = []
     for i, name in enumerate(order):
         val = axes.get(name, 0) / 100.0
-        angle = math.radians(-90 + i * 60)
+        angle = math.radians(-90 + i * angle_step)
         x = cx + r * val * math.cos(angle)
         y = cy + r * val * math.sin(angle)
         data_pts.append(f"{x:.1f},{y:.1f}")
@@ -276,7 +302,7 @@ def _build_radar_svg(axes: Dict[str, float]) -> str:
     data_dots = []
     for i, name in enumerate(order):
         val = axes.get(name, 0) / 100.0
-        angle = math.radians(-90 + i * 60)
+        angle = math.radians(-90 + i * angle_step)
         x = cx + r * val * math.cos(angle)
         y = cy + r * val * math.sin(angle)
         color = DIM_META[name]["color"]
@@ -286,13 +312,16 @@ def _build_radar_svg(axes: Dict[str, float]) -> str:
     labels = []
     for i, name in enumerate(order):
         meta = DIM_META[name]
-        angle = math.radians(-90 + i * 60)
+        angle = math.radians(-90 + i * angle_step)
         lx = cx + (r + 30) * math.cos(angle)
         ly = cy + (r + 30) * math.sin(angle)
         anchor = "middle"
-        if i == 1 or i == 2:
+        angle_deg = -90 + i * angle_step
+        # Normalize to 0-360
+        norm = angle_deg % 360
+        if 45 < norm < 135:
             anchor = "start"
-        elif i == 4 or i == 5:
+        elif 225 < norm < 315:
             anchor = "end"
         val = axes.get(name, 0)
         labels.append(
@@ -571,6 +600,50 @@ svg.radar {{
 .stats-footer span {{
     margin: 0 1rem;
 }}
+.agent-analysis {{
+    background: var(--card);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    padding: 1.5rem;
+    margin-top: 2rem;
+}}
+.agent-analysis h2 {{
+    color: var(--accent);
+    font-size: 1.2rem;
+    margin-bottom: 0.5rem;
+}}
+.agent-meta {{
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+}}
+.agent-content {{
+    color: var(--text);
+    font-size: 0.95rem;
+    line-height: 1.7;
+}}
+.agent-content h3 {{
+    color: var(--accent);
+    margin-top: 1rem;
+    margin-bottom: 0.3rem;
+}}
+.agent-content h4 {{
+    color: var(--text);
+    margin-top: 0.8rem;
+    margin-bottom: 0.2rem;
+}}
+.agent-content ul, .agent-content ol {{
+    padding-left: 1.5rem;
+    margin-bottom: 0.5rem;
+}}
+.agent-content li {{
+    margin-bottom: 0.3rem;
+}}
+.agent-content p {{
+    margin-bottom: 0.5rem;
+}}
 </style>
 </head>
 <body>
@@ -604,6 +677,8 @@ svg.radar {{
     <h2 style="color: var(--accent); margin-bottom: 0.5rem;">📊 各維度詳細分析</h2>
 {dim_cards}
 </div>
+
+{agent_section}
 
 <div class="stats-footer">
     <span>σ = {composite_stddev}</span>

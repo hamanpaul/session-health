@@ -73,6 +73,7 @@ _DIM_LABELS = {
     "CONV":  "收斂力",
     "CTX":   "記憶留存",
     "DEPTH": "推理深度",
+    "TOOL":  "工具效率",
 }
 
 # Short descriptions for terminal display
@@ -83,6 +84,7 @@ _DIM_DESC = {
     "CONV":  "任務收斂程度",
     "CTX":   "上下文記憶力",
     "DEPTH": "推理深度品質",
+    "TOOL":  "工具使用效率",
 }
 
 BAR_WIDTH = 25  # characters for the bar
@@ -131,7 +133,7 @@ def render_radar(score: SessionScore, use_color: bool = True) -> str:
 
     # ── Per-dimension bars ──
     lines.append(box(""))
-    dim_order = ["SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV"]
+    dim_order = ["SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"]
     for name in dim_order:
         val = axes[name]
         zh = _DIM_LABELS[name]

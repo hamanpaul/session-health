@@ -28,6 +28,7 @@ from .metrics.context import ContextResult, analyze_context_session
 from .metrics.reaction import ReactionResult, analyze_reaction_session
 from .metrics.depth import DepthResult, analyze_depth
 from .metrics.convergence import ConvergenceResult, analyze_convergence
+from .metrics.tool_efficiency import ToolEfficiencyResult, analyze_tool_efficiency_session
 
 
 @dataclass
@@ -39,6 +40,7 @@ class TurnScore:
     context: float = 100.0
     reaction: float = 100.0
     depth: float = 50.0
+    tool_efficiency: float = 100.0
     composite: float = 100.0
 
     # Raw metric results for drill-down
@@ -47,6 +49,7 @@ class TurnScore:
     context_result: ContextResult | None = None
     reaction_result: ReactionResult | None = None
     depth_result: DepthResult | None = None
+    tool_result: ToolEfficiencyResult | None = None
 
 
 @dataclass
@@ -64,6 +67,7 @@ class SessionScore:
     reaction: float = 0.0
     depth: float = 0.0
     convergence: float = 0.0
+    tool_efficiency: float = 0.0
     composite: float = 0.0
 
     # Statistics
@@ -80,7 +84,7 @@ class SessionScore:
 
     @property
     def radar_axes(self) -> Dict[str, float]:
-        """Return the 6 radar chart axes."""
+        """Return the 7 radar chart axes."""
         return {
             "SNR": self.snr,
             "STATE": self.state,
@@ -88,6 +92,7 @@ class SessionScore:
             "CONV": self.convergence,
             "CTX": self.context,
             "DEPTH": self.depth,
+            "TOOL": self.tool_efficiency,
         }
 
     @property
@@ -130,6 +135,7 @@ def score_session(session: Session) -> SessionScore:
     # Run per-turn metrics
     context_results = analyze_context_session(session)
     reaction_results = analyze_reaction_session(session)
+    tool_results = analyze_tool_efficiency_session(session)
 
     # Session-level metrics
     conv_result = analyze_convergence(session)
@@ -142,6 +148,7 @@ def score_session(session: Session) -> SessionScore:
         ctx_r = context_results[i] if i < len(context_results) else ContextResult()
         react_r = reaction_results[i] if i < len(reaction_results) else ReactionResult()
         depth_r = analyze_depth(turn)
+        tool_r = tool_results[i] if i < len(tool_results) else ToolEfficiencyResult()
 
         # Per-turn composite:
         # base = state, penalties for noise/reaction, bonus for depth
@@ -159,12 +166,14 @@ def score_session(session: Session) -> SessionScore:
             context=ctx_r.score,
             reaction=react_r.score,
             depth=depth_r.score,
+            tool_efficiency=tool_r.score,
             composite=composite,
             snr_result=snr_r,
             state_result=state_r,
             context_result=ctx_r,
             reaction_result=react_r,
             depth_result=depth_r,
+            tool_result=tool_r,
         )
         turn_scores.append(ts)
 
@@ -175,6 +184,7 @@ def score_session(session: Session) -> SessionScore:
     contexts = [ts.context for ts in turn_scores]
     reactions = [ts.reaction for ts in turn_scores]
     depths = [ts.depth for ts in turn_scores]
+    tools = [ts.tool_efficiency for ts in turn_scores]
 
     # Session composite = mean of turn composites, adjusted by convergence
     raw_composite = statistics.mean(composites)
@@ -192,6 +202,7 @@ def score_session(session: Session) -> SessionScore:
         reaction=statistics.mean(reactions),
         depth=statistics.mean(depths),
         convergence=conv_result.score,
+        tool_efficiency=statistics.mean(tools),
         composite=final_composite,
         composite_min=min(composites),
         composite_max=max(composites),
