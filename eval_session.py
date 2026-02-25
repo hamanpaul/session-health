@@ -84,6 +84,41 @@ def find_sessions_in_dir(dir_path: Path, source: str = "auto") -> List[Path]:
     return files
 
 
+def find_session_by_id(
+    session_id: str, source: str = "auto"
+) -> List[Tuple[Path, str]]:
+    """Find session files matching a (partial) session ID."""
+    results: List[Tuple[Path, str]] = []
+
+    # Codex CLI: ID is embedded in the JSONL filename or payload
+    codex_dir = Path.home() / ".codex" / "sessions"
+    if codex_dir.exists() and source in ("auto", "codex"):
+        for f in codex_dir.rglob("*.jsonl"):
+            if session_id in f.stem:
+                results.append((f, "codex"))
+                continue
+            # Check payload session_meta id
+            try:
+                with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                    first = fh.readline().strip()
+                    if first:
+                        rec = json.loads(first)
+                        sid = rec.get("payload", {}).get("id", "")
+                        if sid and session_id in sid:
+                            results.append((f, "codex"))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Copilot CLI: filename is {uuid}.jsonl
+    copilot_dir = Path.home() / ".copilot" / "session-state"
+    if copilot_dir.exists() and source in ("auto", "copilot"):
+        for f in copilot_dir.glob("*.jsonl"):
+            if session_id in f.stem:
+                results.append((f, "copilot"))
+
+    return results
+
+
 def find_latest_sessions(
     n: int, source: str = "auto"
 ) -> List[Tuple[Path, str]]:
@@ -166,10 +201,16 @@ def main() -> None:
 
     if args.session_file:
         p = Path(args.session_file)
-        if not p.exists():
-            print(f"Error: file not found: {p}", file=sys.stderr)
-            sys.exit(1)
-        sessions_to_eval.append((p, args.source))
+        if p.exists():
+            sessions_to_eval.append((p, args.source))
+        else:
+            # Treat as session ID and search for it
+            found = find_session_by_id(args.session_file, args.source)
+            if found:
+                sessions_to_eval.extend(found)
+            else:
+                print(f"Error: no file or session ID matching: {args.session_file}", file=sys.stderr)
+                sys.exit(1)
 
     elif args.dir:
         d = Path(args.dir)
