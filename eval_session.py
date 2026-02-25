@@ -200,6 +200,14 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Auto-detect format from output filename
+    if args.output and args.format == "radar":
+        if args.output.endswith(".html") or args.output.endswith(".htm"):
+            args.format = "html"
+        elif args.output.endswith(".json"):
+            args.format = "json"
+
     use_color = not args.no_color and sys.stdout.isatty()
 
     # Collect session files to evaluate
