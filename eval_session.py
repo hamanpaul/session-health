@@ -267,13 +267,13 @@ def main() -> None:
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
     """Print per-turn score breakdown."""
     print(f"\n  Turn breakdown ({sc.turn_count} turns):")
-    print(f"  {'#':>4s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'COMP':>6s}")
-    print(f"  {'─'*4} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6}")
+    print(f"  {'#':>4s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'COMP':>6s}")
+    print(f"  {'─'*4} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6} {'─'*6}")
     for ts in sc.turn_scores:
         print(
             f"  {ts.index:4d} "
             f"{ts.snr:6.1f} {ts.state:6.1f} {ts.context:6.1f} "
-            f"{ts.reaction:6.1f} {ts.composite:6.1f}"
+            f"{ts.reaction:6.1f} {ts.depth:6.1f} {ts.composite:6.1f}"
         )
 
 

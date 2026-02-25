@@ -1,7 +1,13 @@
 """Text-based radar chart renderer.
 
-Renders a 4-axis radar chart using Unicode characters for terminal display.
-Axes: SNR (top), STATE (right), REACT (bottom), CTX (left).
+Renders a 6-axis hexagonal radar chart using Unicode characters.
+Axes (clockwise from top):
+  SNR    (信噪比)    — 終端輸出中無效雜訊的佔比，越低越好
+  STATE  (狀態完整度) — 環境關鍵資訊（cwd、exit code、權限）的覆蓋率
+  REACT  (反應指標)   — LLM 是否出現死迴圈、解析錯誤等異常反應
+  CONV   (收斂力)    — 任務是否順利完成、是否中途 abort/重啟
+  CTX    (記憶留存)   — 多輪對話中原始目標是否被遺忘、歷史 log 冗餘度
+  DEPTH  (推理深度)   — Agent 推理的密度與品質，是否先思考再行動
 
 Supports ANSI colors (can be disabled with --no-color).
 """
@@ -59,179 +65,224 @@ def _grade_label(score: float) -> str:
         return "poor"
 
 
-def render_radar(score: SessionScore, use_color: bool = True) -> str:
-    """Render a complete session health report with radar chart.
+# Dimension zh-TW descriptions
+_DIM_LABELS = {
+    "SNR":   "信噪比",
+    "STATE": "狀態完整度",
+    "REACT": "反應指標",
+    "CONV":  "收斂力",
+    "CTX":   "記憶留存",
+    "DEPTH": "推理深度",
+}
 
-    Returns a multi-line string ready for terminal output.
-    """
-    axes = score.radar_axes  # {"SNR": x, "STATE": x, "CTX": x, "REACT": x}
+
+def render_radar(score: SessionScore, use_color: bool = True) -> str:
+    """Render a complete session health report with 6-axis radar chart."""
+    axes = score.radar_axes
     lines: List[str] = []
 
-    W = 52  # box width
+    W = 56  # box width
 
     # Header box
     lines.append(_c("╔" + "═" * W + "╗", "cyan", use_color))
-    lines.append(_c("║", "cyan", use_color) + _c("  Session Health Report", "bold", use_color).ljust(W + (9 if use_color else 0)) + _c("║", "cyan", use_color))
 
-    sid = score.session_id[:30] if score.session_id else "unknown"
+    title = _c("  Session Health Report", "bold", use_color)
+    lines.append(_c("║", "cyan", use_color) + _pad_to(title, W, use_color) + _c("║", "cyan", use_color))
+
+    sid = score.session_id[:34] if score.session_id else "unknown"
     info = f"  ID: {sid}  Source: {score.source}"
-    lines.append(_c("║", "cyan", use_color) + info.ljust(W) + _c("║", "cyan", use_color))
+    lines.append(_c("║", "cyan", use_color) + _pad_to(info, W) + _c("║", "cyan", use_color))
 
     info2 = f"  Model: {score.model or 'unknown'}  Turns: {score.turn_count}"
-    lines.append(_c("║", "cyan", use_color) + info2.ljust(W) + _c("║", "cyan", use_color))
+    lines.append(_c("║", "cyan", use_color) + _pad_to(info2, W) + _c("║", "cyan", use_color))
 
     lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
 
     # Radar chart area
-    chart_lines = _render_diamond(axes, use_color)
+    chart_lines = _render_hexagon(axes, use_color)
     for cl in chart_lines:
-        padded = cl.ljust(W) if not use_color else cl + " " * max(0, W - _visible_len(cl))
-        lines.append(_c("║", "cyan", use_color) + padded + _c("║", "cyan", use_color))
+        lines.append(_c("║", "cyan", use_color) + _pad_to(cl, W) + _c("║", "cyan", use_color))
 
     lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
 
     # Score summary
     comp_color = _score_color(score.composite)
-    comp_str = f"  Session Score: {score.composite:.1f} / 100  ({_grade_label(score.composite)})"
-    lines.append(_c("║", "cyan", use_color) + _c(comp_str, comp_color, use_color).ljust(W + (9 if use_color else 0)) + _c("║", "cyan", use_color))
+    comp_str = _c(f"  Session Score: {score.composite:.1f} / 100  ({_grade_label(score.composite)})", comp_color, use_color)
+    lines.append(_c("║", "cyan", use_color) + _pad_to(comp_str, W, use_color) + _c("║", "cyan", use_color))
 
-    # Per-dimension breakdown
-    dims = [
-        ("STATE", score.state),
-        ("SNR", score.snr),
-        ("CTX", score.context),
-        ("REACT", score.reaction),
-    ]
-    for i, (name, val) in enumerate(dims):
-        prefix = "├─" if i < len(dims) - 1 else "└─"
+    # Per-dimension breakdown with zh-TW labels
+    dim_list = list(axes.items())
+    for i, (name, val) in enumerate(dim_list):
+        prefix = "├─" if i < len(dim_list) - 1 else "└─"
         dc = _score_color(val)
-        label = _grade_label(val)
-        dim_str = f"  {prefix} {name:8s} {val:5.1f}  ({label})"
-        lines.append(_c("║", "cyan", use_color) + _c(dim_str, dc, use_color).ljust(W + (9 if use_color else 0)) + _c("║", "cyan", use_color))
+        zh = _DIM_LABELS.get(name, "")
+        dim_str = _c(f"  {prefix} {name:6s} {val:5.1f}  {zh}({_grade_label(val)})", dc, use_color)
+        lines.append(_c("║", "cyan", use_color) + _pad_to(dim_str, W, use_color) + _c("║", "cyan", use_color))
 
     # Stats line
     if score.composite_stddev > 0:
-        stats = f"  σ={score.composite_stddev:.1f}  min={score.composite_min:.0f}  max={score.composite_max:.0f}"
-        lines.append(_c("║", "cyan", use_color) + _c(stats, "dim", use_color).ljust(W + (9 if use_color else 0)) + _c("║", "cyan", use_color))
+        stats = _c(f"  σ={score.composite_stddev:.1f}  min={score.composite_min:.0f}  max={score.composite_max:.0f}", "dim", use_color)
+        lines.append(_c("║", "cyan", use_color) + _pad_to(stats, W, use_color) + _c("║", "cyan", use_color))
 
     if score.compaction_count > 0 or score.abort_count > 0:
-        flags = f"  ⚠ compactions: {score.compaction_count}  aborts: {score.abort_count}"
-        lines.append(_c("║", "cyan", use_color) + _c(flags, "yellow", use_color).ljust(W + (9 if use_color else 0)) + _c("║", "cyan", use_color))
+        flags = _c(f"  ⚠ compactions: {score.compaction_count}  aborts: {score.abort_count}", "yellow", use_color)
+        lines.append(_c("║", "cyan", use_color) + _pad_to(flags, W, use_color) + _c("║", "cyan", use_color))
 
     lines.append(_c("╚" + "═" * W + "╝", "cyan", use_color))
 
     return "\n".join(lines)
 
 
-def _render_diamond(
+def _render_hexagon(
     axes: Dict[str, float],
     use_color: bool,
 ) -> List[str]:
-    """Render a 4-axis diamond/radar chart as text lines.
+    """Render a 6-axis hexagonal radar chart as text lines.
 
-    Layout (21 cols wide, centered in 52-char box):
-              SNR: 82
-                ▲
-               ╱ ╲
-              ╱   ╲
-             ╱  ●  ╲
-    CTX: 65 ●───────● STATE: 91
-             ╲  ●  ╱
-              ╲   ╱
-               ╲ ╱
-                ▼
-            REACT: 78
+    Layout (clockwise from top):
+                  SNR: 82
+                    ▲
+                 ╱     ╲
+     DEPTH: 70 ╱    ●    ╲  STATE: 91
+               │         │
+     CTX: 65   ╲    ●    ╱  REACT: 78
+                 ╲     ╱
+                    ▼
+                 CONV: 85
+
+    Uses a simple coordinate approach: 6 axes at 60° intervals.
+    Each axis is normalized to 0–5 scale for grid points.
     """
-    snr = axes.get("SNR", 0)
-    state = axes.get("STATE", 0)
-    react = axes.get("REACT", 0)
-    ctx = axes.get("CTX", 0)
+    # Axis order (clockwise from top): SNR, STATE, REACT, CONV, CTX, DEPTH
+    axis_names = ["SNR", "STATE", "REACT", "CONV", "CTX", "DEPTH"]
+    vals = {k: axes.get(k, 0) for k in axis_names}
 
-    # Normalize to 0–5 scale for the chart grid
     def norm(v: float) -> int:
         return max(0, min(5, round(v / 20)))
 
-    n_snr = norm(snr)
-    n_state = norm(state)
-    n_react = norm(react)
-    n_ctx = norm(ctx)
+    nv = {k: norm(v) for k, v in vals.items()}
 
     lines: List[str] = []
-    pad = "  "
+    CW = 54  # chart area width
+    cx = CW // 2  # center x
+
+    # Row layout for hexagon (using fixed text art):
+    # The hexagon has 6 vertices. We'll build it row by row.
+    #
+    # Key positions (r=radius=6 chars):
+    #   Top:          (cx, 0)        SNR
+    #   Top-right:    (cx+10, 3)     STATE
+    #   Bot-right:    (cx+10, 9)     REACT
+    #   Bottom:       (cx, 12)       CONV
+    #   Bot-left:     (cx-10, 9)     CTX
+    #   Top-left:     (cx-10, 3)     DEPTH
+
+    R = 6  # half-height of hexagon in rows
+    HR = 10  # half-width of hexagon in cols
 
     # Top label
-    snr_label = f"SNR: {snr:.0f}"
-    lines.append(pad + snr_label.center(48))
+    snr_lbl = f"SNR(信噪比): {vals['SNR']:.0f}"
+    snr_vlen = _visible_len(snr_lbl)
+    snr_pad = (CW - snr_vlen) // 2
+    lines.append("  " + " " * snr_pad + snr_lbl)
 
-    # Build diamond grid (11 rows: 5 top + center + 5 bottom)
-    grid_size = 5
-    center = 24  # center column in 48-char space
+    # Row 0: top vertex
+    lines.append("  " + " " * cx + "▲")
 
-    # Top half: row 0 (tip) to row 4
-    lines.append(pad + " " * (center) + "▲")
+    # Rows 1–5: upper sides expanding
+    for i in range(1, R):
+        row = list(" " * CW)
+        # Left edge: cx - (HR*i//R)
+        # Right edge: cx + (HR*i//R)
+        lx = cx - (HR * i // R)
+        rx = cx + (HR * i // R)
+        row[lx] = "╱"
+        row[rx] = "╲"
+        # Fill center dot based on SNR score
+        if i <= nv["SNR"]:
+            row[cx] = "·"
+        lines.append("  " + "".join(row))
 
-    for row in range(1, grid_size):
-        left_edge = center - row
-        right_edge = center + row
-        line = list(" " * 48)
+    # Row 6: top-left and top-right vertex row (widest point, upper)
+    row = list(" " * CW)
+    lx = cx - HR
+    rx = cx + HR
+    row[lx] = "●"
+    row[rx] = "●"
+    for c in range(lx + 1, rx):
+        row[c] = "─"
+    row[cx] = "●"  # center
+    # Build with labels
+    depth_lbl = f"DEPTH:{vals['DEPTH']:.0f}"
+    state_lbl = f"STATE:{vals['STATE']:.0f}"
+    row_str = "".join(row)
+    left_part = depth_lbl + " " + row_str[len(depth_lbl) + 1 : CW - len(state_lbl) - 1] + " " + state_lbl
+    lines.append("  " + left_part)
 
-        # Diamond edges
-        line[left_edge] = "╱"
-        line[right_edge] = "╲"
+    # Rows 7–11: lower sides contracting (mirror)
+    for i in range(R - 1, 0, -1):
+        row = list(" " * CW)
+        lx = cx - (HR * i // R)
+        rx = cx + (HR * i // R)
+        row[lx] = "╲"
+        row[rx] = "╱"
+        if i <= nv["CONV"]:
+            row[cx] = "·"
+        lines.append("  " + "".join(row))
 
-        # Fill point if within score range
-        if row <= n_snr:
-            line[center] = "·"
-
-        lines.append(pad + "".join(line))
-
-    # Center row
-    center_line = list(" " * 48)
-    # Left point (CTX)
-    ctx_pos = center - grid_size
-    center_line[ctx_pos] = "●"
-    # Right point (STATE)
-    state_pos = center + grid_size
-    center_line[state_pos] = "●"
-    # Horizontal line
-    for c in range(ctx_pos + 1, state_pos):
-        center_line[c] = "─"
-    # Center marker
-    center_line[center] = "●"
-
-    # Add labels
-    ctx_label = f"CTX:{ctx:.0f} "
-    state_label = f" STATE:{state:.0f}"
-    center_str = ctx_label + "".join(center_line)[len(ctx_label):48 - len(state_label)] + state_label
-    lines.append(pad + center_str)
-
-    # Bottom half: mirror of top
-    for row in range(grid_size - 1, 0, -1):
-        left_edge = center - row
-        right_edge = center + row
-        line = list(" " * 48)
-
-        line[left_edge] = "╲"
-        line[right_edge] = "╱"
-
-        if row <= n_react:
-            line[center] = "·"
-
-        lines.append(pad + "".join(line))
-
-    lines.append(pad + " " * (center) + "▼")
+    # Row 12: bottom vertex
+    lines.append("  " + " " * cx + "▼")
 
     # Bottom label
-    react_label = f"REACT: {react:.0f}"
-    lines.append(pad + react_label.center(48))
+    conv_lbl = f"CONV(收斂力): {vals['CONV']:.0f}"
+    conv_vlen = _visible_len(conv_lbl)
+    conv_pad = (CW - conv_vlen) // 2
+    lines.append("  " + " " * conv_pad + conv_lbl)
+
+    # Side labels (REACT on right, CTX on left) — add as annotation
+    # Insert at middle rows: the widest point ± 2
+    mid_idx = R + 1  # index of the widest row in our lines list (after top label + top vertex)
+    # Add REACT label 2 rows below widest
+    react_note = f"  REACT(反應指標): {vals['REACT']:.0f}"
+    ctx_note = f"  CTX(記憶留存): {vals['CTX']:.0f}"
+    # We'll add right-side labels at specific rows
+    # Modify rows: insert labels after the main hexagon
+    # Actually, let's add them as separate lines below for clarity
+
+    # Add dimension legend below the chart
+    lines.append("")
+    # Use fixed-width columns with CJK awareness
+    # Left column ~26 chars visible, gap, right column
+    ll1 = f"    DEPTH(推理深度): {vals['DEPTH']:3.0f}"
+    lr1 = f"STATE(狀態完整度):{vals['STATE']:3.0f}"
+    pad1 = max(1, CW - 2 - _visible_len(ll1) - _visible_len(lr1))
+    lines.append("  " + ll1 + " " * pad1 + lr1)
+
+    ll2 = f"    CTX(記憶留存)  : {vals['CTX']:3.0f}"
+    lr2 = f"REACT(反應指標)  :{vals['REACT']:3.0f}"
+    pad2 = max(1, CW - 2 - _visible_len(ll2) - _visible_len(lr2))
+    lines.append("  " + ll2 + " " * pad2 + lr2)
 
     return lines
 
 
 def _visible_len(s: str) -> int:
-    """Calculate visible length of string (excluding ANSI codes)."""
+    """Calculate visible terminal width (excluding ANSI codes, CJK=2 cols)."""
     import re
-    return len(re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", s))
+    import unicodedata
+    clean = re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", s)
+    width = 0
+    for ch in clean:
+        eaw = unicodedata.east_asian_width(ch)
+        width += 2 if eaw in ("W", "F") else 1
+    return width
+
+
+def _pad_to(s: str, target_width: int, use_color: bool = False) -> str:
+    """Pad string to target terminal width, accounting for CJK chars."""
+    vlen = _visible_len(s)
+    pad = max(0, target_width - vlen)
+    return s + " " * pad
 
 
 def render_table(score: SessionScore, use_color: bool = True) -> str:
