@@ -5,6 +5,10 @@ dist/
 build/
 .eggs/
 
-t.html
-test.html
+# Generated HTML reports
 *.html
+
+# Test artifacts
+tests/fixtures/
+tests/output/
+test_*.html
