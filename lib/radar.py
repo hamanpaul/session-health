@@ -1,7 +1,6 @@
-"""Text-based radar chart renderer.
+"""Terminal renderer for session health reports.
 
-Renders a 6-axis hexagonal radar chart using Unicode characters.
-Axes (clockwise from top):
+RPG-style progress-bar display for 6 evaluation dimensions:
   SNR    (信噪比)    — 終端輸出中無效雜訊的佔比，越低越好
   STATE  (狀態完整度) — 環境關鍵資訊（cwd、exit code、權限）的覆蓋率
   REACT  (反應指標)   — LLM 是否出現死迴圈、解析錯誤等異常反應
@@ -14,8 +13,7 @@ Supports ANSI colors (can be disabled with --no-color).
 
 from __future__ import annotations
 
-import math
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from .scorer import SessionScore
 
@@ -31,7 +29,9 @@ _COLORS = {
     "magenta": "\033[35m",
     "cyan": "\033[36m",
     "white": "\033[37m",
-    "bg_blue": "\033[44m",
+    "bg_red": "\033[41m",
+    "bg_green": "\033[42m",
+    "bg_yellow": "\033[43m",
 }
 
 
@@ -75,184 +75,94 @@ _DIM_LABELS = {
     "DEPTH": "推理深度",
 }
 
+# Short descriptions for terminal display
+_DIM_DESC = {
+    "SNR":   "雜訊過濾品質",
+    "STATE": "環境狀態覆蓋",
+    "REACT": "模型反應正常",
+    "CONV":  "任務收斂程度",
+    "CTX":   "上下文記憶力",
+    "DEPTH": "推理深度品質",
+}
+
+BAR_WIDTH = 25  # characters for the bar
+
+
+def _make_bar(score: float, use_color: bool) -> str:
+    """Build an RPG-style HP bar: ████████░░░░░░░░"""
+    filled = round(score * BAR_WIDTH / 100)
+    empty = BAR_WIDTH - filled
+    bar_fill = "█" * filled
+    bar_empty = "░" * empty
+    color = _score_color(score)
+    return _c(bar_fill, color, use_color) + _c(bar_empty, "dim", use_color)
+
 
 def render_radar(score: SessionScore, use_color: bool = True) -> str:
-    """Render a complete session health report with 6-axis radar chart."""
+    """Render a session health report with RPG-style progress bars."""
     axes = score.radar_axes
     lines: List[str] = []
 
-    W = 56  # box width
+    W = 56  # box inner width
 
-    # Header box
+    def box(content: str) -> str:
+        return _c("║", "cyan", use_color) + _pad_to(content, W, use_color) + _c("║", "cyan", use_color)
+
+    # ── Header ──
     lines.append(_c("╔" + "═" * W + "╗", "cyan", use_color))
+    lines.append(box(_c("  ⚔ Session Health Report", "bold", use_color)))
+    lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
 
-    title = _c("  Session Health Report", "bold", use_color)
-    lines.append(_c("║", "cyan", use_color) + _pad_to(title, W, use_color) + _c("║", "cyan", use_color))
-
-    sid = score.session_id[:34] if score.session_id else "unknown"
-    info = f"  ID: {sid}  Source: {score.source}"
-    lines.append(_c("║", "cyan", use_color) + _pad_to(info, W) + _c("║", "cyan", use_color))
-
-    info2 = f"  Model: {score.model or 'unknown'}  Turns: {score.turn_count}"
-    lines.append(_c("║", "cyan", use_color) + _pad_to(info2, W) + _c("║", "cyan", use_color))
+    sid = score.session_id[:38] if score.session_id else "unknown"
+    lines.append(box(f"  ID:     {sid}"))
+    lines.append(box(f"  Source: {score.source}    Model: {score.model or 'unknown'}    Turns: {score.turn_count}"))
 
     lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
 
-    # Radar chart area
-    chart_lines = _render_hexagon(axes, use_color)
-    for cl in chart_lines:
-        lines.append(_c("║", "cyan", use_color) + _pad_to(cl, W) + _c("║", "cyan", use_color))
-
-    lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
-
-    # Score summary
+    # ── Overall score bar ──
+    comp_grade = f"{score.composite:.1f}/100 ({score.grade})"
     comp_color = _score_color(score.composite)
-    comp_str = _c(f"  Session Score: {score.composite:.1f} / 100  ({_grade_label(score.composite)})", comp_color, use_color)
-    lines.append(_c("║", "cyan", use_color) + _pad_to(comp_str, W, use_color) + _c("║", "cyan", use_color))
+    lines.append(box(""))
+    lines.append(box(_c(f"  Overall Score: {comp_grade}", comp_color, use_color)))
+    lines.append(box(f"  {_make_bar(score.composite, use_color)}"))
+    lines.append(box(""))
 
-    # Per-dimension breakdown with zh-TW labels
-    dim_list = list(axes.items())
-    for i, (name, val) in enumerate(dim_list):
-        prefix = "├─" if i < len(dim_list) - 1 else "└─"
-        dc = _score_color(val)
-        zh = _DIM_LABELS.get(name, "")
-        dim_str = _c(f"  {prefix} {name:6s} {val:5.1f}  {zh}({_grade_label(val)})", dc, use_color)
-        lines.append(_c("║", "cyan", use_color) + _pad_to(dim_str, W, use_color) + _c("║", "cyan", use_color))
+    lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
 
-    # Stats line
+    # ── Per-dimension bars ──
+    lines.append(box(""))
+    dim_order = ["SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV"]
+    for name in dim_order:
+        val = axes[name]
+        zh = _DIM_LABELS[name]
+        desc = _DIM_DESC[name]
+        color = _score_color(val)
+
+        # Line 1: label + description
+        # "  SNR  信噪比     雜訊過濾品質"
+        label_part = f"  {name:6s}{zh}"
+        lines.append(box(_c(label_part, "bold", use_color)))
+
+        # Line 2: bar + score
+        bar = _make_bar(val, use_color)
+        score_str = _c(f"{val:5.1f}", color, use_color)
+        lines.append(box(f"  {bar} {score_str}  {_c(desc, 'dim', use_color)}"))
+        lines.append(box(""))
+
+    # ── Footer stats ──
+    lines.append(_c("╠" + "═" * W + "╣", "cyan", use_color))
     if score.composite_stddev > 0:
-        stats = _c(f"  σ={score.composite_stddev:.1f}  min={score.composite_min:.0f}  max={score.composite_max:.0f}", "dim", use_color)
-        lines.append(_c("║", "cyan", use_color) + _pad_to(stats, W, use_color) + _c("║", "cyan", use_color))
-
+        stats = f"  σ={score.composite_stddev:.1f}  min={score.composite_min:.0f}  max={score.composite_max:.0f}"
+        lines.append(box(_c(stats, "dim", use_color)))
     if score.compaction_count > 0 or score.abort_count > 0:
-        flags = _c(f"  ⚠ compactions: {score.compaction_count}  aborts: {score.abort_count}", "yellow", use_color)
-        lines.append(_c("║", "cyan", use_color) + _pad_to(flags, W, use_color) + _c("║", "cyan", use_color))
+        flags = f"  ⚠ compactions: {score.compaction_count}  aborts: {score.abort_count}"
+        lines.append(box(_c(flags, "yellow", use_color)))
+    if score.composite_stddev <= 0 and score.compaction_count == 0 and score.abort_count == 0:
+        lines.append(box(_c("  ✓ No anomalies detected", "green", use_color)))
 
     lines.append(_c("╚" + "═" * W + "╝", "cyan", use_color))
 
     return "\n".join(lines)
-
-
-def _render_hexagon(
-    axes: Dict[str, float],
-    use_color: bool,
-) -> List[str]:
-    """Render a proper 6-vertex hexagonal radar chart.
-
-    Layout (clockwise from top):
-                     SNR
-                      ▲
-                    ╱   ╲
-                  ╱       ╲
-      DEPTH:66  ●─────●─────●  STATE:100
-                │     ·     │
-                │   · ● ·   │
-                │     ·     │
-      CTX:30    ●─────●─────●  REACT:100
-                  ╲       ╱
-                    ╲   ╱
-                      ▼
-                     CONV
-    """
-    axis_names = ["SNR", "STATE", "REACT", "CONV", "CTX", "DEPTH"]
-    vals = {k: axes.get(k, 0) for k in axis_names}
-
-    CW = 54  # content width (+ "  " prefix = 56 = box W)
-    cx = CW // 2  # 27
-    HW = 9  # half-width from center to side vertices
-    lv = cx - HW  # 18  left vertex column
-    rv = cx + HW  # 36  right vertex column
-
-    lines: List[str] = []
-
-    # ── SNR label (top, centered) ──
-    snr_lbl = f"SNR({_DIM_LABELS['SNR']}): {vals['SNR']:.0f}"
-    snr_pad = (CW - _visible_len(snr_lbl)) // 2
-    lines.append("  " + " " * snr_pad + snr_lbl)
-
-    # ── Top vertex ▲ ──
-    lines.append("  " + " " * cx + "▲")
-
-    # ── Upper diagonal (2 rows, expanding toward upper vertices) ──
-    diag_offsets = [3, 6]
-    for off in diag_offsets:
-        row = list(" " * CW)
-        row[cx - off] = "╱"
-        row[cx + off] = "╲"
-        if vals["SNR"] >= (60 if off == 3 else 30):
-            row[cx] = "·"
-        lines.append("  " + "".join(row))
-
-    # ── Upper vertex row: DEPTH ●─────●─────● STATE ──
-    def _vertex_row(left_label: str, right_label: str) -> str:
-        row = list(" " * CW)
-        row[lv] = "●"
-        row[rv] = "●"
-        row[cx] = "●"
-        for c in range(lv + 1, cx):
-            row[c] = "─"
-        for c in range(cx + 1, rv):
-            row[c] = "─"
-        # Overlay left label (right-justified before vertex)
-        start_l = lv - len(left_label) - 1
-        for i, ch in enumerate(left_label):
-            if 0 <= start_l + i < lv:
-                row[start_l + i] = ch
-        # Overlay right label (left-justified after vertex)
-        start_r = rv + 2
-        for i, ch in enumerate(right_label):
-            if start_r + i < CW:
-                row[start_r + i] = ch
-        return "  " + "".join(row)
-
-    depth_lbl = f"DEPTH:{vals['DEPTH']:.0f}"
-    state_lbl = f"STATE:{vals['STATE']:.0f}"
-    lines.append(_vertex_row(depth_lbl, state_lbl))
-
-    # ── Middle vertical section (3 rows with │ sides) ──
-    for m in range(3):
-        row = list(" " * CW)
-        row[lv] = "│"
-        row[rv] = "│"
-        if m == 1:
-            # Center row: ● and diagonal axis hints
-            row[cx] = "●"
-            if vals["DEPTH"] >= 50:
-                row[cx - 4] = "·"
-            if vals["STATE"] >= 50:
-                row[cx + 4] = "·"
-            if vals["CTX"] >= 50:
-                row[cx - 4] = "·"
-            if vals["REACT"] >= 50:
-                row[cx + 4] = "·"
-        else:
-            # Vertical axis dot
-            row[cx] = "·"
-        lines.append("  " + "".join(row))
-
-    # ── Lower vertex row: CTX ●─────●─────● REACT ──
-    ctx_lbl = f"CTX:{vals['CTX']:.0f}"
-    react_lbl = f"REACT:{vals['REACT']:.0f}"
-    lines.append(_vertex_row(ctx_lbl, react_lbl))
-
-    # ── Lower diagonal (2 rows, contracting toward bottom vertex) ──
-    for off in reversed(diag_offsets):
-        row = list(" " * CW)
-        row[cx - off] = "╲"
-        row[cx + off] = "╱"
-        if vals["CONV"] >= (60 if off == 3 else 30):
-            row[cx] = "·"
-        lines.append("  " + "".join(row))
-
-    # ── Bottom vertex ▼ ──
-    lines.append("  " + " " * cx + "▼")
-
-    # ── CONV label (bottom, centered) ──
-    conv_lbl = f"CONV({_DIM_LABELS['CONV']}): {vals['CONV']:.0f}"
-    conv_pad = (CW - _visible_len(conv_lbl)) // 2
-    lines.append("  " + " " * conv_pad + conv_lbl)
-
-    return lines
 
 
 def _visible_len(s: str) -> int:

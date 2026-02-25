@@ -26,6 +26,7 @@ from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.scorer import score_session, SessionScore
 from lib.radar import render_radar, render_table, render_json
+from lib.html_report import render_html
 
 
 def detect_source(path: Path) -> str:
@@ -178,7 +179,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--format", "-f",
-        choices=["radar", "table", "json"],
+        choices=["radar", "table", "json", "html"],
         default="radar",
         help="Output format (default: radar)",
     )
@@ -186,6 +187,11 @@ def main() -> None:
         "--no-color",
         action="store_true",
         help="Disable ANSI color output",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        metavar="FILE",
+        help="Write output to file (default: stdout; auto-named for html)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -246,14 +252,23 @@ def main() -> None:
 
     # Output
     for sc in scores:
-        if args.format == "radar":
+        if args.format == "html":
+            html_content = render_html(sc)
+            out_path = args.output
+            if not out_path:
+                safe_id = (sc.session_id or "session")[:16].replace("/", "_")
+                out_path = f"session-health-{safe_id}.html"
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            print(f"✓ HTML report saved to: {out_path}", file=sys.stderr)
+        elif args.format == "radar":
             print(render_radar(sc, use_color))
         elif args.format == "table":
             print(render_table(sc, use_color))
         elif args.format == "json":
             print(render_json(sc))
 
-        if args.verbose and args.format != "json":
+        if args.verbose and args.format not in ("json", "html"):
             _print_turn_breakdown(sc, use_color)
 
         if len(scores) > 1:
