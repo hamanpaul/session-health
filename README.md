@@ -27,13 +27,22 @@
 session-health/
 ├── eval_session.py              # CLI 入口：參數解析、session 查找、輸出路由
 ├── install.sh                   # 一鍵部署腳本
+├── docs/
+│   ├── README.md                # 專案規劃/研究文件索引
+│   ├── plan.md                  # 專案規劃文件（repo 鏡像）
+│   ├── todo.md                  # 執行待辦面板（repo 鏡像）
+│   └── research/
+│       └── https-github-com-onestardao-wfgy-tree-main-problem.md
+│                               # WFGY / ProblemMap 整合研究報告
 ├── lib/
 │   ├── parser_base.py           # 共用資料結構：Turn, Session, ToolCall
 │   ├── parser_codex.py          # Codex CLI JSONL 解析器
 │   ├── parser_copilot.py        # Copilot CLI JSONL 解析器
+│   ├── report_types.py          # 報告包裝層資料結構（single/batch/weighted diagnosis）
+│   ├── problemmap.py            # ProblemMap / Atlas 診斷與 Fx 加權整合層
 │   ├── scorer.py                # 複合計分引擎（7 維度聚合）
-│   ├── radar.py                 # 終端渲染器（RPG 進度條 + 表格 + JSON）
-│   ├── html_report.py           # HTML 報告產生器（SVG 雷達圖 + 維度卡片）
+│   ├── radar.py                 # 終端渲染器（quant + weighted diagnosis + agent）
+│   ├── html_report.py           # HTML 報告產生器（single/batch report bundle）
 │   ├── agent_analysis.py        # AI Agent 分析模組（外部 CLI 呼叫）
 │   └── metrics/
 │       ├── snr.py               # SNR   信噪比
@@ -48,6 +57,15 @@ session-health/
 ├── README.md
 └── .gitignore
 ```
+
+### 文件與規劃檔
+
+第一次重構的研究、規劃與待辦文件已整理到 `docs/`：
+
+- `docs/README.md`：文件索引與同步規則
+- `docs/plan.md`：目前核准的實作計畫
+- `docs/todo.md`：目前的執行待辦面板
+- `docs/research/https-github-com-onestardao-wfgy-tree-main-problem.md`：WFGY / ProblemMap 整合研究報告
 
 ### 模組關係圖
 
@@ -260,6 +278,12 @@ source ~/.bashrc
 
 ## 使用方式
 
+如果你直接給 `Session ID`、`session 目錄` 或 `sessions 目錄` 作為唯一參數，`session-health` 會自動走 **bundle 模式**：
+
+- terminal 先輸出摘要分數條
+- 同步產生 HTML 報告
+- 盡可能補上 weighted diagnosis（含 PM 欄位中文說明與 Fx 比重）與 agent analysis
+
 ### 完整 Help
 
 ```
@@ -268,12 +292,13 @@ usage: eval_session [-h] [--dir DIR] [--latest N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
                     [--analyze] [--test-agent]
-                    [session_file]
+                    [SESSION_OR_PATH]
 
 Agent CLI Session 動態 Prompt 品質量化評估
 
 positional arguments:
-  session_file               Session JSONL 檔案路徑，或 Session ID（支援部分匹配）
+  SESSION_OR_PATH            Session ID、Session JSONL、session 目錄，
+                             或包含多個 sessions 的目錄
 
 options:
   -h, --help                 顯示此說明
@@ -304,6 +329,12 @@ session-health 019c8d32-6e21-7693-90bf-3b63176d9c10
 # 直接指定 JSONL 檔案
 session-health ~/.codex/sessions/2026/02/24/rollout-2026-02-24-xxx.jsonl
 
+# 直接指定單一 session 目錄（例如 Copilot events.jsonl 所在目錄）
+session-health ~/.copilot/session-state/019c8d32-6e21-7693-90bf-3b63176d9c10
+
+# 直接指定 sessions 目錄（不必再加 --dir）
+session-health ~/.codex/sessions/2026/02/
+
 # ── 批次評估 ──
 
 # 評估最近 5 個 session
@@ -312,7 +343,7 @@ session-health --latest 5
 # 只看 Codex CLI 的最近 10 個
 session-health --latest 10 --source codex
 
-# 評估整個目錄
+# 評估整個目錄（舊寫法，仍相容）
 session-health --dir ~/.codex/sessions/2026/02/
 
 # ── 輸出格式 ──
@@ -393,7 +424,7 @@ session-health 019c8d32 --analyze --test-agent
 
 | 順位 | Agent | 命令 |
 |------|-------|------|
-| 1 | Codex (GPT-5.3) | `codex -c model=gpt-5.3 exec "prompt"` |
+| 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 exec "prompt"` |
 | 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p "prompt" --yolo` |
 | 3 | Gemini (3 Pro) | `gemini -m gemini-3-pro-preview -p "prompt"` |
 | 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p "prompt" --yolo` |

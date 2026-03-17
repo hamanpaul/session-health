@@ -13,6 +13,8 @@ import json
 import math
 from typing import Dict, List, Tuple
 
+from .agent_analysis import render_agent_html_section
+from .report_types import BatchReport, DiagnosisSummary, ProblemMapDiagnosis, SessionReport
 from .scorer import SessionScore
 
 # ── Dimension metadata ──
@@ -224,8 +226,400 @@ def _score_css_color(score: float) -> str:
         return "#f44336"
 
 
-def render_html(score: SessionScore, agent_section: str = "") -> str:
+def _render_diagnosis_summary_html(summary: DiagnosisSummary | None) -> str:
+    """Render weighted diagnosis summary section."""
+
+    if summary is None:
+        return ""
+
+    pm_guide = "".join(
+        "<li><strong>{field}</strong>: {meaning}</li>".format(
+            field=html.escape(str(item.get("field", "PM"))),
+            meaning=html.escape(str(item.get("meaning_zh", ""))),
+        )
+        for item in summary.pm_field_guide
+    ) or "<li>無</li>"
+
+    pm_items = "".join(
+        """
+        <li>
+            <strong>{field}</strong> — {label}<br>
+            <span class="text-dim">{meaning}</span><br>
+            <span class="text-dim">Fx 加權比重：{fx}</span>
+        </li>
+        """.format(
+            field=html.escape(str(item.get("field", "PM"))),
+            label=html.escape(str(item.get("label_zh", "無"))),
+            meaning=html.escape(str(item.get("field_meaning_zh", "無"))),
+            fx=html.escape(str(item.get("fx_weight_ratio_zh", "無"))),
+        )
+        for item in summary.pm_candidates
+    ) or "<li>無</li>"
+
+    fx_items = "".join(
+        "<li><strong>{fx}</strong> — {label}: {weight}</li>".format(
+            fx=html.escape(str(item.get("fx", ""))),
+            label=html.escape(str(item.get("family_label_zh", ""))),
+            weight=html.escape(str(item.get("weight_pct", "0.0%"))),
+        )
+        for item in summary.fx_weights
+        if float(item.get("weight", 0.0)) > 0
+    ) or "<li>無顯著 Fx 權重</li>"
+
+    weighted_dims = "".join(
+        "<li><strong>{dim}</strong> — raw={raw} / attention={attention} / Fx={fx}</li>".format(
+            dim=html.escape(str(item.get("dimension_zh", item.get("dimension", "")))),
+            raw=html.escape(str(item.get("raw_score", ""))),
+            attention=html.escape(str(item.get("combined_attention_pct", ""))),
+            fx=html.escape(str(item.get("fx_weight_ratio_zh", "無"))),
+        )
+        for item in summary.weighted_dimensions[:5]
+    ) or "<li>無</li>"
+
+    if summary.scope == "batch":
+        route_items = "".join(
+            "<li><strong>{label}</strong>：{count}</li>".format(
+                label=html.escape(str(item.get("label_zh", "未解析"))),
+                count=html.escape(str(item.get("count", 0))),
+            )
+            for item in summary.route_summary.get("top_primary_families", [])
+        ) or "<li>無</li>"
+    else:
+        route_items = """
+            <li><strong>主家族</strong>: {primary}</li>
+            <li><strong>次家族</strong>: {secondary}</li>
+            <li><strong>破損不變量</strong>: {invariant}</li>
+            <li><strong>優先修復方向</strong>: {fix}</li>
+            <li><strong>誤修風險</strong>: {risk}</li>
+            <li><strong>信心 / 證據</strong>: {confidence} / {evidence}</li>
+        """.format(
+            primary=html.escape(str(summary.route_summary.get("primary_family_zh", "未解析"))),
+            secondary=html.escape(str(summary.route_summary.get("secondary_family_zh", "無"))),
+            invariant=html.escape(str(summary.route_summary.get("broken_invariant_zh", "尚未判定"))),
+            fix=html.escape(str(summary.route_summary.get("first_fix_zh", "無"))),
+            risk=html.escape(str(summary.route_summary.get("misrepair_risk_zh", "無"))),
+            confidence=html.escape(str(summary.route_summary.get("confidence_zh", "低"))),
+            evidence=html.escape(str(summary.route_summary.get("evidence_sufficiency_zh", "薄弱"))),
+        )
+
+    signal_items = "".join(
+        "<li>{label}</li>".format(label=html.escape(str(item.get("signal_zh", item.get("signal", "")))))
+        for item in summary.supporting_evidence.get("failure_signals", [])[:5]
+    ) or "<li>無</li>"
+
+    failed_tools = "".join(
+        f"<li>{html.escape(str(item))}</li>"
+        for item in summary.supporting_evidence.get("failed_tools", [])[:5]
+    ) or "<li>無</li>"
+
+    representative_turns = "".join(
+        "<li>Turn {turn} — composite {composite}</li>".format(
+            turn=html.escape(str(item.get("turn", "?"))),
+            composite=html.escape(str(item.get("composite", "?"))),
+        )
+        for item in summary.supporting_evidence.get("representative_turns", [])[:5]
+    ) or "<li>無</li>"
+
+    notes = "".join(
+        f"<li>{html.escape(str(note))}</li>"
+        for note in summary.notes
+    ) or "<li>無</li>"
+
+    return f"""
+<div class="agent-analysis">
+    <h2>🧭 加權診斷摘要</h2>
+    <div class="agent-content">
+        <h3>摘要</h3>
+        <p>{html.escape(summary.summary_zh or '無')}</p>
+        <h3>PM 欄位說明</h3>
+        <ul>{pm_guide}</ul>
+        <h3>ProblemMap 候選</h3>
+        <ul>{pm_items}</ul>
+        <h3>Fx 加權比重</h3>
+        <ul>{fx_items}</ul>
+        <h3>加權後重點維度</h3>
+        <ul>{weighted_dims}</ul>
+        <h3>{'批次主家族分布' if summary.scope == 'batch' else '路由摘要'}</h3>
+        <ul>{route_items}</ul>
+        <h3>Supporting Evidence</h3>
+        <h4>Failure Signals</h4>
+        <ul>{signal_items}</ul>
+        <h4>Failed Tools</h4>
+        <ul>{failed_tools}</ul>
+        <h4>Representative Turns</h4>
+        <ul>{representative_turns}</ul>
+        <h3>備註</h3>
+        <ul>{notes}</ul>
+    </div>
+</div>
+"""
+
+
+def _render_problemmap_html(diagnosis: ProblemMapDiagnosis | None) -> str:
+    """Render ProblemMap / Atlas diagnosis section."""
+
+    if diagnosis is None:
+        return ""
+
+    atlas = diagnosis.atlas
+    pm1_items = "".join(
+        "<li><strong>{number}</strong> — {label} ({confidence})</li>".format(
+            number=html.escape(str(item.get("number", "?"))),
+            label=html.escape(str(item.get("label_zh", item.get("label", "unknown")))),
+            confidence=html.escape(str(item.get("confidence_zh", item.get("confidence", "unknown")))),
+        )
+        for item in diagnosis.pm1_candidates
+    ) or "<li>無明確 PM1 候選</li>"
+
+    references = "".join(
+        f"<li>{html.escape(ref)}</li>" for ref in diagnosis.references_used
+    ) or "<li>無</li>"
+
+    return f"""
+<div class="agent-analysis">
+    <h2>🧭 ProblemMap / Atlas 診斷</h2>
+    <div class="agent-content">
+        <h3>PM1 候選</h3>
+        <ul>{pm1_items}</ul>
+        <h3>Atlas 家族</h3>
+        <ul>
+            <li><strong>主家族</strong>: {html.escape(str(atlas.get('primary_family_zh', atlas.get('primary_family', '未解析'))))}</li>
+            <li><strong>次家族</strong>: {html.escape(str(atlas.get('secondary_family_zh', atlas.get('secondary_family', '無'))))}</li>
+            <li><strong>破損不變量</strong>: {html.escape(str(atlas.get('broken_invariant_zh', atlas.get('broken_invariant', '尚未判定'))))}</li>
+            <li><strong>為何主而非次</strong>: {html.escape(str(atlas.get('why_primary_not_secondary_zh', atlas.get('why_primary_not_secondary', '無'))))}</li>
+            <li><strong>優先修復方向</strong>: {html.escape(str(atlas.get('fix_surface_direction_zh', atlas.get('fix_surface_direction', '無'))))}</li>
+            <li><strong>誤修風險</strong>: {html.escape(str(atlas.get('misrepair_risk_zh', atlas.get('misrepair_risk', '無'))))}</li>
+            <li><strong>信心</strong>: {html.escape(str(atlas.get('confidence_zh', atlas.get('confidence', '低'))))}</li>
+            <li><strong>證據充分度</strong>: {html.escape(str(atlas.get('evidence_sufficiency_zh', atlas.get('evidence_sufficiency', '薄弱'))))}</li>
+        </ul>
+        <h3>全域修復路徑</h3>
+        <ul>
+            <li><strong>對應家族</strong>: {html.escape(str(diagnosis.global_fix_route.get('family_zh', diagnosis.global_fix_route.get('family', '無')) or '無'))}</li>
+            <li><strong>建議頁面</strong>: {html.escape(str(diagnosis.global_fix_route.get('page_zh', diagnosis.global_fix_route.get('page', '無')) or '無'))}</li>
+            <li><strong>最小修復動作</strong>: {html.escape(str(diagnosis.global_fix_route.get('minimal_fix_zh', diagnosis.global_fix_route.get('minimal_fix', '無')) or '無'))}</li>
+        </ul>
+        <h3>參考來源</h3>
+        <ul>{references}</ul>
+    </div>
+</div>
+"""
+
+
+def _render_evidence_summary_html(evidence_summary: Dict[str, object]) -> str:
+    """Render normalized evidence summary section."""
+
+    if not evidence_summary:
+        return ""
+
+    representative_turns = evidence_summary.get("representative_turns", [])
+    turn_items = "".join(
+        "<li>Turn {turn} — composite {composite} / tools {tools}</li>".format(
+            turn=html.escape(str(item.get("turn", "?"))),
+            composite=html.escape(str(item.get("composite", "?"))),
+            tools=html.escape(", ".join(item.get("tools", [])) or "none"),
+        )
+        for item in representative_turns[:5]
+    ) or "<li>無</li>"
+
+    failed_tools = "".join(
+        f"<li>{html.escape(str(name))}</li>"
+        for name in evidence_summary.get("failed_tools", [])[:10]
+    ) or "<li>無</li>"
+
+    weak_dimensions = "".join(
+        "<li>{name}: {value}</li>".format(
+            name=html.escape(str(name)),
+            value=html.escape(f"{value:.1f}" if isinstance(value, (int, float)) else str(value)),
+        )
+        for name, value in evidence_summary.get("weak_dimensions", {}).items()
+    ) or "<li>無</li>"
+
+    signals = "".join(
+        f"<li>{html.escape(str(signal))}</li>"
+        for signal in evidence_summary.get("candidate_failure_signals", [])[:10]
+    ) or "<li>無</li>"
+
+    return f"""
+<div class="agent-analysis">
+    <h2>🧪 Evidence Summary</h2>
+    <div class="agent-content">
+        <h3>Weak Dimensions</h3>
+        <ul>{weak_dimensions}</ul>
+        <h3>Candidate Failure Signals</h3>
+        <ul>{signals}</ul>
+        <h3>Representative Turns</h3>
+        <ul>{turn_items}</ul>
+        <h3>Failed Tools</h3>
+        <ul>{failed_tools}</ul>
+    </div>
+</div>
+"""
+
+
+def _render_artifact_sources_html(sources: Dict[str, str]) -> str:
+    """Render artifact source metadata."""
+
+    if not sources:
+        return ""
+
+    items = "".join(
+        "<li><strong>{key}</strong>: {value}</li>".format(
+            key=html.escape(str(key)),
+            value=html.escape(str(value)),
+        )
+        for key, value in sorted(sources.items())
+    )
+    return f"""
+<div class="agent-analysis">
+    <h2>🗃️ Artifact Sources</h2>
+    <div class="agent-content">
+        <ul>{items}</ul>
+    </div>
+</div>
+"""
+
+
+def _render_batch_html(batch: BatchReport) -> str:
+    """Generate a standalone HTML page for a batch report."""
+
+    rows = []
+    for report in batch.sessions:
+        primary = "未解析"
+        route = ""
+        if report.problemmap is not None:
+            primary = str(report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析")))
+            route = report.problemmap.global_fix_route.get("minimal_fix_zh") or report.problemmap.global_fix_route.get("minimal_fix") or json.dumps(
+                report.problemmap.global_fix_route, ensure_ascii=False
+            )
+        rows.append(
+            """
+            <tr>
+                <td>{session_id}</td>
+                <td>{score}</td>
+                <td>{grade}</td>
+                <td>{primary}</td>
+                <td>{route}</td>
+            </tr>
+            """.format(
+                session_id=html.escape(report.score.session_id or "unknown"),
+                score=html.escape(f"{report.score.composite:.1f}"),
+                grade=html.escape(report.score.grade),
+                primary=html.escape(primary),
+                route=html.escape(route),
+            )
+        )
+
+    evidence_json = html.escape(
+        json.dumps(batch.evidence_summary, indent=2, ensure_ascii=False)
+    )
+    layers = ", ".join(batch.analysis_layers)
+    agent_section = ""
+    if batch.agent_analysis is not None:
+        agent_section = render_agent_html_section(batch.agent_analysis)
+    diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary)
+    return f"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Health Batch Report</title>
+<style>
+body {{
+    font-family: 'Segoe UI', 'Noto Sans TC', -apple-system, sans-serif;
+    background: #1a1a2e;
+    color: #e8e8e8;
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+}}
+.card {{
+    background: #16213e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}}
+h1, h2 {{ color: #4fc3f7; }}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+}}
+th, td {{
+    border-bottom: 1px solid #2a2a4a;
+    padding: 0.75rem;
+    text-align: left;
+    vertical-align: top;
+}}
+th {{ color: #4fc3f7; }}
+pre {{
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0f3460;
+    border-radius: 8px;
+    padding: 1rem;
+}}
+.agent-analysis {{
+    background: #16213e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}}
+.agent-analysis h2 {{ color: #4fc3f7; }}
+.agent-meta {{
+    color: #8892a4;
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #2a2a4a;
+}}
+.agent-content h3 {{ color: #4fc3f7; margin: 0.8rem 0 0.3rem; }}
+.agent-content h4 {{ margin: 0.6rem 0 0.2rem; }}
+.agent-content p, .agent-content li {{ margin-bottom: 0.3rem; }}
+.agent-content ul, .agent-content ol {{ padding-left: 1.4rem; }}
+.text-dim {{ color: #8892a4; }}
+</style>
+</head>
+<body>
+<div class="card">
+    <h1>⚔ Session Health Batch Report</h1>
+    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Layers: {html.escape(layers)}</p>
+</div>
+<div class="card">
+    <h2>📋 Batch Summary</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Session</th>
+                <th>Score</th>
+                <th>Grade</th>
+                <th>主家族</th>
+                <th>最小修復動作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {''.join(rows)}
+        </tbody>
+    </table>
+</div>
+<div class="card">
+    <h2>🧪 Batch Evidence</h2>
+    <pre>{evidence_json}</pre>
+</div>
+{diagnosis_section}
+{agent_section}
+</body>
+</html>
+"""
+
+
+def render_html(item: SessionScore | SessionReport | BatchReport, agent_section: str = "") -> str:
     """Generate a complete standalone HTML report."""
+    if isinstance(item, BatchReport):
+        return _render_batch_html(item)
+
+    score = item.score if isinstance(item, SessionReport) else item
     axes = score.radar_axes
 
     # Build radar chart SVG data
@@ -240,6 +634,20 @@ def render_html(score: SessionScore, agent_section: str = "") -> str:
     model = html.escape(score.model or "unknown")
     comp_color = _score_css_color(score.composite)
 
+    extra_sections = ""
+    if isinstance(item, SessionReport):
+        extra_sections = "".join(
+            [
+                _render_diagnosis_summary_html(item.diagnosis_summary),
+                _render_artifact_sources_html(item.artifact_sources),
+                render_agent_html_section(item.agent_analysis)
+                if item.agent_analysis is not None
+                else "",
+            ]
+        )
+    elif agent_section:
+        extra_sections = agent_section
+
     return _HTML_TEMPLATE.format(
         session_id=sid,
         source=source,
@@ -251,7 +659,7 @@ def render_html(score: SessionScore, agent_section: str = "") -> str:
         grade_label=_grade_label(score.composite),
         radar_svg=radar_svg,
         dim_cards=dim_cards,
-        agent_section=agent_section,
+        agent_section=extra_sections,
         compaction_count=score.compaction_count,
         abort_count=score.abort_count,
         composite_min=f"{score.composite_min:.1f}",

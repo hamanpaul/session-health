@@ -2,8 +2,8 @@
 """session-health: Agent CLI Session 動態 Prompt 品質量化評估工具.
 
 Usage:
-    eval_session.py <session.jsonl>              # Evaluate a single session
-    eval_session.py --dir <dir>                  # Batch evaluate all sessions in dir
+    eval_session.py <session-id-or-path>         # Session ID / JSONL / session dir / sessions dir
+    eval_session.py --dir <dir>                  # Legacy-compatible batch mode
     eval_session.py --latest N                   # Evaluate the N most recent sessions
     eval_session.py --latest N --source codex    # Only Codex sessions
 """
@@ -11,9 +11,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
+from dataclasses import asdict
 import json
-import os
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -25,14 +24,19 @@ from lib.parser_base import Session
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.scorer import score_session, SessionScore
-from lib.radar import render_radar, render_table, render_json
+from lib.report_types import BatchReport, SessionReport
+from lib.problemmap import (
+    build_batch_diagnosis_summary,
+    build_diagnosis_summary,
+    build_evidence_summary,
+    diagnose_problemmap,
+)
+from lib.radar import render_report_terminal, render_table, render_json
 from lib.html_report import render_html
 from lib.agent_analysis import (
     prepare_analysis_prompt,
+    prepare_batch_analysis_prompt,
     call_agent,
-    render_agent_html_section,
-    render_agent_terminal,
-    AgentAnalysis,
 )
 
 
@@ -180,9 +184,10 @@ def main() -> None:
     # Input modes (mutually exclusive)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
-        "session_file",
+        "session_target",
         nargs="?",
-        help="Path to a single session JSONL file",
+        metavar="SESSION_OR_PATH",
+        help="Session ID, session JSONL file, session dir, or sessions dir",
     )
     group.add_argument(
         "--dir", "-d",
@@ -236,6 +241,8 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    explicit_format = any(flag in sys.argv[1:] for flag in ("--format", "-f"))
+    explicit_analyze = any(flag in sys.argv[1:] for flag in ("--analyze", "-a", "--test-agent"))
 
     # Auto-detect format from output filename
     if args.output and args.format == "radar":
@@ -244,30 +251,35 @@ def main() -> None:
         elif args.output.endswith(".json"):
             args.format = "json"
 
+    # One-command flow: session ID / path alone produces terminal summary + HTML bundle.
+    if args.session_target and not explicit_format and not explicit_analyze and not args.output:
+        args.format = "html"
+        args.analyze = True
+
     use_color = not args.no_color and sys.stdout.isatty()
 
     # Collect session files to evaluate
-    sessions_to_eval: List[Tuple[Path, str]] = []
+    sessions_to_eval: List[Tuple[Path, str, str]] = []
 
-    if args.session_file:
-        p = Path(args.session_file)
+    if args.session_target:
+        p = Path(args.session_target)
         if p.is_dir():
-            # Directory-format session: resolve to events.jsonl inside it
-            p = _resolve_copilot_session_path(p)
-            if p.exists():
-                sessions_to_eval.append((p, args.source))
+            # Session dir: use events.jsonl when present; otherwise treat as sessions dir.
+            events = p / "events.jsonl"
+            if events.exists():
+                sessions_to_eval.append((events, args.source, "session_dir"))
             else:
-                print(f"Error: directory has no events.jsonl: {args.session_file}", file=sys.stderr)
-                sys.exit(1)
+                files = find_sessions_in_dir(p, args.source)
+                sessions_to_eval.extend((f, args.source, "sessions_dir") for f in files)
         elif p.exists():
-            sessions_to_eval.append((p, args.source))
+            sessions_to_eval.append((p, args.source, "session_file"))
         else:
             # Treat as session ID and search for it
-            found = find_session_by_id(args.session_file, args.source)
+            found = find_session_by_id(args.session_target, args.source)
             if found:
-                sessions_to_eval.extend(found)
+                sessions_to_eval.extend((path, source, "session_id") for path, source in found)
             else:
-                print(f"Error: no file or session ID matching: {args.session_file}", file=sys.stderr)
+                print(f"Error: no file or session ID matching: {args.session_target}", file=sys.stderr)
                 sys.exit(1)
 
     elif args.dir:
@@ -276,76 +288,181 @@ def main() -> None:
             print(f"Error: not a directory: {d}", file=sys.stderr)
             sys.exit(1)
         files = find_sessions_in_dir(d, args.source)
-        sessions_to_eval.extend((f, args.source) for f in files)
+        sessions_to_eval.extend((f, args.source, "sessions_dir") for f in files)
 
     elif args.latest:
-        sessions_to_eval.extend(find_latest_sessions(args.latest, args.source))
+        latest_target_kind = "session_file" if args.latest == 1 else "sessions_dir"
+        sessions_to_eval.extend(
+            (path, source, latest_target_kind)
+            for path, source in find_latest_sessions(args.latest, args.source)
+        )
 
     if not sessions_to_eval:
         print("No session files found.", file=sys.stderr)
         sys.exit(1)
 
     # Evaluate each session
-    scores: List[SessionScore] = []
-    parsed_sessions: List[Session] = []
-    for path, source in sessions_to_eval:
+    reports: List[SessionReport] = []
+    for path, source, target_kind in sessions_to_eval:
         try:
             session = parse_session(path, source)
             if not session.turns:
                 continue
             sc = score_session(session)
-            scores.append(sc)
-            parsed_sessions.append(session)
+            evidence_summary = build_evidence_summary(session, sc)
+            problemmap = diagnose_problemmap(session, sc, evidence_summary=evidence_summary)
+            diagnosis_summary = build_diagnosis_summary(
+                session,
+                sc,
+                evidence_summary=evidence_summary,
+                problemmap=problemmap,
+            )
+            reports.append(
+                SessionReport(
+                    session=session,
+                    score=sc,
+                    target_kind=target_kind,
+                    problemmap=problemmap,
+                    diagnosis_summary=diagnosis_summary,
+                    evidence_summary=evidence_summary,
+                    artifact_sources={"session_input": str(path)},
+                    sync_status="session-only",
+                )
+            )
         except Exception as e:
             print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
             continue
 
-    if not scores:
+    if not reports:
         print("No valid sessions found.", file=sys.stderr)
         sys.exit(1)
 
-    # Output
-    for idx, sc in enumerate(scores):
-        # Run agent analysis if requested (single session only)
-        analysis = AgentAnalysis()
-        if args.analyze and len(scores) == 1:
-            prompt = prepare_analysis_prompt(sc, parsed_sessions[idx])
+    batch_target_kinds = {report.target_kind for report in reports}
+    batch_report = BatchReport(
+        sessions=reports,
+        target_kind=batch_target_kinds.pop() if len(batch_target_kinds) == 1 else "mixed",
+        diagnosis_summary=build_batch_diagnosis_summary(reports),
+        evidence_summary={
+            "session_count": len(reports),
+            "average_score": round(sum(report.score.composite for report in reports) / len(reports), 1),
+            "min_score": round(min(report.score.composite for report in reports), 1),
+            "max_score": round(max(report.score.composite for report in reports), 1),
+            "primary_families": [
+                report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析"))
+                for report in reports
+                if report.problemmap is not None
+            ],
+            "failure_signals": sorted(
+                {
+                    signal
+                    for report in reports
+                    for signal in report.evidence_summary.get("candidate_failure_signals", [])
+                }
+            ),
+        },
+        artifact_sources={
+            "input": (
+                args.session_target
+                if args.session_target
+                else args.dir
+                if args.dir
+                else f"latest:{args.latest}"
+            )
+        },
+        sync_status="session-only",
+    )
+
+    if args.analyze:
+        if len(reports) == 1:
+            report = reports[0]
+            problemmap_payload = None
+            if report.problemmap is not None:
+                problemmap_payload = {
+                    "pm1_candidates": report.problemmap.pm1_candidates,
+                    "atlas": report.problemmap.atlas,
+                    "global_fix_route": report.problemmap.global_fix_route,
+                }
+            prompt = prepare_analysis_prompt(
+                report.score,
+                report.session,
+                diagnosis_summary=asdict(report.diagnosis_summary) if report.diagnosis_summary is not None else None,
+                problemmap=problemmap_payload,
+                evidence_summary=report.evidence_summary,
+            )
             analysis = call_agent(prompt, test_mode=args.test_agent)
+            report.agent_analysis = analysis
+            if analysis.success and "agent" not in report.analysis_layers:
+                report.analysis_layers.append("agent")
+        else:
+            session_summaries = []
+            for report in reports:
+                session_summaries.append(
+                    {
+                        "session_id": report.score.session_id or "unknown",
+                        "score": round(report.score.composite, 1),
+                        "grade": report.score.grade,
+                        "primary_family": (
+                            report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析"))
+                            if report.problemmap is not None
+                            else "未解析"
+                        ),
+                        "weak_dimensions": list(report.evidence_summary.get("weak_dimensions", {}).keys()),
+                        "route": (
+                            report.problemmap.global_fix_route.get("minimal_fix_zh", report.problemmap.global_fix_route.get("minimal_fix", "無"))
+                            if report.problemmap is not None
+                            else "無"
+                        ),
+                    }
+                )
+            prompt = prepare_batch_analysis_prompt(
+                batch_report.evidence_summary,
+                session_summaries,
+                diagnosis_summary=asdict(batch_report.diagnosis_summary) if batch_report.diagnosis_summary is not None else None,
+            )
+            batch_report.agent_analysis = call_agent(prompt, test_mode=args.test_agent)
 
-        if args.format == "html":
-            # Always print terminal summary first
-            print(render_radar(sc, use_color))
-            # Print agent analysis in terminal too
-            if analysis.success:
-                print(render_agent_terminal(analysis))
-            # Then write HTML report
-            agent_html = render_agent_html_section(analysis)
-            html_content = render_html(sc, agent_section=agent_html)
-            out_path = args.output
-            if not out_path:
-                safe_id = (sc.session_id or "session")[:16].replace("/", "_")
+        layers = set(layer for item in reports for layer in item.analysis_layers)
+        if batch_report.agent_analysis is not None and batch_report.agent_analysis.success:
+            layers.add("agent")
+        batch_report.analysis_layers = sorted(layers)
+
+    # Output
+    if args.format == "html":
+        for index, report in enumerate(reports):
+            print(render_report_terminal(report, use_color))
+            if index < len(reports) - 1:
+                print()
+
+        html_content = render_html(batch_report if len(reports) > 1 else reports[0])
+        out_path = args.output
+        if not out_path:
+            if len(reports) == 1:
+                safe_id = (reports[0].score.session_id or "session")[:16].replace("/", "_")
                 out_path = f"session-health-{safe_id}.html"
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(html_content)
-            print(f"\n✓ HTML report saved to: {out_path}", file=sys.stderr)
-        elif args.format == "radar":
-            print(render_radar(sc, use_color))
-            if analysis.success:
-                print(render_agent_terminal(analysis))
-        elif args.format == "table":
-            print(render_table(sc, use_color))
-        elif args.format == "json":
-            print(render_json(sc))
+            else:
+                out_path = "session-health-batch.html"
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"\n✓ HTML report saved to: {out_path}", file=sys.stderr)
+    elif args.format == "radar":
+        for index, report in enumerate(reports):
+            print(render_report_terminal(report, use_color))
+            if index < len(reports) - 1:
+                print()
+    elif args.format == "table":
+        print(render_table(batch_report if len(reports) > 1 else reports[0], use_color))
+    elif args.format == "json":
+        print(render_json(batch_report if len(reports) > 1 else reports[0]))
 
-        if args.verbose and args.format not in ("json",):
-            _print_turn_breakdown(sc, use_color)
-
-        if len(scores) > 1:
-            print()  # separator between sessions
+    if args.verbose and args.format not in ("json",):
+        for index, report in enumerate(reports):
+            _print_turn_breakdown(report.score, use_color)
+            if index < len(reports) - 1:
+                print()
 
     # Batch summary
-    if len(scores) > 1:
-        _print_batch_summary(scores, use_color)
+    if len(reports) > 1 and args.format != "json":
+        _print_batch_summary([report.score for report in reports], use_color)
 
 
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:

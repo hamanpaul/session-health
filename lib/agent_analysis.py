@@ -4,7 +4,7 @@ Calls external CLI agents (Codex/Copilot/Gemini) to provide
 AI-powered analysis and improvement suggestions for a session.
 
 Agent priority (production):
-  1. codex -c model=gpt-5.3 exec "prompt"
+  1. codex -c model=gpt-5.4 exec "prompt"
   2. copilot -s --model claude-sonnet-4.6 -p "prompt" --yolo
   3. gemini -m gemini-3-pro-preview -p "prompt"
   4. copilot -s --model gpt-5-mini -p "prompt" --yolo
@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .scorer import SessionScore
 from .parser_base import Session
@@ -34,7 +34,7 @@ class AgentConfig:
 
 
 def _build_codex_cmd(prompt: str) -> List[str]:
-    return ["codex", "-c", "model=gpt-5.3", "exec", prompt]
+    return ["codex", "-c", "model=gpt-5.4", "exec", prompt]
 
 
 def _build_copilot_sonnet_cmd(prompt: str) -> List[str]:
@@ -51,7 +51,7 @@ def _build_copilot_mini_cmd(prompt: str) -> List[str]:
 
 # Production agent chain
 AGENT_CHAIN: List[AgentConfig] = [
-    AgentConfig(name="codex/gpt-5.3", build_cmd=_build_codex_cmd, timeout=180),
+    AgentConfig(name="codex/gpt-5.4", build_cmd=_build_codex_cmd, timeout=180),
     AgentConfig(name="copilot/sonnet-4.6", build_cmd=_build_copilot_sonnet_cmd, timeout=120),
     AgentConfig(name="gemini/3-pro", build_cmd=_build_gemini_cmd, timeout=120),
     AgentConfig(name="copilot/gpt-5-mini", build_cmd=_build_copilot_mini_cmd, timeout=90),
@@ -74,7 +74,13 @@ class AgentAnalysis:
     error: str = ""
 
 
-def prepare_analysis_prompt(score: SessionScore, session: Session) -> str:
+def prepare_analysis_prompt(
+    score: SessionScore,
+    session: Session,
+    diagnosis_summary: Optional[Dict[str, Any]] = None,
+    problemmap: Optional[Dict[str, Any]] = None,
+    evidence_summary: Optional[Dict[str, Any]] = None,
+) -> str:
     """Build a prompt summarizing the session for agent analysis."""
     axes = score.radar_axes
     weak_dims = [f"{k}={v:.0f}" for k, v in axes.items() if v < 70]
@@ -104,6 +110,71 @@ def prepare_analysis_prompt(score: SessionScore, session: Session) -> str:
     tool_stats = ", ".join(f"{n}({c})" for n, c in top_tools)
 
     axes_str = " / ".join(f"{k}={v:.0f}" for k, v in axes.items())
+    diagnosis_section = ""
+    if diagnosis_summary:
+        pm_lines = []
+        for item in diagnosis_summary.get("pm_candidates", [])[:3]:
+            pm_lines.append(
+                f"- {item.get('field')}: {item.get('label_zh')}｜欄位意義={item.get('field_meaning_zh')}｜Fx={item.get('fx_weight_ratio_zh')}"
+            )
+        fx_lines = ", ".join(
+            f"{item.get('fx')}={item.get('weight_pct')}"
+            for item in diagnosis_summary.get("fx_weights", [])[:4]
+            if float(item.get("weight", 0.0)) > 0
+        ) or "無"
+        weighted_dims = ", ".join(
+            f"{item.get('dimension_zh')}={item.get('combined_attention_pct')}"
+            for item in diagnosis_summary.get("weighted_dimensions", [])[:3]
+        ) or "無"
+        route = diagnosis_summary.get("route_summary", {})
+        diagnosis_section = f"""
+
+## 加權診斷摘要
+- 摘要: {diagnosis_summary.get("summary_zh", "無")}
+- 主家族: {route.get("primary_family_zh", "未解析")}
+- 次家族: {route.get("secondary_family_zh", "無")}
+- 破損不變量: {route.get("broken_invariant_zh", "尚未判定")}
+- 優先修復方向: {route.get("first_fix_zh", "無")}
+- Fx 權重: {fx_lines}
+- 加權後最值得關注的維度: {weighted_dims}
+{chr(10).join(pm_lines) if pm_lines else '- 無 PM 候選'}
+"""
+    elif problemmap:
+        pm1_candidates = problemmap.get("pm1_candidates", [])
+        pm1_str = ", ".join(
+            f"{item.get('number')}:{item.get('label_zh', item.get('label'))}"
+            for item in pm1_candidates[:3]
+        ) or "無"
+        atlas = problemmap.get("atlas", {})
+        diagnosis_section = f"""
+
+## ProblemMap / Atlas 診斷
+- PM 候選: {pm1_str}
+- 主家族: {atlas.get("primary_family_zh", atlas.get("primary_family", "未解析"))}
+- 次家族: {atlas.get("secondary_family_zh", atlas.get("secondary_family", "無"))}
+- 優先修復方向: {atlas.get("fix_surface_direction_zh", atlas.get("fix_surface_direction", "無"))}
+"""
+
+    evidence_section = ""
+    if evidence_summary:
+        weak_dim_str = ", ".join(
+            f"{name}={value:.0f}"
+            for name, value in evidence_summary.get("weak_dimensions", {}).items()
+        ) or "無"
+        top_turns = ", ".join(
+            f"T{item.get('turn')}({item.get('composite')})"
+            for item in evidence_summary.get("representative_turns", [])[:5]
+        ) or "無"
+        fail_str = ", ".join(evidence_summary.get("failed_tools", [])[:5]) or "無"
+        signal_str = ", ".join(evidence_summary.get("candidate_failure_signals", [])[:5]) or "無"
+        evidence_section = f"""
+
+## 補充 Evidence 摘要
+- Weak Dimensions: {weak_dim_str}
+- Candidate Failure Signals: {signal_str}
+- Representative Turns: {top_turns}
+- Failed Tools: {fail_str}
+"""
 
     prompt = f"""你是一個 Agent CLI Session 品質分析師。以下是一個 session 的評估摘要，請提供專業的改善建議。
 
@@ -129,11 +200,77 @@ def prepare_analysis_prompt(score: SessionScore, session: Session) -> str:
 ## 事件統計
 - Abort 次數: {score.abort_count}
 - Context Compaction 次數: {score.compaction_count}
+{diagnosis_section}
+{evidence_section}
 
 ## 請提供：
 1. **整體評估**（2-3 句話概述此 session 的 prompt 品質）
 2. **針對每個低分維度（<70 分）的具體改善建議**（如果有的話）
 3. **最重要的 1 個改善行動**
+
+用繁體中文回覆，簡潔扼要。使用 Markdown 格式。"""
+
+    return prompt
+
+
+def prepare_batch_analysis_prompt(
+    aggregate: Dict[str, Any],
+    session_summaries: List[Dict[str, Any]],
+    diagnosis_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build an analysis prompt for a batch of sessions."""
+
+    session_lines = []
+    for item in session_summaries[:12]:
+        weak_dims = ", ".join(item.get("weak_dimensions", [])) or "無"
+        session_lines.append(
+            "- {session_id}: score={score} grade={grade} 主家族={primary} 弱項={weak} 修復方向={route}".format(
+                session_id=item.get("session_id", "unknown"),
+                score=item.get("score", "?"),
+                grade=item.get("grade", "?"),
+                primary=item.get("primary_family", "未解析"),
+                weak=weak_dims,
+                route=item.get("route", "無"),
+            )
+        )
+
+    diagnosis_section = ""
+    if diagnosis_summary:
+        fx_lines = ", ".join(
+            f"{item.get('fx')}={item.get('weight_pct')}"
+            for item in diagnosis_summary.get("fx_weights", [])[:4]
+            if float(item.get("weight", 0.0)) > 0
+        ) or "無"
+        dim_lines = ", ".join(
+            f"{item.get('dimension_zh')}={item.get('combined_attention_pct')}"
+            for item in diagnosis_summary.get("weighted_dimensions", [])[:3]
+        ) or "無"
+        diagnosis_section = f"""
+
+## 批次加權診斷摘要
+- 摘要: {diagnosis_summary.get('summary_zh', '無')}
+- 主要 Fx 權重: {fx_lines}
+- 加權後最值得關注的維度: {dim_lines}
+"""
+
+    prompt = f"""你是一個 Agent CLI Session 品質分析師。以下是一批 session 的彙整評估結果，請根據量化分數、ProblemMap / Atlas 診斷與 evidence 訊號，給出整體改善建議。
+
+## Batch 概況
+- Session 數量: {aggregate.get('session_count')}
+- 平均分數: {aggregate.get('average_score')}
+- 最低分數: {aggregate.get('min_score')}
+- 最高分數: {aggregate.get('max_score')}
+- 常見主家族: {', '.join(aggregate.get('primary_families', [])) or '無'}
+- 常見 Failure Signals: {', '.join(aggregate.get('failure_signals', [])) or '無'}
+{diagnosis_section}
+
+## Session 摘要
+{chr(10).join(session_lines)}
+
+## 請提供：
+1. **整體觀察**（2-3 句）
+2. **最常見的結構性問題模式**（聚焦 ProblemMap / Atlas）
+3. **最值得優先做的 1-2 個工程改善行動**
 
 用繁體中文回覆，簡潔扼要。使用 Markdown 格式。"""
 
