@@ -13,8 +13,11 @@ Supports ANSI colors (can be disabled with --no-color).
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Dict, List
 
+from .agent_analysis import render_agent_terminal
+from .report_types import BatchReport, DiagnosisSummary, ProblemMapDiagnosis, SessionReport
 from .scorer import SessionScore
 
 # ANSI color codes
@@ -100,8 +103,15 @@ def _make_bar(score: float, use_color: bool) -> str:
     return _c(bar_fill, color, use_color) + _c(bar_empty, "dim", use_color)
 
 
-def render_radar(score: SessionScore, use_color: bool = True) -> str:
+def _unwrap_score(item: SessionScore | SessionReport) -> SessionScore:
+    if isinstance(item, SessionReport):
+        return item.score
+    return item
+
+
+def render_radar(item: SessionScore | SessionReport, use_color: bool = True) -> str:
     """Render a session health report with RPG-style progress bars."""
+    score = _unwrap_score(item)
     axes = score.radar_axes
     lines: List[str] = []
 
@@ -167,6 +177,117 @@ def render_radar(score: SessionScore, use_color: bool = True) -> str:
     return "\n".join(lines)
 
 
+def render_problemmap_terminal(
+    diagnosis: ProblemMapDiagnosis | None,
+    use_color: bool = True,
+) -> str:
+    """Render a compact ProblemMap / Atlas diagnosis box."""
+
+    if diagnosis is None:
+        return ""
+
+    atlas = diagnosis.atlas
+    lines: List[str] = [
+        _c("╔" + "═" * 56 + "╗", "magenta", use_color),
+        _c("║", "magenta", use_color) + _pad_to(_c("  🧭 ProblemMap 診斷", "bold", use_color), 56, use_color) + _c("║", "magenta", use_color),
+        _c("╠" + "═" * 56 + "╣", "magenta", use_color),
+    ]
+
+    def add_line(prefix: str, value: str) -> None:
+        content = f"  {prefix}: {value}".strip()
+        for chunk in _wrap_visible(content, 54):
+            lines.append(_c("║", "magenta", use_color) + _pad_to(f" {chunk}", 56, use_color) + _c("║", "magenta", use_color))
+
+    pm1 = ", ".join(
+        f"{item.get('number')}:{item.get('label_zh', item.get('label'))}"
+        for item in diagnosis.pm1_candidates[:3]
+    ) or "無"
+    add_line("PM1", pm1)
+    add_line("主家族", str(atlas.get("primary_family_zh", atlas.get("primary_family", "未解析"))))
+    add_line("次家族", str(atlas.get("secondary_family_zh", atlas.get("secondary_family", "無"))))
+    add_line("破損不變量", str(atlas.get("broken_invariant_zh", atlas.get("broken_invariant", "尚未判定"))))
+    add_line("優先修復方向", str(atlas.get("fix_surface_direction_zh", atlas.get("fix_surface_direction", "無"))))
+    add_line("信心 / 證據", f"{atlas.get('confidence_zh', atlas.get('confidence', '低'))} / {atlas.get('evidence_sufficiency_zh', atlas.get('evidence_sufficiency', '薄弱'))}")
+
+    if diagnosis.need_more_evidence:
+        add_line("備註", "目前仍需更多證據，再做強修復判斷。")
+
+    lines.append(_c("╚" + "═" * 56 + "╝", "magenta", use_color))
+    return "\n".join(lines)
+
+
+def render_diagnosis_summary_terminal(
+    summary: DiagnosisSummary | None,
+    use_color: bool = True,
+) -> str:
+    """Render the integrated weighted diagnosis section."""
+
+    if summary is None:
+        return ""
+
+    lines: List[str] = [
+        _c("╔" + "═" * 56 + "╗", "magenta", use_color),
+        _c("║", "magenta", use_color) + _pad_to(_c("  🧭 加權診斷摘要", "bold", use_color), 56, use_color) + _c("║", "magenta", use_color),
+        _c("╠" + "═" * 56 + "╣", "magenta", use_color),
+    ]
+
+    def add_line(prefix: str, value: str) -> None:
+        content = f"  {prefix}: {value}".strip()
+        for chunk in _wrap_visible(content, 54):
+            lines.append(_c("║", "magenta", use_color) + _pad_to(f" {chunk}", 56, use_color) + _c("║", "magenta", use_color))
+
+    add_line("摘要", summary.summary_zh or "無")
+    route = summary.route_summary
+    if route:
+        primary = route.get("primary_family_zh") or "未解析"
+        secondary = route.get("secondary_family_zh") or "無"
+        if primary != "未解析" or summary.scope == "batch":
+            add_line("主 / 次家族", f"{primary} / {secondary}")
+        if route.get("broken_invariant_zh"):
+            add_line("破損不變量", str(route.get("broken_invariant_zh")))
+        if route.get("first_fix_zh"):
+            add_line("優先修復方向", str(route.get("first_fix_zh")))
+
+    top_fx = "、".join(
+        f"{item.get('fx')} {item.get('weight_pct')}"
+        for item in summary.fx_weights[:4]
+        if float(item.get("weight", 0.0)) > 0
+    ) or "無顯著 Fx 權重"
+    add_line("Fx 權重", top_fx)
+
+    top_dims = "、".join(
+        f"{item.get('dimension_zh')} {item.get('combined_attention_pct')}"
+        for item in summary.weighted_dimensions[:3]
+    ) or "無"
+    add_line("加權關注維度", top_dims)
+
+    for item in summary.pm_candidates[:3]:
+        add_line(
+            item.get("field", "PM"),
+            f"{item.get('label_zh')}｜{item.get('field_meaning_zh')}",
+        )
+        add_line(f"{item.get('field', 'PM')} Fx", item.get("fx_weight_ratio_zh", "無"))
+
+    lines.append(_c("╚" + "═" * 56 + "╝", "magenta", use_color))
+    return "\n".join(lines)
+
+
+def render_report_terminal(report: SessionReport, use_color: bool = True) -> str:
+    """Render the terminal bundle for a single session report."""
+
+    parts = [render_radar(report, use_color)]
+    diagnosis_box = render_diagnosis_summary_terminal(report.diagnosis_summary, use_color)
+    if diagnosis_box:
+        parts.append(diagnosis_box)
+    else:
+        problemmap_box = render_problemmap_terminal(report.problemmap, use_color)
+        if problemmap_box:
+            parts.append(problemmap_box)
+    if report.agent_analysis is not None and report.agent_analysis.success:
+        parts.append(render_agent_terminal(report.agent_analysis))
+    return "\n".join(part for part in parts if part)
+
+
 def _visible_len(s: str) -> int:
     """Calculate visible terminal width (excluding ANSI codes, CJK=2 cols)."""
     import re
@@ -186,11 +307,32 @@ def _pad_to(s: str, target_width: int, use_color: bool = False) -> str:
     return s + " " * pad
 
 
-def render_table(score: SessionScore, use_color: bool = True) -> str:
+def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bool = True) -> str:
     """Render a compact table summary."""
+    if isinstance(item, BatchReport):
+        lines = []
+        lines.append(f"Batch: {len(item.sessions)} sessions  Target: {item.target_kind}")
+        lines.append("-" * 88)
+        lines.append(f"{'Session':24s} {'Score':>7s} {'Grade':6s} {'主家族'}")
+        lines.append("-" * 88)
+        for report in item.sessions:
+            primary = "未解析"
+            if report.problemmap is not None:
+                primary = str(report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析")))
+            session_id = (report.score.session_id or "unknown")[:24]
+            lines.append(f"{session_id:24s} {report.score.composite:7.1f} {report.score.grade:6s} {primary}")
+        lines.append("-" * 88)
+        return "\n".join(lines)
+
+    score = _unwrap_score(item)
     lines = []
     lines.append(f"Session: {score.session_id}  ({score.source}, {score.model})")
     lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
+    if isinstance(item, SessionReport):
+        if item.diagnosis_summary is not None:
+            lines.append(f"加權診斷: {item.diagnosis_summary.summary_zh}")
+        elif item.problemmap is not None:
+            lines.append(f"ProblemMap 主家族: {item.problemmap.atlas.get('primary_family_zh', item.problemmap.atlas.get('primary_family', '未解析'))}")
     lines.append("-" * 50)
     lines.append(f"{'Dim':10s} {'Score':>6s}  {'Grade'}")
     lines.append("-" * 50)
@@ -200,10 +342,35 @@ def render_table(score: SessionScore, use_color: bool = True) -> str:
     return "\n".join(lines)
 
 
-def render_json(score: SessionScore) -> str:
+def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
     """Render as JSON string."""
     import json
-    return json.dumps({
+    if isinstance(item, BatchReport):
+        payload = {
+            "report_kind": item.report_kind,
+            "target_kind": item.target_kind,
+            "analysis_layers": item.analysis_layers,
+            "sync_status": item.sync_status,
+            "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
+            "evidence_summary": item.evidence_summary,
+            "artifact_sources": item.artifact_sources,
+            "agent_analysis": {
+                "agent_name": item.agent_analysis.agent_name,
+                "success": item.agent_analysis.success,
+                "raw_response": item.agent_analysis.raw_response,
+                "error": item.agent_analysis.error,
+            }
+            if item.agent_analysis is not None
+            else None,
+            "sessions": [
+                json.loads(render_json(report))
+                for report in item.sessions
+            ],
+        }
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    score = _unwrap_score(item)
+    payload = {
         "session_id": score.session_id,
         "source": score.source,
         "model": score.model,
@@ -220,4 +387,57 @@ def render_json(score: SessionScore) -> str:
             "compactions": score.compaction_count,
             "aborts": score.abort_count,
         },
-    }, indent=2, ensure_ascii=False)
+    }
+    if isinstance(item, SessionReport):
+        payload.update(
+            {
+                "report_kind": item.report_kind,
+                "target_kind": item.target_kind,
+                "analysis_layers": item.analysis_layers,
+                "sync_status": item.sync_status,
+                "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
+                "evidence_summary": item.evidence_summary,
+                "artifact_sources": item.artifact_sources,
+                "problemmap": {
+                    "status": item.problemmap.status,
+                    "diagnostic_mode": item.problemmap.diagnostic_mode,
+                    "pm1_candidates": item.problemmap.pm1_candidates,
+                    "fx_weights": item.problemmap.fx_weights,
+                    "atlas": item.problemmap.atlas,
+                    "global_fix_route": item.problemmap.global_fix_route,
+                    "references_used": item.problemmap.references_used,
+                    "source_case": item.problemmap.source_case,
+                    "need_more_evidence": item.problemmap.need_more_evidence,
+                }
+                if item.problemmap is not None
+                else None,
+                "agent_analysis": {
+                    "agent_name": item.agent_analysis.agent_name,
+                    "success": item.agent_analysis.success,
+                    "raw_response": item.agent_analysis.raw_response,
+                    "error": item.agent_analysis.error,
+                }
+                if item.agent_analysis is not None
+                else None,
+            }
+        )
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _wrap_visible(text: str, width: int) -> List[str]:
+    """Wrap plain text to a visible terminal width."""
+
+    words = text.split()
+    if not words:
+        return [""]
+    lines: List[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if _visible_len(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
