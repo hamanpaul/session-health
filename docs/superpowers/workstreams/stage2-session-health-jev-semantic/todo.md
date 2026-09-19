@@ -17,6 +17,8 @@ Prerequisite: session-health-jev-offline must be independently accepted and its 
 Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.1-pro-high, read-only exact candidate. One builder writer; no other repository, registry, credentials, push/PR/merge/deploy mutations by builder. Follow master plan section 9. Unhandled defects/gaps fail review; documented bounded residual risk alone does not, unless reviewer rebuts its impact analysis. Findings: at most 10 BLOCKER/MAJOR with reproducible triggers, file locations and PASS/FAIL.
 
 
+## Tasks
+
 - [ ] S2.1 — Implement a capability-aware generic semantic backend and standard-library Jev HTTP adapter with Choice/Noul/Score schema/range validation.
 - [ ] S2.2 — Add bounded request/state/question/attempt/time budgets, conservative byte limits, retry classification, provenance and correct request-level usage accounting.
 - [ ] S2.3 — Implement all seven versioned semantic question groups, applicability/abstention, independent questions sharing state across multiple cases, and bounded dependent stages.

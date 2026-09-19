@@ -17,6 +17,8 @@ This slice is ready for intake. It must produce a complete useful offline report
 Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.1-pro-high, read-only exact candidate. One builder writer; no other repository, registry, credentials, push/PR/merge/deploy mutations by builder. Follow master plan section 9. Unhandled defects/gaps fail review; documented bounded residual risk alone does not, unless reviewer rebuts its impact analysis. Findings: at most 10 BLOCKER/MAJOR with reproducible triggers, file locations and PASS/FAIL.
 
 
+## Tasks
+
 - [ ] S1.1 — T01: Add Codex nested call/result and Copilot JSON-string arguments regression fixtures; preserve unknown/failed/unsupported records and reliable pairing.
 - [ ] S1.2 — T02: Build versioned portable SessionBundle, bounded canonical events/facts, source refs/capabilities, redacted evidence/case candidates and observation cutoffs; export/import round-trip.
 - [ ] S1.3 — T03: Implement all seven process-v2 observable axes with applicability/coverage/null denominators, transparent legacy score and optional identity-checked external outcome fixture joins.

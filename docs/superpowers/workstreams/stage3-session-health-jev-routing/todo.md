@@ -17,6 +17,8 @@ Prerequisite: session-health-jev-semantic must be independently accepted and its
 Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.1-pro-high, read-only exact candidate. One builder writer; no other repository, registry, credentials, push/PR/merge/deploy mutations by builder. Follow master plan section 9. Unhandled defects/gaps fail review; documented bounded residual risk alone does not, unless reviewer rebuts its impact analysis. Findings: at most 10 BLOCKER/MAJOR with reproducible triggers, file locations and PASS/FAIL.
 
 
+## Tasks
+
 - [ ] S3.1 — Add concrete executor/route/model/settings catalog with read-only Codex/Copilot/agy discovery, operator entries, availability provenance and freshness; do not infer account access from installed CLI.
 - [ ] S3.2 — Implement Python hard eligibility/budget constraints and Jev Choice selecting concrete candidates, explicit override, deterministic no-Jev fallback and bounded failed-execution reselection.
 - [ ] S3.3 — Run the chosen analyzer through bounded argv/stdin adapters; record requested/actual model/settings and native usage without fabricating unknown tokens.

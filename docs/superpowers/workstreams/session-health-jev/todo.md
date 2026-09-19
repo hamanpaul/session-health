@@ -18,6 +18,8 @@ Tracking: https://github.com/hamanpaul/session-health/issues/4 。相關 #3 保�
 
 Sizing 依據：包含資料、評估、模型執行三類邊界；狀態一致性為本機報告與 request ledger，沒有分散式交易。11 條不變量對應 spec 的 Required behavior；驗收包含 parser、CLI/JSON/HTML、API adapter 與模型 executor。
 
+## Tasks
+
 - [ ] T01 — 修正 Codex/Copilot parser 並加入有意義的 regression fixtures。
 - [ ] T02 — 建立 portable bundle、evidence refs、limits、redaction 與案例 cutoff。
 - [ ] T03 — 完成無 LLM 七軸 process-v2、coverage、legacy 透明性與外部 outcome join。
