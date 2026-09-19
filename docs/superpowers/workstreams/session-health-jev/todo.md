@@ -14,7 +14,7 @@ artifact_classes: [source, tests, documentation]
 使用者於 2026-09-19 明示授權本計畫與 Cortex 實作及對抗 review。
 Tracking: https://github.com/hamanpaul/session-health/issues/4 。相關 #3 保留獨立 scope，不作本 work 的 closure target。
 完整範圍以 [accepted plan](../../plans/session-health-jev.md)、[spec](../../specs/session-health-jev-spec.md)、[design](../../specs/session-health-jev-design.md) 為準。
-單一 writer 依序完成各包；不得只交付 transport 或部分軸便宣稱全案完成。
+單一 writer 依序完成各包；不得只交付 transport 或部分軸便宣稱全案完成。此為 parent work，不直接派 Red=7 的整包 build；依總計畫順序執行 offline、semantic、routing 三個 Yellow 子工作，全部驗收後才關閉 parent。
 
 Sizing 依據：包含資料、評估、模型執行三類邊界；狀態一致性為本機報告與 request ledger，沒有分散式交易。11 條不變量對應 spec 的 Required behavior；驗收包含 parser、CLI/JSON/HTML、API adapter 與模型 executor。
 

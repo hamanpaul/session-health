@@ -8,7 +8,7 @@ task_type: feature
 
 本 spec 與 [implementation plan](../plans/session-health-jev.md) 共同定義 2026-09-19 使用者已接受的功能；plan 包含各軸量測、API、用量與完整測試細節。
 
-## Required behavior
+## Requirements
 
 1. 七軸 SNR/STATE/CTX/REACT/DEPTH/CONV/TOOL 保留 ID；新版量測只用可觀察事實與有來源的判讀。DEPTH 評分析/驗證充分性、CONV 分開交付宣告與實際 external outcome。
 2. 1-1 不需要 LLM/SDK/key/network/CLI agent，明確 offline 模式的所有入口都保持無模型；產生 single/batch JSON、terminal、HTML。

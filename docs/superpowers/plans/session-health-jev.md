@@ -115,9 +115,19 @@ Jev 第一階段與事後檢查是同源判讀，不稱獨立 correctness proof�
 - 服務失敗保留基本產物。exit 0＝要求工作完成或正常不適用；partial/failed/nonzero 有穩定契約；not_requested、unknown、not_applicable、insufficient、failed 不混用。
 - 舊七軸 JSON/legacy renderer regression fixtures；資料記錄修正造成舊分數變動需帶 parser version 解釋。
 
-## 7. 實作工作包與依賴
+## Tasks
 
 一個 owner / 一個 builder writer，依序提交可驗收工作包。Cortex 可再拆 bounded cards，但不得平行修改同一基底，或漏掉後續階段。
+
+Cortex 規模檢查為 Red=7，總工作拆成三個獨立執行切片，按順序 intake；總計畫保留完整範圍，不能因第一片完成就宣告全案完成：
+
+| 順序 | 執行 plan | 工作 | Sizing | 前置條件 |
+|---|---|---|---|---|
+| 1 | [offline](session-health-jev-offline.md) | T01–T04＋本片驗證/review | Yellow=5 | 現在可啟動 |
+| 2 | [semantic](session-health-jev-semantic.md) | T05–T06＋本片驗證/review | Yellow=6 | offline 已驗收的 exact candidate 成為基底 |
+| 3 | [routing](session-health-jev-routing.md) | T07–T09＋整合驗證/review | Yellow=6 | semantic 已驗收的 exact candidate 成為基底 |
+
+每片使用 Luna max builder 與 AGY reviewer。Root 在前片通過後將 exact candidate 整合成本機後續基底，再啟動下一片；不以三個 stale base 同時派工。T10/T11 在所有切片及整合檢查完成後才結案。
 
 | ID | 工作 | 主要檔案/介面 | 驗收 |
 |---|---|---|---|

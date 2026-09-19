@@ -28,7 +28,7 @@ flowchart TD
 
 圖中的回寫是有界分階段輸出，不是無限 agent loop；postcheck 只讀凍結的分析產物與原始證據，最多一次修正。
 
-## Modules and contracts
+## Decisions
 
 - `parser_base` 與新 bundle/schema 模組：typed records、source refs、能力與未知值、序列化。
 - `metrics`/`scorer`：legacy＋process-v2；觀察量與語意輸出分層，沒有隱藏混合總分。

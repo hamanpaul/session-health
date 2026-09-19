@@ -7,6 +7,7 @@ This directory holds the project's accepted plans, execution boards and research
 - `superpowers/plans/session-health-jev.md` — accepted implementation plan: 1-1 offline seven-axis analysis, 1-2 Jev batch enhancement, stage 2 dynamic model routing and checked diagnosis.
 - `superpowers/specs/session-health-jev-spec.md` / `session-health-jev-design.md` — behavior and architecture contracts for the accepted plan.
 - `superpowers/workstreams/session-health-jev/todo.md` — Cortex work source and task boundary.
+- `superpowers/plans/session-health-jev-{offline,semantic,routing}.md` — sequential Cortex execution slices; matching stage workstreams own their slice todos.
 - `jev-support-refinement.md` — superseded discussion draft; the accepted plan controls implementation.
 - `research/https-github-com-onestardao-wfgy-tree-main-problem.md` — imported research report on integrating WFGY ProblemMap / skill-problemmap into `session-health`.
 - `plan.md` — synced mirror of the active implementation plan.
