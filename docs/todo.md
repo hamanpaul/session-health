@@ -2,11 +2,13 @@
 
 ## Active work — 2026-09-19
 
-The accepted [Jev implementation plan](superpowers/plans/session-health-jev.md) is ready for Cortex intake. The [workstream todo](superpowers/workstreams/session-health-jev/todo.md) is the sole active Cortex todo source. The operator SQLite task ledger currently records PLAN=in_progress and T01–T11=pending; no product implementation or review is complete yet.
+The accepted [Jev implementation plan](superpowers/plans/session-health-jev.md) is split into three sequential Cortex slices under parent issue #4: offline #5, semantic #6, routing #7. Each slice has its own stage workstream todo; the [parent board](superpowers/workstreams/session-health-jev/todo.md) tracks total scope.
+
+Launch snapshot: PLAN and INTAKE completed; T01 in progress, T02–T11 pending. Cortex run `workflow-ccfc87313fe9e42c761d` has passed worktree isolation and dispatched Luna max job `wf-17c86c880d-tdd-red-611`. AGY is bound to later review cards; no review or feature completion is claimed. The operator SQLite ledger and current run/usage snapshots are saved alongside the local 260919 report, under `implementation-260919/`.
 
 | Work | Owner | Status |
 |---|---|---|
-| T01–T04: portable evidence and offline seven-axis analysis | Luna max | Pending |
+| T01–T04: portable evidence and offline seven-axis analysis | Luna max | T01 in progress; T02–T04 pending |
 | T05–T06: Jev typed batches and usage | Luna max | Pending |
 | T07–T08: model discovery, routing, analyzer and postcheck | Luna max | Pending |
 | T09: E2E, pilot and documentation | Luna max | Pending |

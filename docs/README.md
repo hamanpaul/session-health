@@ -21,5 +21,5 @@ This directory holds the project's accepted plans, execution boards and research
 ## Sync contract
 
 - The accepted plan/spec/design define current requirements; `docs/plan.md` links the current plan and retains historical decisions.
-- The workstream todo is the single Cortex active todo source; `docs/todo.md` is its readable execution-board mirror.
+- Each execution slice has one Cortex active workstream todo; the parent tracks total scope and `docs/todo.md` mirrors the launch/execution board.
 - The operator keeps a local SQLite task ledger alongside run evidence; it is separate from Cortex's Manager-owned lifecycle registry.
