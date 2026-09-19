@@ -25,6 +25,8 @@ Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.1-pro-high, read-on
 5. Run synthetic mock E2E and labeled English/Traditional-Chinese pilot fixtures; perform a small non-sensitive live Jev smoke only if the key is visible and record actual model/tokens.
 6. AGY adversarial review of exact candidate, Luna repairs, then root independent verification.
 
+7. Update source changes, tests and documentation together, including CLI help and a changelog entry describing observable behavior and compatibility changes.
+
 ## Validation and scope
 
 Source changes, tests and documentation are acceptance surfaces. Run meaningful unit/integration tests; update CLI help and changelog/release notes as applicable. Produce reports/verify and reports/review evidence. Do not tick master T10/T11 until all slices pass. Unknown usage remains null; mock API and portable fixtures are not live/API/platform proof.
