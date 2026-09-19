@@ -1,0 +1,8 @@
+{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{"id":"codex-nested-fixture","cwd":"/tmp/session-health","model":"fixture-model"}}
+{"timestamp":"2026-09-19T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Run the fixture commands."}]}}
+{"timestamp":"2026-09-19T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"printf nested\"}","call_id":"call-nested-1"}}
+{"timestamp":"2026-09-19T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"future_tool","arguments":"{\"opaque\":true}","call_id":"call-unsupported-1"}}
+{"timestamp":"2026-09-19T00:00:04Z","type":"event_msg","payload":{"type":"future_event","status":"unknown","value":"preserve"}}
+{"timestamp":"2026-09-19T00:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-unsupported-1","output":"unsupported tool"}}
+{"timestamp":"2026-09-19T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-nested-1","output":"nested\n"}}
+{"timestamp":"2026-09-19T00:00:07Z","type":"response_item","payload":{"role":"assistant","content":[{"type":"output_text","text":"Completed."}]}}

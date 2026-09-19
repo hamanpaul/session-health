@@ -1,0 +1,7 @@
+{"timestamp":"2026-09-19T00:00:00Z","type":"session.start","data":{"sessionId":"copilot-json-args","copilotVersion":"fixture"}}
+{"timestamp":"2026-09-19T00:00:01Z","type":"user.message","data":{"content":"Run the fixture tools."}}
+{"timestamp":"2026-09-19T00:00:02Z","type":"tool.execution_start","data":{"toolCallId":"tool-bash-1","toolName":"bash","arguments":"{\"command\":\"printf copilot\"}"}}
+{"timestamp":"2026-09-19T00:00:03Z","type":"tool.execution_start","data":{"toolCallId":"tool-unsupported-1","toolName":"future.tool","arguments":"{\"opaque\":true}"}}
+{"timestamp":"2026-09-19T00:00:04Z","type":"tool.execution_complete","data":{"toolCallId":"tool-bash-1","success":false,"result":{"content":"permission denied"}}}
+{"timestamp":"2026-09-19T00:00:05Z","type":"tool.execution_complete","data":{"toolCallId":"tool-unsupported-1","success":false,"result":{"content":"unsupported tool"}}}
+{"timestamp":"2026-09-19T00:00:06Z","type":"assistant.message","data":{"content":"The tools were not available."}}
