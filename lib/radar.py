@@ -285,6 +285,16 @@ def render_report_terminal(report: SessionReport, use_color: bool = True) -> str
             parts.append(problemmap_box)
     if report.agent_analysis is not None and report.agent_analysis.success:
         parts.append(render_agent_terminal(report.agent_analysis))
+    if report.process_v2 is not None:
+        lines = [_c("Process-v2 observable profile", "bold", use_color)]
+        for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+            axis = report.process_v2.axes.get(axis_id)
+            if axis is None:
+                continue
+            value = axis.metric.value
+            rendered = "null" if value is None else f"{value:.3f}"
+            lines.append(f"  {axis_id:5s} {rendered:>7s}  {axis.metric.status}  ({axis.metric.reason})")
+        parts.append("\n".join(lines))
     return "\n".join(part for part in parts if part)
 
 
@@ -312,6 +322,8 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
     if isinstance(item, BatchReport):
         lines = []
         lines.append(f"Batch: {len(item.sessions)} sessions  Target: {item.target_kind}")
+        if item.profile:
+            lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
         lines.append("-" * 88)
         lines.append(f"{'Session':24s} {'Score':>7s} {'Grade':6s} {'主家族'}")
         lines.append("-" * 88)
@@ -329,6 +341,7 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
     lines.append(f"Session: {score.session_id}  ({score.source}, {score.model})")
     lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
     if isinstance(item, SessionReport):
+        lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
         if item.diagnosis_summary is not None:
             lines.append(f"加權診斷: {item.diagnosis_summary.summary_zh}")
         elif item.problemmap is not None:
@@ -347,10 +360,15 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
     import json
     if isinstance(item, BatchReport):
         payload = {
+            "schema_version": "report-2",
             "report_kind": item.report_kind,
             "target_kind": item.target_kind,
+            "profile": item.profile,
             "analysis_layers": item.analysis_layers,
             "sync_status": item.sync_status,
+            "processing_status": item.processing_status,
+            "processing_diagnostics": item.processing_diagnostics,
+            "analysis_status": item.analysis_status,
             "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
             "evidence_summary": item.evidence_summary,
             "artifact_sources": item.artifact_sources,
@@ -371,6 +389,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
 
     score = _unwrap_score(item)
     payload = {
+        "schema_version": "report-2",
         "session_id": score.session_id,
         "source": score.source,
         "model": score.model,
@@ -383,6 +402,14 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             "max": round(score.composite_max, 2),
             "stddev": round(score.composite_stddev, 2),
         },
+        "legacy": {
+            "profile": "legacy",
+            "composite": round(score.composite, 2),
+            "grade": score.grade,
+            "status": "heuristic_uncalibrated",
+            "formula_dimensions": ["STATE", "SNR", "REACT", "DEPTH", "CONV"],
+            "note": "Compatibility composite; not the process-v2 score.",
+        },
         "events": {
             "compactions": score.compaction_count,
             "aborts": score.abort_count,
@@ -393,8 +420,14 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             {
                 "report_kind": item.report_kind,
                 "target_kind": item.target_kind,
+                "profile": item.profile,
                 "analysis_layers": item.analysis_layers,
                 "sync_status": item.sync_status,
+                "processing_status": item.processing_status,
+                "processing_diagnostics": item.processing_diagnostics,
+                "analysis_status": item.analysis_status,
+                "bundle": item.bundle_manifest or None,
+                "process_v2": item.process_v2.to_dict() if item.process_v2 is not None else None,
                 "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
                 "evidence_summary": item.evidence_summary,
                 "artifact_sources": item.artifact_sources,

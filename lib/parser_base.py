@@ -15,6 +15,21 @@ class ToolCall:
     output: str = ""
     success: Optional[bool] = None
     exit_code: Optional[int] = None
+    status: str = "unknown"
+    source_ref: str = ""
+    diagnostics: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Keep the three-valued outcome explicit and backwards compatible."""
+
+        if self.success is True:
+            self.status = "success"
+        elif self.success is False:
+            self.status = "failed"
+        elif self.exit_code is not None:
+            self.status = "success" if self.exit_code == 0 else "failed"
+        elif self.status not in {"success", "failed", "unknown"}:
+            self.status = "unknown"
 
 
 @dataclass
@@ -34,6 +49,7 @@ class Turn:
     # Cached raw text sizes for SNR calculation
     raw_tool_output_chars: int = 0
     total_context_chars: int = 0
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_tools(self) -> bool:
@@ -47,7 +63,7 @@ class Turn:
             if tc.name in ("exec_command", "shell", "shell_command", "bash"):
                 cmd = tc.arguments.get("command", tc.arguments.get("cmd", ""))
                 if cmd:
-                    cmds.append(cmd)
+                    cmds.append(str(cmd))
         return cmds
 
 
@@ -69,6 +85,10 @@ class Session:
     task_started_count: int = 0
     task_complete_count: int = 0
     turn_aborted_count: int = 0
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    parser_version: str = "legacy-1"
+    source_ref: str = ""
+    source_capabilities: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def turn_count(self) -> int:

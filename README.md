@@ -284,14 +284,47 @@ source ~/.bashrc
 - 同步產生 HTML 報告
 - 盡可能補上 weighted diagnosis（含 PM 欄位中文說明與 Fx 比重）與 agent analysis
 
+### 可攜式離線分析
+
+`--offline` 會在所有入口關閉 Agent/model/network 呼叫，只使用本機 parser、可攜式
+`SessionBundle` 與 deterministic `process-v2` 七軸觀察。新 profile 的比例一定帶
+`numerator`、`denominator`、`excluded_count` 與 `status`；沒有適用分母時使用 `null`，
+不把缺證據補成 0、100 或成功。既有 heuristic composite 與 A–F 欄位仍保留，必要時可
+用 `--profile legacy` 明示舊 profile。
+
+```bash
+# 產生單一 session 的離線 JSON（不會呼叫任何 analyzer）
+session-health session.jsonl --offline --format json
+
+# 匯出可跨機 replay 的 bounded bundle，再從 bundle 產生同一份離線分析
+session-health session.jsonl --offline --export-bundle session.bundle.json
+session-health --import-bundle session.bundle.json --offline --format html --output report.html
+
+# 批次輸出會保留每一筆成功、partial 或 failed 狀態
+session-health --dir ./fixtures --offline --format json
+```
+
+Bundle 只保留 bounded canonical events/facts、相對 source refs、redacted evidence、
+case candidates 與 observation cutoffs；redaction 是有限的 heuristic 偵測，不能宣稱
+找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
+join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
+
+這個 slice 的驗證是 Linux 本機標準庫與 portable fixtures 的離線驗證；它不等同於
+live API/model、真實 agent CLI、Windows/macOS 或平台 correctness 驗證。那些執行環境與
+語意校準保留給後續切片，缺少資料時報告會保留 `unknown`、`not_applicable` 或
+`failed` 狀態。
+
 ### 完整 Help
 
 ```
 usage: eval_session [-h] [--dir DIR] [--latest N]
+                    [--import-bundle FILE]
                     [--source {auto,codex,copilot}]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
                     [--analyze] [--test-agent]
+                    [--offline] [--profile {legacy,process-v2}]
+                    [--export-bundle FILE_OR_DIR] [--outcome-file FILE]
                     [SESSION_OR_PATH]
 
 Agent CLI Session 動態 Prompt 品質量化評估
@@ -313,6 +346,12 @@ options:
   --verbose, -v              顯示每輪詳細分數
   --analyze, -a              啟用 AI Agent 分析（僅限單一 session）
   --test-agent               使用測試用 agent（copilot/gpt-5-mini）
+  --offline                  關閉 model/network，只做本機 deterministic 分析
+  --profile {legacy,process-v2}
+                             選擇舊 heuristic 或新版可觀察七軸 profile
+  --import-bundle FILE       匯入 portable SessionBundle JSON
+  --export-bundle FILE_OR_DIR 匯出 portable SessionBundle
+  --outcome-file FILE        以 exact session/task identity 匯入外部 outcome fixture
 ```
 
 ### 使用範例
@@ -359,6 +398,12 @@ session-health 019c8d32 -f table
 
 # 產生 HTML 報告（同時顯示終端摘要）
 session-health 019c8d32 -o report.html
+
+# 明確離線 process-v2（positional auto-analyze 也會被停用）
+session-health 019c8d32 --offline --format json
+
+# 明示 legacy 相容 profile
+session-health 019c8d32 --offline --profile legacy --format json
 
 # 顯示每輪詳細分數
 session-health 019c8d32 -v

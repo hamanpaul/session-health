@@ -479,6 +479,36 @@ def _render_artifact_sources_html(sources: Dict[str, str]) -> str:
 """
 
 
+def _render_process_v2_html(process_result: object | None) -> str:
+    """Render observable process-v2 facts without implying a composite score."""
+
+    if process_result is None or not hasattr(process_result, "axes"):
+        return ""
+    rows = []
+    for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+        axis = process_result.axes.get(axis_id)
+        if axis is None:
+            continue
+        value = "null" if axis.metric.value is None else f"{axis.metric.value:.3f}"
+        rows.append(
+            "<tr><td>{axis}</td><td>{value}</td><td>{status}</td><td>{reason}</td></tr>".format(
+                axis=html.escape(axis_id),
+                value=html.escape(value),
+                status=html.escape(axis.metric.status),
+                reason=html.escape(axis.metric.reason),
+            )
+        )
+    return """
+<div class="agent-analysis">
+    <h2>Process-v2 observable profile</h2>
+    <p>Ratios are evidence-bounded; null means the axis was not applicable or lacked an observable denominator.</p>
+    <p>The legacy composite shown in the compatibility radar remains heuristic and uncalibrated; it is not a process-v2 score.</p>
+    <table><thead><tr><th>Axis</th><th>Value</th><th>Status</th><th>Observation</th></tr></thead>
+    <tbody>{rows}</tbody></table>
+</div>
+""".format(rows="".join(rows))
+
+
 def _render_batch_html(batch: BatchReport) -> str:
     """Generate a standalone HTML page for a batch report."""
 
@@ -638,6 +668,7 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     if isinstance(item, SessionReport):
         extra_sections = "".join(
             [
+                _render_process_v2_html(item.process_v2),
                 _render_diagnosis_summary_html(item.diagnosis_summary),
                 _render_artifact_sources_html(item.artifact_sources),
                 render_agent_html_section(item.agent_analysis)
