@@ -1,20 +1,24 @@
 # Project docs
 
-This directory holds the project-facing planning and research artifacts for the first refactor.
+This directory holds the project's accepted plans, execution boards and research artifacts.
 
 ## Files
 
+- `superpowers/plans/session-health-jev.md` — accepted implementation plan: 1-1 offline seven-axis analysis, 1-2 Jev batch enhancement, stage 2 dynamic model routing and checked diagnosis.
+- `superpowers/specs/session-health-jev-spec.md` / `session-health-jev-design.md` — behavior and architecture contracts for the accepted plan.
+- `superpowers/workstreams/session-health-jev/todo.md` — Cortex work source and task boundary.
+- `jev-support-refinement.md` — superseded discussion draft; the accepted plan controls implementation.
 - `research/https-github-com-onestardao-wfgy-tree-main-problem.md` — imported research report on integrating WFGY ProblemMap / skill-problemmap into `session-health`.
 - `plan.md` — synced mirror of the active implementation plan.
 - `todo.md` — synced execution board derived from the approved plan and current SQL todo state.
 
 ## Current taxonomy decision
 
-- The existing quantitative, PM1, and Atlas diagnostic categories are currently sufficient to express analysis results.
-- The first refactor should only add report/document wrapper attributes when needed, rather than inventing new diagnostic families.
+- The seven axis IDs and PM1/Atlas taxonomy remain stable.
+- The accepted Jev plan strengthens axis semantics in a versioned process-v2 profile, preserving the documented legacy profile.
 
 ## Sync contract
 
-- Session-state `plan.md` remains the plan-mode control file.
-- Repo `docs/plan.md` and `docs/todo.md` are the formal project-facing documents and should stay in sync with session planning/tracking.
-- Future implementation work should update both the SQL todo state and the repo docs mirror together.
+- The accepted plan/spec/design define current requirements; `docs/plan.md` links the current plan and retains historical decisions.
+- The workstream todo is the single Cortex active todo source; `docs/todo.md` is its readable execution-board mirror.
+- The operator keeps a local SQLite task ledger alongside run evidence; it is separate from Cortex's Manager-owned lifecycle registry.

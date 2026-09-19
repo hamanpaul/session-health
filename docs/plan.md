@@ -1,4 +1,8 @@
-> Synced mirror of the active session plan.
+> Active plan (2026-09-19): [七軸離線分析、Jev 增強與動態選模](superpowers/plans/session-health-jev.md)。使用者已授權 Cortex Luna max 實作與 agy 對抗 review。下文為已完成的歷史 refactor 計畫，保留供追溯；不得作本次新需求的範圍上限。
+>
+> 本次查詢式執行台帳由 SQLite 保存並鏡像至 docs/todo.md；Cortex workflow/job 狀態另由其 Manager 管理。
+>
+> Historical mirror of the earlier session plan.
 > Copilot plan-mode control file lives in session state; this repo copy is the formal project-facing version.
 
 # Plan: `docs/` 納入研究與規劃文件，並檢視分析屬性種類是否足夠
