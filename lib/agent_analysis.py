@@ -91,7 +91,7 @@ def build_session_health_task_profile(*, scope: str = "single", count: int = 1) 
         "CTX": "context continuity and bounded context use",
         "REACT": "reaction and recovery behavior",
         "DEPTH": "analysis depth and uncertainty separation",
-        "CONV": "conversation coherence and task progression",
+        "CONV": "convergence and task completion",
         "TOOL": "tool use, outcomes, and failure handling",
     }
     return {
@@ -127,7 +127,12 @@ def build_session_health_task_profile(*, scope: str = "single", count: int = 1) 
     }
 
 
-DEFAULT_SESSION_HEALTH_TASK_PROFILE = build_session_health_task_profile()
+DEFAULT_SESSION_HEALTH_TASK_PROFILE = {
+    **build_session_health_task_profile(),
+    "scope": "unspecified",
+    "count": None,
+    "session_count": None,
+}
 
 
 def _checked_at() -> str:
@@ -650,6 +655,13 @@ def _operator_availability_from_entry(
 
 
 def _build_operator_candidate(entry: Mapping[str, Any], existing: Optional[AgentConfig] = None) -> AgentConfig:
+    if existing is not None and (existing.availability or {}).get("discovery") == "codex_model_cache":
+        # A discovered card has unknown byte/capability limits. A full operator
+        # card must keep the same adapter defaults it had before cache discovery.
+        candidate = _build_operator_candidate(entry)
+        if "capability_evidence" not in entry:
+            candidate.capability_evidence = copy.deepcopy(existing.capability_evidence)
+        return candidate
     name, executor, provider, route, identity = _entry_identity(entry)
     model_id = identity["model_id"]
     settings = identity["inference_settings"]
@@ -1406,6 +1418,12 @@ def call_agent(
         raise ValueError("max_retries must be non-negative")
     source_chain = [TEST_AGENT] if test_mode else (agent_chain if agent_chain is not None else AGENT_CHAIN)
     candidates = [item.clone() for item in source_chain]
+    if agent_chain is None and not test_mode:
+        known = {(item.executor, item.model_id) for item in candidates}
+        candidates.extend(
+            item for item in discover_agent_catalog()
+            if (item.executor, item.model_id) not in known
+        )
     chosen_backend = routing_backend if routing_backend is not None else backend
     if request is None:
         effective_request = AnalysisRequest(

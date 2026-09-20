@@ -457,6 +457,7 @@ def _choice_question(request: AnalysisRequest, candidates: Sequence[Any]) -> Any
             "Use insufficient_model_evidence when essential task or suitability evidence is missing. "
             "Use no_suitable_model only when supplied evidence shows all options fail a required "
             "constraint. Do not claim this provisional selection proves which model is objectively best."
+            " Byte, output and time limits are ceilings, not requested output size or measured runtime."
         ),
         answer_type="choice",
         case_id="routing",

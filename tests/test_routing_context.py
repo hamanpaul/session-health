@@ -17,7 +17,7 @@ from lib.agent_analysis import (
     discover_agent_catalog,
     operator_catalog,
 )
-from lib.jev_routing import AnalysisRequest, RouteDecision
+from lib.jev_routing import AnalysisRequest, RouteDecision, evaluate_candidate
 
 
 def _command(_prompt: str):
@@ -77,8 +77,8 @@ class RoutingContextTest(unittest.TestCase):
     def test_default_caller_profile_reaches_routing_without_prompt(self):
         request = self._capture_route()
         profile = request.task_profile
-        self.assertEqual(profile["scope"], "single")
-        self.assertEqual(profile["count"], 1)
+        self.assertEqual(profile["scope"], "unspecified")
+        self.assertIsNone(profile["count"])
         self.assertEqual(set(profile["axes"]), {"SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"})
         self.assertEqual(profile["analysis_output"]["language"], "zh-TW")
         self.assertEqual(profile["model_suitability"]["decision"], "provisional_suitability")
@@ -174,6 +174,31 @@ class RoutingContextTest(unittest.TestCase):
             defaults = {item.name for item in discover_agent_catalog(model_cache_path=bad_path)}
             self.assertTrue(defaults)
             self.assertNotIn("codex/gpt-cache-visible", defaults)
+
+    def test_full_operator_card_keeps_defaults_despite_cache_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "models_cache.json"
+            path.write_text(json.dumps({"models": [{"slug": "gpt-cache-visible", "visibility": "list", "context_window": 272000}]}))
+            with patch.object(analysis_module, "CODEX_MODEL_CACHE_PATH", path):
+                cards = operator_catalog([{
+                    "name": "codex/gpt-cache-visible", "executor": "codex", "provider": "openai",
+                    "route": "codex.exec", "model_id": "gpt-cache-visible",
+                    "inference_settings": {"effort": "max", "stdin": True},
+                    "status": "available", "expires_at": "2099-01-01T00:00:00Z",
+                }])
+            card = next(c for c in cards if c.model_id == "gpt-cache-visible")
+            self.assertTrue(evaluate_candidate(card, AnalysisRequest(context_bytes=5709)).eligible)
+            self.assertEqual(card.context_window, 192000)
+            self.assertEqual(card.to_dict()["capability_evidence"]["provenance"], "provider_advertised")
+
+    def test_default_analyzer_invocation_receives_discovered_candidates(self):
+        discovered = _candidate("fixture/new-model")
+        seen = []
+        with patch.object(analysis_module, "discover_agent_catalog", return_value=[discovered]), patch.object(
+            analysis_module, "choose_model", side_effect=lambda cards, *_args, **_kwargs: (seen.extend(cards) or RouteDecision()),
+        ):
+            call_agent("bounded prompt", max_retries=0)
+        self.assertIn(discovered.model_id, [c.model_id for c in seen])
 
 
 if __name__ == "__main__":
