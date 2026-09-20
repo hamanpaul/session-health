@@ -20,9 +20,17 @@ from typing import List, Tuple
 # Add parent dir to path for relative imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib.parser_base import Session
+from lib.parser_base import (
+    MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_RECORD_CHARS,
+    MAX_SESSION_RECORDS,
+    Session,
+    SessionInputLimits,
+)
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
+from lib.bundle import BundleError, BundleLimits, SessionBundle, build_session_bundle, export_bundle, import_bundle
+from lib.metrics.process_v2 import analyze_process_v2
 from lib.scorer import score_session, SessionScore
 from lib.report_types import BatchReport, SessionReport
 from lib.problemmap import (
@@ -43,11 +51,19 @@ from lib.agent_analysis import (
 def detect_source(path: Path) -> str:
     """Auto-detect whether a JSONL file is from Codex or Copilot CLI."""
     try:
+        if path.suffix == ".json" or path.name.endswith(".bundle.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return "unknown"
+            if payload.get("schema") == "session-health.session-bundle":
+                return str(payload.get("manifest", {}).get("source", "unknown"))
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             first_line = f.readline().strip()
             if not first_line:
                 return "unknown"
             rec = json.loads(first_line)
+            if not isinstance(rec, dict):
+                return "unknown"
 
             # Copilot CLI uses top-level "type" like "session.start"
             if rec.get("type", "").startswith("session."):
@@ -66,33 +82,61 @@ def detect_source(path: Path) -> str:
     return "unknown"
 
 
-def parse_session(path: Path, source: str = "auto") -> Session:
+def is_bundle_path(path: Path) -> bool:
+    """Return whether a JSON artifact is a SessionBundle."""
+    if path.name.endswith(".bundle.json") or path.suffix == ".bundle":
+        return True
+    if path.suffix != ".json":
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("schema") == "session-health.session-bundle"
+
+
+def parse_session(
+    path: Path,
+    source: str = "auto",
+    *,
+    input_limits: SessionInputLimits | None = None,
+) -> Session:
     """Parse a session file with auto-detection or explicit source."""
+    input_limits = input_limits or SessionInputLimits()
+    if is_bundle_path(path):
+        return import_bundle(path).to_session()
     if source == "auto":
         source = detect_source(path)
 
     if source == "codex":
-        return parse_codex_session(path)
+        return parse_codex_session(path, input_limits=input_limits)
     elif source == "copilot":
-        return parse_copilot_session(path)
+        return parse_copilot_session(path, input_limits=input_limits)
     else:
         # Try both, prefer whichever produces more turns
         try:
-            s1 = parse_codex_session(path)
+            s1 = parse_codex_session(path, input_limits=input_limits)
         except Exception:
             s1 = Session(id="", source="codex")
         try:
-            s2 = parse_copilot_session(path)
+            s2 = parse_copilot_session(path, input_limits=input_limits)
         except Exception:
             s2 = Session(id="", source="copilot")
         return s1 if len(s1.turns) >= len(s2.turns) else s2
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def find_sessions_in_dir(dir_path: Path, source: str = "auto") -> List[Path]:
     """Recursively find all .jsonl session files in a directory."""
-    files = sorted(dir_path.rglob("*.jsonl"))
+    files = sorted(list(dir_path.rglob("*.jsonl")) + list(dir_path.rglob("*.bundle.json")))
     if source != "auto":
-        return [f for f in files if detect_source(f) == source]
+        return [f for f in files if f.name.endswith(".bundle.json") or detect_source(f) == source]
     return files
 
 
@@ -200,6 +244,11 @@ def main() -> None:
         metavar="N",
         help="Evaluate the N most recent sessions",
     )
+    group.add_argument(
+        "--import-bundle",
+        metavar="FILE",
+        help="Import one portable SessionBundle JSON artifact",
+    )
 
     # Options
     parser.add_argument(
@@ -207,6 +256,41 @@ def main() -> None:
         choices=["auto", "codex", "copilot"],
         default="auto",
         help="Session source format (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--max-input-bytes",
+        type=_positive_int,
+        default=MAX_SESSION_INPUT_BYTES,
+        metavar="N",
+        help="Raw JSONL read budget in bytes (default: 128 MiB; over-budget input is partial)",
+    )
+    parser.add_argument(
+        "--max-input-records",
+        type=_positive_int,
+        default=MAX_SESSION_RECORDS,
+        metavar="N",
+        help="Maximum raw JSONL records to construct (default: 50000)",
+    )
+    parser.add_argument(
+        "--max-input-record-chars",
+        type=_positive_int,
+        default=MAX_SESSION_RECORD_CHARS,
+        metavar="N",
+        help="Maximum characters in one raw JSONL record (default: 1000000)",
+    )
+    parser.add_argument(
+        "--max-bundle-bytes",
+        type=_positive_int,
+        default=BundleLimits().max_bytes,
+        metavar="N",
+        help="Portable bundle byte budget (default: 2000000; evidence is truncated to fit)",
+    )
+    parser.add_argument(
+        "--max-bundle-events",
+        type=_positive_int,
+        default=BundleLimits().max_events,
+        metavar="N",
+        help="Portable bundle event budget (default: 10000)",
     )
     parser.add_argument(
         "--format", "-f",
@@ -239,10 +323,29 @@ def main() -> None:
         action="store_true",
         help="Use test agent (copilot/gpt-5-mini) instead of production chain",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable model/network analysis and produce only local deterministic results",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["legacy", "process-v2"],
+        default="process-v2",
+        help="Report profile (default: process-v2; legacy keeps the historical heuristic fields)",
+    )
+    parser.add_argument(
+        "--export-bundle",
+        metavar="FILE_OR_DIR",
+        help="Export a portable SessionBundle (a directory is used for batch input)",
+    )
+    parser.add_argument(
+        "--outcome-file",
+        metavar="FILE",
+        help="Optional local JSON outcome fixture joined only on exact session/task identity",
+    )
 
     args = parser.parse_args()
-    explicit_format = any(flag in sys.argv[1:] for flag in ("--format", "-f"))
-    explicit_analyze = any(flag in sys.argv[1:] for flag in ("--analyze", "-a", "--test-agent"))
 
     # Auto-detect format from output filename
     if args.output and args.format == "radar":
@@ -251,17 +354,21 @@ def main() -> None:
         elif args.output.endswith(".json"):
             args.format = "json"
 
-    # One-command flow: session ID / path alone produces terminal summary + HTML bundle.
-    if args.session_target and not explicit_format and not explicit_analyze and not args.output:
-        args.format = "html"
-        args.analyze = True
+    # Positional input is deterministic by default.  Model analysis is an
+    # explicit opt-in via --analyze; a plain path must never launch an agent.
 
     use_color = not args.no_color and sys.stdout.isatty()
 
     # Collect session files to evaluate
     sessions_to_eval: List[Tuple[Path, str, str]] = []
 
-    if args.session_target:
+    if args.import_bundle:
+        p = Path(args.import_bundle)
+        if not p.is_file():
+            print(f"Error: not a bundle file: {p}", file=sys.stderr)
+            sys.exit(1)
+        sessions_to_eval.append((p, "auto", "bundle"))
+    elif args.session_target:
         p = Path(args.session_target)
         if p.is_dir():
             # Session dir: use events.jsonl when present; otherwise treat as sessions dir.
@@ -301,13 +408,39 @@ def main() -> None:
         print("No session files found.", file=sys.stderr)
         sys.exit(1)
 
-    # Evaluate each session
+    input_limits = SessionInputLimits(
+        max_bytes=args.max_input_bytes,
+        max_records=args.max_input_records,
+        max_record_chars=args.max_input_record_chars,
+    )
+    bundle_limits = BundleLimits(
+        max_bytes=args.max_bundle_bytes,
+        max_events=args.max_bundle_events,
+    )
+
+    outcome_fixture = None
+    if args.outcome_file:
+        try:
+            outcome_fixture = json.loads(Path(args.outcome_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Error: invalid outcome fixture: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    # Evaluate each selected session.  Parse failures stay in a batch report so
+    # that a partial result cannot be mistaken for complete coverage.
     reports: List[SessionReport] = []
     for path, source, target_kind in sessions_to_eval:
+        bundle = None
+        processing_diagnostics = []
         try:
-            session = parse_session(path, source)
-            if not session.turns:
-                continue
+            if is_bundle_path(path):
+                bundle = import_bundle(path, limits=bundle_limits)
+                session = bundle.to_session()
+            else:
+                session = parse_session(path, source, input_limits=input_limits)
+            if args.profile == "process-v2" or args.export_bundle or args.offline:
+                if bundle is None:
+                    bundle = build_session_bundle(session, limits=bundle_limits)
             sc = score_session(session)
             evidence_summary = build_evidence_summary(session, sc)
             problemmap = diagnose_problemmap(session, sc, evidence_summary=evidence_summary)
@@ -317,6 +450,23 @@ def main() -> None:
                 evidence_summary=evidence_summary,
                 problemmap=problemmap,
             )
+            process_result = (
+                analyze_process_v2(session, bundle=bundle, external_outcome=outcome_fixture)
+                if args.profile == "process-v2"
+                else None
+            )
+            status = "complete" if session.turns else "failed"
+            if status != "failed" and process_result is not None and process_result.status == "failed":
+                status = "failed"
+            elif status != "failed" and bundle is not None and bundle.coverage.get("input_status") == "failed":
+                status = "failed"
+            elif status != "failed" and process_result is not None and process_result.status == "partial":
+                status = "partial"
+            elif status != "failed" and bundle is not None and bundle.coverage.get("input_status") == "partial":
+                status = "partial"
+            elif session.diagnostics and status == "complete":
+                status = "partial"
+            processing_diagnostics.extend(session.diagnostics)
             reports.append(
                 SessionReport(
                     session=session,
@@ -325,13 +475,43 @@ def main() -> None:
                     problemmap=problemmap,
                     diagnosis_summary=diagnosis_summary,
                     evidence_summary=evidence_summary,
-                    artifact_sources={"session_input": str(path)},
+                    artifact_sources={
+                        "session_input": path.name,
+                        "source_ref": bundle.manifest.get("source_ref", path.name) if bundle else path.name,
+                    },
                     sync_status="session-only",
+                    profile=args.profile,
+                    process_v2=process_result,
+                    bundle_manifest=bundle.manifest if bundle else {},
+                    processing_status=status,
+                    processing_diagnostics=processing_diagnostics,
                 )
             )
-        except Exception as e:
-            print(f"Warning: failed to parse {path}: {e}", file=sys.stderr)
-            continue
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            print(f"Warning: failed to parse {path}: {message}", file=sys.stderr)
+            failed_session = Session(
+                id=path.stem,
+                source=source if source in ("codex", "copilot") else "unknown",
+                source_ref=path.name,
+                diagnostics=[{"kind": "parse_failure", "status": "failed", "message": message}],
+            )
+            failed_score = score_session(failed_session)
+            failed_process = analyze_process_v2(failed_session, external_outcome=outcome_fixture) if args.profile == "process-v2" else None
+            reports.append(
+                SessionReport(
+                    session=failed_session,
+                    score=failed_score,
+                    target_kind=target_kind,
+                    evidence_summary={},
+                    artifact_sources={"session_input": path.name},
+                    sync_status="session-only",
+                    profile=args.profile,
+                    process_v2=failed_process,
+                    processing_status="failed",
+                    processing_diagnostics=failed_session.diagnostics,
+                )
+            )
 
     if not reports:
         print("No valid sessions found.", file=sys.stderr)
@@ -341,12 +521,24 @@ def main() -> None:
     batch_report = BatchReport(
         sessions=reports,
         target_kind=batch_target_kinds.pop() if len(batch_target_kinds) == 1 else "mixed",
+        profile=args.profile,
+        processing_status=(
+            "failed" if any(report.processing_status == "failed" for report in reports)
+            else "partial" if any(report.processing_status == "partial" for report in reports)
+            else "complete"
+        ),
+        processing_diagnostics=[
+            {"session_id": report.score.session_id, "status": report.processing_status, "diagnostics": report.processing_diagnostics}
+            for report in reports
+            if report.processing_status != "complete"
+        ],
         diagnosis_summary=build_batch_diagnosis_summary(reports),
         evidence_summary={
             "session_count": len(reports),
-            "average_score": round(sum(report.score.composite for report in reports) / len(reports), 1),
-            "min_score": round(min(report.score.composite for report in reports), 1),
-            "max_score": round(max(report.score.composite for report in reports), 1),
+            "evaluated_session_count": sum(report.processing_status != "failed" for report in reports),
+            "average_score": _average_evaluated_score(reports),
+            "min_score": _extreme_evaluated_score(reports, minimum=True),
+            "max_score": _extreme_evaluated_score(reports, minimum=False),
             "primary_families": [
                 report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析"))
                 for report in reports
@@ -366,13 +558,30 @@ def main() -> None:
                 if args.session_target
                 else args.dir
                 if args.dir
+                else args.import_bundle
+                if args.import_bundle
                 else f"latest:{args.latest}"
             )
         },
         sync_status="session-only",
     )
 
-    if args.analyze:
+    if args.analyze and args.offline:
+        # Explicit offline mode wins over positional auto-analysis and over an
+        # explicit --analyze request.  Keep the reason in the report instead of
+        # invoking any external CLI or model transport.
+        for report in reports:
+            report.analysis_status = "disabled_offline"
+            report.processing_diagnostics.append({
+                "kind": "analysis_disabled_offline",
+                "status": "not_requested",
+            })
+        batch_report.analysis_status = "disabled_offline"
+        batch_report.processing_diagnostics.append({
+            "kind": "analysis_disabled_offline",
+            "status": "not_requested",
+        })
+    elif args.analyze:
         if len(reports) == 1:
             report = reports[0]
             problemmap_payload = None
@@ -391,6 +600,7 @@ def main() -> None:
             )
             analysis = call_agent(prompt, test_mode=args.test_agent)
             report.agent_analysis = analysis
+            report.analysis_status = "completed" if analysis.success else "failed"
             if analysis.success and "agent" not in report.analysis_layers:
                 report.analysis_layers.append("agent")
         else:
@@ -420,11 +630,58 @@ def main() -> None:
                 diagnosis_summary=asdict(batch_report.diagnosis_summary) if batch_report.diagnosis_summary is not None else None,
             )
             batch_report.agent_analysis = call_agent(prompt, test_mode=args.test_agent)
+            batch_report.analysis_status = "completed" if batch_report.agent_analysis.success else "failed"
 
         layers = set(layer for item in reports for layer in item.analysis_layers)
         if batch_report.agent_analysis is not None and batch_report.agent_analysis.success:
             layers.add("agent")
         batch_report.analysis_layers = sorted(layers)
+
+    if args.export_bundle:
+        export_target = Path(args.export_bundle)
+        if len(reports) == 1 and (export_target.suffix or not export_target.exists()):
+            export_bundle(reports[0].session, export_target, limits=bundle_limits)
+            print(f"✓ SessionBundle exported to: {export_target}", file=sys.stderr)
+        else:
+            export_target.mkdir(parents=True, exist_ok=True)
+            used_names: set[str] = set()
+            export_manifest: List[dict] = []
+            for index, report in enumerate(reports, 1):
+                source = (report.session.source or "unknown").replace("/", "_")
+                safe_id = (report.score.session_id or "session").replace("/", "_")
+                artifact_id = str(report.bundle_manifest.get("artifact_id", ""))[:12]
+                stem = "-".join(part for part in (source, safe_id, artifact_id) if part) or f"session-{index}"
+                filename = f"{stem}.bundle.json"
+                suffix = 2
+                while filename in used_names or (export_target / filename).exists():
+                    filename = f"{stem}-{suffix}.bundle.json"
+                    suffix += 1
+                used_names.add(filename)
+                export_bundle(report.session, export_target / filename, limits=bundle_limits)
+                export_manifest.append(
+                    {
+                        "input": report.artifact_sources.get("session_input", "unknown"),
+                        "session_id": report.score.session_id or None,
+                        "source": report.session.source,
+                        "processing_status": report.processing_status,
+                        "artifact": filename,
+                    }
+                )
+            (export_target / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "session-health.bundle-export-manifest",
+                        "version": "1.0",
+                        "processing_status": batch_report.processing_status,
+                        "sessions": export_manifest,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"✓ SessionBundles exported to: {export_target}", file=sys.stderr)
 
     # Output
     if args.format == "html":
@@ -462,7 +719,13 @@ def main() -> None:
 
     # Batch summary
     if len(reports) > 1 and args.format != "json":
-        _print_batch_summary([report.score for report in reports], use_color)
+        _print_batch_summary(reports, use_color)
+
+    if any(report.processing_status == "failed" for report in reports):
+        return 1
+    if any(report.processing_status == "partial" for report in reports):
+        return 2
+    return 0
 
 
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
@@ -478,32 +741,64 @@ def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
         )
 
 
-def _print_batch_summary(scores: List[SessionScore], use_color: bool) -> None:
+def _average_evaluated_score(reports: List[SessionReport]) -> float | None:
+    scores = [report.score.composite for report in reports if report.processing_status != "failed"]
+    return round(sum(scores) / len(scores), 1) if scores else None
+
+
+def _extreme_evaluated_score(reports: List[SessionReport], *, minimum: bool) -> float | None:
+    scores = [report.score.composite for report in reports if report.processing_status != "failed"]
+    if not scores:
+        return None
+    value = min(scores) if minimum else max(scores)
+    return round(value, 1)
+
+
+def _print_batch_summary(reports: List[SessionReport], use_color: bool) -> None:
     """Print summary for batch evaluation."""
-    import statistics
-    composites = [s.composite for s in scores]
-    avg = statistics.mean(composites)
-    med = statistics.median(composites)
+    complete = sum(report.processing_status == "complete" for report in reports)
+    partial = sum(report.processing_status == "partial" for report in reports)
+    failed = sum(report.processing_status == "failed" for report in reports)
 
     print("=" * 52)
-    print(f"Batch Summary: {len(scores)} sessions evaluated")
-    print(f"  Mean:   {avg:.1f}")
-    print(f"  Median: {med:.1f}")
-    print(f"  Min:    {min(composites):.1f}")
-    print(f"  Max:    {max(composites):.1f}")
-    if len(composites) > 1:
-        print(f"  StdDev: {statistics.stdev(composites):.1f}")
+    print(f"Batch Summary: {len(reports)} selected; {complete} complete, {partial} partial, {failed} failed")
+    if reports and all(report.profile != "legacy" for report in reports):
+        print("  Process-v2 axis observations:")
+        for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+            present = 0
+            observed = 0
+            for report in reports:
+                axis = report.process_v2.axes.get(axis_id) if report.process_v2 is not None else None
+                if axis is not None:
+                    present += 1
+                    if axis.metric.status == "observed":
+                        observed += 1
+            print(f"    {axis_id}: {observed}/{present} observed")
+        return
 
-    # Grade distribution
-    grades = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-    for s in scores:
-        grades[s.grade] += 1
-    print(f"\n  Grade distribution:")
-    for g in ["A", "B", "C", "D", "F"]:
-        if grades[g] > 0:
-            bar = "█" * grades[g]
-            print(f"    {g}: {grades[g]:3d} {bar}")
+    import statistics
+    evaluated = [report.score.composite for report in reports if report.processing_status != "failed"]
+    avg = statistics.mean(evaluated) if evaluated else None
+    med = statistics.median(evaluated) if evaluated else None
+    print(f"  Evaluated: {len(evaluated)}")
+    print(f"  Mean:   {'unknown' if avg is None else f'{avg:.1f}'}")
+    print(f"  Median: {'unknown' if med is None else f'{med:.1f}'}")
+    print(f"  Min:    {'unknown' if not evaluated else f'{min(evaluated):.1f}'}")
+    print(f"  Max:    {'unknown' if not evaluated else f'{max(evaluated):.1f}'}")
+    if len(evaluated) > 1:
+        print(f"  StdDev: {statistics.stdev(evaluated):.1f}")
+
+    if reports and all(report.profile == "legacy" for report in reports):
+        grades = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+        for report in reports:
+            if report.processing_status != "failed":
+                grades[report.score.grade] += 1
+        print(f"\n  Grade distribution:")
+        for g in ["A", "B", "C", "D", "F"]:
+            if grades[g] > 0:
+                bar = "█" * grades[g]
+                print(f"    {g}: {grades[g]:3d} {bar}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

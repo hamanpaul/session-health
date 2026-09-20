@@ -7,6 +7,33 @@
 
 ---
 
+## Install
+
+```bash
+git clone https://github.com/hamanpaul/session-health.git
+cd session-health
+./install.sh
+```
+
+The CLI uses Python 3.8+ and the standard library. No package installation is
+required for the offline parser and `process-v2` report.
+
+## Usage
+
+```bash
+python3 eval_session.py SESSION.jsonl --offline --format json
+python3 eval_session.py --dir ./sessions --offline --format table
+```
+
+Use `--analyze` only when an explicit external agent analysis is wanted;
+offline mode never calls a model, network, or agent CLI.
+
+## Version
+
+0.1.0
+
+---
+
 ## 設計理念
 
 在 Agent CLI（如 Codex CLI、Copilot CLI）的工作流程中，每一輪送給 LLM 的 **動態 Prompt** 品質，直接決定了模型能否做出正確的判斷與行動。然而，這些 Prompt 的品質往往是隱性的——使用者難以直觀感受到「這次 session 為什麼跑偏了」或「為什麼模型一直重複同樣的錯誤」。
@@ -278,20 +305,74 @@ source ~/.bashrc
 
 ## 使用方式
 
-如果你直接給 `Session ID`、`session 目錄` 或 `sessions 目錄` 作為唯一參數，`session-health` 會自動走 **bundle 模式**：
+如果你直接給 `Session ID`、session 檔案或 sessions 目錄作為唯一參數，`session-health`
+預設走 deterministic `process-v2`，只輸出本機可觀察的 terminal 報告；HTML 與外部
+agent analysis 都必須明確選擇。`--profile legacy` 才會啟用歷史 heuristic composite。
 
-- terminal 先輸出摘要分數條
-- 同步產生 HTML 報告
-- 盡可能補上 weighted diagnosis（含 PM 欄位中文說明與 Fx 比重）與 agent analysis
+- `--format html` 或輸出 `.html` 才會產生 HTML 報告
+- `--analyze` 才會啟用外部 agent analysis
+- parse failure 會保留在 batch 報告中；`partial` 回傳 exit code 2，`failed` 回傳 exit code 1
+
+### 可攜式離線分析
+
+`--offline` 會在所有入口關閉 Agent/model/network 呼叫，只使用本機 parser、可攜式
+`SessionBundle` 與 deterministic `process-v2` 七軸觀察。新 profile 的比例一定帶
+`numerator`、`denominator`、`excluded_count` 與 `status`；沒有適用分母時使用 `null`，
+不把缺證據補成 0、100 或成功。既有 heuristic composite 與 A–F 欄位仍保留，必要時可
+用 `--profile legacy` 明示舊 profile。
+
+```bash
+# 產生單一 session 的離線 JSON（不會呼叫任何 analyzer）
+session-health session.jsonl --offline --format json
+
+# 匯出可跨機 replay 的 bounded bundle，再從 bundle 產生同一份離線分析
+session-health session.jsonl --offline --export-bundle session.bundle.json
+session-health --import-bundle session.bundle.json --offline --format html --output report.html
+
+# 批次輸出會保留每一筆成功、partial 或 failed 狀態
+session-health --dir ./fixtures --offline --format json
+```
+
+Bundle 只保留 bounded canonical events/facts、相對 source refs、redacted evidence、
+case candidates 與 observation cutoffs；當 bundle byte/event budget 觸頂時，證據 projection
+會縮減並明示 `partial`，完整的 typed numeric facts 仍分開保存；redaction 是有限的 heuristic 偵測，不能宣稱
+找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
+join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
+
+Bundle coverage 會分開記錄 `input_status`/`input_complete`、`facts_status`/`facts_complete`
+與 `evidence_status`：raw source 讀取不完整時保留已讀 prefix facts，但 processing status
+會是 `partial` 或 `failed`；只有 evidence projection 觸頂時，不會因為可重播的 typed
+facts 被截短而誤報 raw input 不完整。STATE 只在 source 實際發出欄位時計入分母，並保留
+per-turn 明確 `false` 與 inherited cwd 的差異。
+
+Raw JSONL 讀取 budget 與 bundle budget 是兩個獨立邊界：預設 raw input 上限為 128 MiB、
+`50000` 筆 record、單筆 `1000000` 字元，可用 `--max-input-bytes`、
+`--max-input-records`、`--max-input-record-chars` 個別調整。Portable bundle 另有預設 2 MiB
+與 10000 events 上限，可用 `--max-bundle-bytes`、`--max-bundle-events` 調整；超過 bundle
+budget 時保留 bounded prefix 並標成 `partial`。超過 raw budget 時保留已讀
+prefix 並標成 `partial`/`failed`；不會把較小的 portable bundle 上限誤當成 raw session
+上限。Bundle 的文字 evidence 仍會 bounded，但 SNR 所需的完整 numeric noise facts 會
+一併保存，因此直接解析與 export/import replay 的可觀察統計一致。
+
+這個 slice 的驗證是 Linux 本機標準庫與 portable fixtures 的離線驗證；它不等同於
+live API/model、真實 agent CLI、Windows/macOS 或平台 correctness 驗證。那些執行環境與
+語意校準保留給後續切片，缺少資料時報告會保留 `unknown`、`not_applicable` 或
+`failed` 狀態。
 
 ### 完整 Help
 
 ```
 usage: eval_session [-h] [--dir DIR] [--latest N]
+                    [--import-bundle FILE]
                     [--source {auto,codex,copilot}]
+                    [--max-input-bytes N] [--max-input-records N]
+                    [--max-input-record-chars N]
+                    [--max-bundle-bytes N] [--max-bundle-events N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
                     [--analyze] [--test-agent]
+                    [--offline] [--profile {legacy,process-v2}]
+                    [--export-bundle FILE_OR_DIR] [--outcome-file FILE]
                     [SESSION_OR_PATH]
 
 Agent CLI Session 動態 Prompt 品質量化評估
@@ -306,6 +387,11 @@ options:
   --latest N, -l N           評估最近 N 個 session
   --source, -s {auto,codex,copilot}
                              指定 session 來源格式（預設：auto 自動偵測）
+  --max-input-bytes N        raw JSONL 讀取上限（預設：128 MiB，超限保留 partial prefix）
+  --max-input-records N      raw JSONL record 上限（預設：50000）
+  --max-input-record-chars N 單筆 raw JSONL 字元上限（預設：1000000）
+  --max-bundle-bytes N      portable bundle byte budget（預設：2000000）
+  --max-bundle-events N     portable bundle event budget（預設：10000）
   --format, -f {radar,table,json,html}
                              輸出格式（預設：radar）
   --no-color                 停用 ANSI 色彩
@@ -313,6 +399,12 @@ options:
   --verbose, -v              顯示每輪詳細分數
   --analyze, -a              啟用 AI Agent 分析（僅限單一 session）
   --test-agent               使用測試用 agent（copilot/gpt-5-mini）
+  --offline                  關閉 model/network，只做本機 deterministic 分析
+  --profile {legacy,process-v2}
+                             選擇舊 heuristic 或新版可觀察七軸 profile
+  --import-bundle FILE       匯入 portable SessionBundle JSON
+  --export-bundle FILE_OR_DIR 匯出 portable SessionBundle
+  --outcome-file FILE        以 exact session/task identity 匯入外部 outcome fixture
 ```
 
 ### 使用範例
@@ -348,7 +440,7 @@ session-health --dir ~/.codex/sessions/2026/02/
 
 # ── 輸出格式 ──
 
-# RPG 進度條（預設）
+# process-v2 observable axes（預設）
 session-health 019c8d32
 
 # JSON 輸出（可串接其他工具）
@@ -359,6 +451,12 @@ session-health 019c8d32 -f table
 
 # 產生 HTML 報告（同時顯示終端摘要）
 session-health 019c8d32 -o report.html
+
+# 明確離線 process-v2（positional auto-analyze 也會被停用）
+session-health 019c8d32 --offline --format json
+
+# 明示 legacy 相容 profile
+session-health 019c8d32 --offline --profile legacy --format json
 
 # 顯示每輪詳細分數
 session-health 019c8d32 -v
@@ -374,7 +472,9 @@ session-health 019c8d32 --analyze --test-agent
 
 ### 輸出範例
 
-#### 終端 RPG 進度條
+#### Legacy 終端 RPG 進度條
+
+只有明示 `--profile legacy` 時才會顯示歷史 composite/A–F radar。
 
 ```
 ╔════════════════════════════════════════════════════════╗

@@ -479,6 +479,91 @@ def _render_artifact_sources_html(sources: Dict[str, str]) -> str:
 """
 
 
+def _render_process_v2_html(process_result: object | None) -> str:
+    """Render observable process-v2 facts without implying a composite score."""
+
+    if process_result is None or not hasattr(process_result, "axes"):
+        return ""
+    rows = []
+    for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+        axis = process_result.axes.get(axis_id)
+        if axis is None:
+            continue
+        value = "null" if axis.metric.value is None else f"{axis.metric.value:.3f}"
+        rows.append(
+            "<tr><td>{axis}</td><td>{value}</td><td>{status}</td><td>{reason}</td></tr>".format(
+                axis=html.escape(axis_id),
+                value=html.escape(value),
+                status=html.escape(axis.metric.status),
+                reason=html.escape(axis.metric.reason),
+            )
+        )
+    return """
+<div class="agent-analysis">
+    <h2>Process-v2 observable profile</h2>
+    <p>Ratios are evidence-bounded; null means the axis was not applicable or lacked an observable denominator.</p>
+    <p>Only observable axis evidence is shown; no aggregate score is computed.</p>
+    <table><thead><tr><th>Axis</th><th>Value</th><th>Status</th><th>Observation</th></tr></thead>
+    <tbody>{rows}</tbody></table>
+</div>
+""".format(rows="".join(rows))
+
+
+def _render_process_v2_document(report: SessionReport) -> str:
+    """Render a single process-v2 report without legacy score surfaces."""
+
+    score = report.score
+    sid = html.escape(score.session_id or "unknown")
+    source = html.escape(score.source or "unknown")
+    model = html.escape(score.model or "unknown")
+    diagnostics = html.escape(
+        json.dumps(report.processing_diagnostics, indent=2, ensure_ascii=False)
+    )
+    extra_sections = "".join(
+        [
+            _render_process_v2_html(report.process_v2),
+            _render_artifact_sources_html(report.artifact_sources),
+            render_agent_html_section(report.agent_analysis)
+            if report.agent_analysis is not None
+            else "",
+        ]
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Health Process-v2 Report</title>
+<style>
+body {{ font-family: sans-serif; background: #1a1a2e; color: #e8e8e8; line-height: 1.6; padding: 2rem; max-width: 1000px; margin: 0 auto; }}
+.card, .agent-analysis {{ background: #16213e; border: 1px solid #2a2a4a; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+h1, h2 {{ color: #4fc3f7; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ border-bottom: 1px solid #2a2a4a; padding: .75rem; text-align: left; vertical-align: top; }}
+th {{ color: #4fc3f7; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #0f3460; border-radius: 8px; padding: 1rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Session Health Process-v2 Report</h1>
+<p>Session: {sid} ｜ Source: {source} ｜ Model: {model} ｜ Turns: {score.turn_count}</p>
+<p>Profile: process-v2 ｜ processing_status: {html.escape(report.processing_status)}</p>
+</div>
+{extra_sections}
+<div class="card">
+<h2>Processing diagnostics</h2>
+<pre>{diagnostics}</pre>
+</div>
+</body>
+</html>
+"""
+
+
+def _format_process_value(value: object) -> str:
+    return "null" if value is None else f"{float(value):.3f}"
+
+
 def _render_batch_html(batch: BatchReport) -> str:
     """Generate a standalone HTML page for a batch report."""
 
@@ -491,32 +576,89 @@ def _render_batch_html(batch: BatchReport) -> str:
             route = report.problemmap.global_fix_route.get("minimal_fix_zh") or report.problemmap.global_fix_route.get("minimal_fix") or json.dumps(
                 report.problemmap.global_fix_route, ensure_ascii=False
             )
+        process_axes = "—"
+        process_coverage = "—"
+        if report.process_v2 is not None:
+            process_axes = " ".join(
+                f"{axis_id}={_format_process_value(report.process_v2.axes.get(axis_id).metric.value if report.process_v2.axes.get(axis_id) else None)}"
+                for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL")
+            )
+            coverage = report.process_v2.coverage or {}
+            process_coverage = f"{coverage.get('observed_axis_count', 'unknown')}/{coverage.get('axis_count', 'unknown')}"
+        legacy_score = "—" if report.processing_status == "failed" else f"{report.score.composite:.1f}"
+        legacy_grade = "—" if report.processing_status == "failed" else report.score.grade
+        diagnostic = "; ".join(
+            str(item.get("message", item.get("kind", "")))
+            for item in report.processing_diagnostics[:3]
+            if isinstance(item, dict)
+        )
+        if batch.profile == "legacy":
+            legacy_cells = f"<td>{html.escape(legacy_score)}</td><td>{html.escape(legacy_grade)}</td>"
+            diagnosis_cells = f"<td>{html.escape(primary)}</td><td>{html.escape(route)}</td>"
+        else:
+            legacy_cells = ""
+            diagnosis_cells = ""
         rows.append(
             """
             <tr>
                 <td>{session_id}</td>
-                <td>{score}</td>
-                <td>{grade}</td>
-                <td>{primary}</td>
-                <td>{route}</td>
+                <td>{status}</td>
+                {legacy_cells}
+                {diagnosis_cells}
+                <td><code>{process_axes}</code></td>
+                <td>{coverage}</td>
+                <td>{diagnostic}</td>
             </tr>
             """.format(
                 session_id=html.escape(report.score.session_id or "unknown"),
-                score=html.escape(f"{report.score.composite:.1f}"),
-                grade=html.escape(report.score.grade),
-                primary=html.escape(primary),
-                route=html.escape(route),
+                status=html.escape(report.processing_status),
+                legacy_cells=legacy_cells,
+                diagnosis_cells=diagnosis_cells,
+                process_axes=html.escape(process_axes),
+                coverage=html.escape(process_coverage),
+                diagnostic=html.escape(diagnostic or "—"),
             )
         )
 
-    evidence_json = html.escape(
-        json.dumps(batch.evidence_summary, indent=2, ensure_ascii=False)
-    )
+    if batch.profile == "legacy":
+        evidence_payload = batch.evidence_summary
+    else:
+        axis_observations = {}
+        for axis_id in DIM_ORDER:
+            axis_observations[axis_id] = {
+                "sessions": sum(
+                    1
+                    for report in batch.sessions
+                    if report.process_v2 is not None and axis_id in report.process_v2.axes
+                ),
+                "observed": sum(
+                    1
+                    for report in batch.sessions
+                    if report.process_v2 is not None
+                    and axis_id in report.process_v2.axes
+                    and report.process_v2.axes[axis_id].metric.status == "observed"
+                ),
+            }
+        evidence_payload = {
+            "session_count": len(batch.sessions),
+            "processing_status": batch.processing_status,
+            "axis_observations": axis_observations,
+        }
+    evidence_json = html.escape(json.dumps(evidence_payload, indent=2, ensure_ascii=False))
     layers = ", ".join(batch.analysis_layers)
     agent_section = ""
     if batch.agent_analysis is not None:
         agent_section = render_agent_html_section(batch.agent_analysis)
-    diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary)
+    diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary) if batch.profile == "legacy" else ""
+    if batch.profile == "legacy":
+        summary_headers = """
+                <th>Score</th>
+                <th>Grade</th>"""
+    else:
+        summary_headers = ""
+    diagnosis_headers = "" if batch.profile != "legacy" else """
+                <th>主家族</th>
+                <th>最小修復動作</th>"""
     return f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -584,7 +726,7 @@ pre {{
 <body>
 <div class="card">
     <h1>⚔ Session Health Batch Report</h1>
-    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Layers: {html.escape(layers)}</p>
+    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Profile: {html.escape(batch.profile)} ｜ processing_status: {html.escape(batch.processing_status)} ｜ Layers: {html.escape(layers)}</p>
 </div>
 <div class="card">
     <h2>📋 Batch Summary</h2>
@@ -592,10 +734,12 @@ pre {{
         <thead>
             <tr>
                 <th>Session</th>
-                <th>Score</th>
-                <th>Grade</th>
-                <th>主家族</th>
-                <th>最小修復動作</th>
+                <th>Status</th>
+                {summary_headers}
+                {diagnosis_headers}
+                <th>process-v2 axes</th>
+                <th>Coverage</th>
+                <th>Diagnostics</th>
             </tr>
         </thead>
         <tbody>
@@ -618,6 +762,8 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     """Generate a complete standalone HTML report."""
     if isinstance(item, BatchReport):
         return _render_batch_html(item)
+    if isinstance(item, SessionReport) and item.profile != "legacy":
+        return _render_process_v2_document(item)
 
     score = item.score if isinstance(item, SessionReport) else item
     axes = score.radar_axes
@@ -638,6 +784,7 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     if isinstance(item, SessionReport):
         extra_sections = "".join(
             [
+                _render_process_v2_html(item.process_v2),
                 _render_diagnosis_summary_html(item.diagnosis_summary),
                 _render_artifact_sources_html(item.artifact_sources),
                 render_agent_html_section(item.agent_analysis)

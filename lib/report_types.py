@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from .agent_analysis import AgentAnalysis
 from .parser_base import Session
 from .scorer import SessionScore
+from .metrics.process_v2 import ProcessV2Result
 
 
 @dataclass
@@ -70,6 +71,12 @@ class SessionReport:
     artifact_sources: Dict[str, str] = field(default_factory=dict)
     analysis_layers: List[str] = field(default_factory=list)
     sync_status: str = "session-only"
+    profile: str = "legacy"
+    process_v2: Optional[ProcessV2Result] = None
+    bundle_manifest: Dict[str, Any] = field(default_factory=dict)
+    processing_status: str = "complete"
+    processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    analysis_status: str = "not_requested"
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -80,6 +87,8 @@ class SessionReport:
                 self.analysis_layers.append("diagnosis")
             if self.agent_analysis is not None and self.agent_analysis.success:
                 self.analysis_layers.append("agent")
+            if self.process_v2 is not None:
+                self.analysis_layers.append("process-v2")
 
     @property
     def report_kind(self) -> str:
@@ -100,6 +109,10 @@ class BatchReport:
     artifact_sources: Dict[str, str] = field(default_factory=dict)
     analysis_layers: List[str] = field(default_factory=list)
     sync_status: str = "session-only"
+    profile: str = "legacy"
+    processing_status: str = "complete"
+    processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    analysis_status: str = "not_requested"
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -110,6 +123,8 @@ class BatchReport:
                 layers.add("diagnosis")
             if self.agent_analysis is not None and self.agent_analysis.success:
                 layers.add("agent")
+            if self.profile == "process-v2":
+                layers.add("process-v2")
             self.analysis_layers = sorted(layers)
 
     @property
