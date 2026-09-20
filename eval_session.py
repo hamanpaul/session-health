@@ -48,6 +48,7 @@ from lib.agent_analysis import (
     discover_agent_catalog,
     catalog_payload,
     operator_catalog,
+    build_session_health_task_profile,
     prepare_analysis_prompt,
     prepare_batch_analysis_prompt,
     call_agent,
@@ -490,7 +491,7 @@ def main() -> None:
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
     if args.list_models:
-        catalog = configured_agent_chain or discover_agent_catalog(AGENT_CHAIN)
+        catalog = configured_agent_chain or discover_agent_catalog()
         print(json.dumps(catalog_payload(catalog), ensure_ascii=False, indent=2))
         return 0
     if not any((args.session_target, args.dir, args.latest, args.import_bundle)):
@@ -830,6 +831,7 @@ def main() -> None:
                 routing_backend=semantic_backend if args.jev else None,
                 routing_budget=semantic_budget if args.jev else None,
                 model_override=args.analyze_model,
+                task_profile=build_session_health_task_profile(scope="single", count=1),
                 use_jev=args.jev,
                 max_output_bytes=args.analyze_max_output_bytes,
             )
@@ -924,6 +926,7 @@ def main() -> None:
                 routing_backend=semantic_backend if args.jev else None,
                 routing_budget=semantic_budget if args.jev else None,
                 model_override=args.analyze_model,
+                task_profile=build_session_health_task_profile(scope="batch", count=len(reports)),
                 use_jev=args.jev,
                 max_output_bytes=args.analyze_max_output_bytes,
             )

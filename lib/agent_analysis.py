@@ -10,13 +10,14 @@ separate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import copy
 import hashlib
 import html
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -69,7 +70,64 @@ _OPERATOR_ENTRY_KEYS = {
     "capabilities",
     "output_formats",
     "priority",
+    "capability_evidence",
 }
+
+CODEX_MODEL_CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
+MAX_CODEX_MODEL_CACHE_BYTES = 1_000_000
+MAX_CODEX_CACHE_MODELS = 64
+
+
+def build_session_health_task_profile(*, scope: str = "single", count: int = 1) -> Dict[str, Any]:
+    """Return the bounded, transcript-free task contract used by routing."""
+
+    if scope not in {"single", "batch"}:
+        raise ValueError("session-health scope must be single or batch")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("session-health count must be a positive integer")
+    axes = {
+        "SNR": "signal-to-noise and evidence quality",
+        "STATE": "state and lifecycle consistency",
+        "CTX": "context continuity and bounded context use",
+        "REACT": "reaction and recovery behavior",
+        "DEPTH": "analysis depth and uncertainty separation",
+        "CONV": "conversation coherence and task progression",
+        "TOOL": "tool use, outcomes, and failure handling",
+    }
+    return {
+        "profile": "session-health-v1",
+        "scope": scope,
+        "count": count,
+        "session_count": count,
+        "axes": {
+            axis: {
+                "focus": focus,
+                "evidence": "cite bounded evidence_refs when available",
+                "unknown": "preserve as unknown when evidence is missing",
+            }
+            for axis, focus in axes.items()
+        },
+        "evidence_policy": {
+            "source": "bounded portable evidence and deterministic observations",
+            "unknown_handling": "keep missing, unknown, and not_applicable distinct",
+            "counterevidence": "retain and weigh counterevidence_refs",
+            "raw_prompt_or_transcript": "excluded",
+        },
+        "analysis_output": {
+            "language": "zh-TW",
+            "format": "structured_json",
+            "sections": ["observations", "hypotheses", "recommendations"],
+            "recommendations_require_support": True,
+        },
+        "model_suitability": {
+            "decision": "provisional_suitability",
+            "objectively_best": "not_established",
+            "quality_authority": "none",
+        },
+    }
+
+
+DEFAULT_SESSION_HEALTH_TASK_PROFILE = build_session_health_task_profile()
 
 
 def _checked_at() -> str:
@@ -154,6 +212,7 @@ class AgentConfig:
     output_formats: Tuple[str, ...] = ("text", "json")
     priority: int = 100
     legacy: bool = False
+    capability_evidence: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not self.executor:
@@ -165,6 +224,10 @@ class AgentConfig:
         if not self.model_id:
             self.model_id = self.name.split("/", 1)[1] if "/" in self.name else self.name
         self.inference_settings = dict(self.inference_settings or {})
+        if self.capability_evidence is not None:
+            if not isinstance(self.capability_evidence, Mapping):
+                raise ValueError("capability_evidence must be a mapping")
+            self.capability_evidence = dict(self.capability_evidence)
         self.capabilities = tuple(str(item) for item in (self.capabilities or ()))
         self.output_formats = tuple(str(item) for item in (self.output_formats or ()))
         if self.availability is None:
@@ -209,6 +272,7 @@ class AgentConfig:
             "output_formats": list(self.output_formats),
             "priority": self.priority,
             "legacy": self.legacy,
+            "capability_evidence": _report_safe_capability_evidence(self.capability_evidence),
         }
 
 
@@ -352,6 +416,110 @@ def _configured_build_cmd(
         return ["copilot", "-s", "--model", model_id, "-p", "-"]
 
     return build_copilot
+
+
+def _codex_cache_availability() -> Dict[str, Any]:
+    checked = _checked_at()
+    value = {
+        "status": "unknown",
+        "provenance": "read_only_discovery",
+        "discovery": "codex_model_cache",
+    }
+    value.update(_freshness(checked))
+    return value
+
+
+def _read_codex_model_cache(path: Any) -> List[Mapping[str, Any]]:
+    """Read one bounded local cache file; never probe a provider or CLI."""
+
+    try:
+        cache_path = Path(path)
+        if not cache_path.is_file() or cache_path.stat().st_size > MAX_CODEX_MODEL_CACHE_BYTES:
+            return []
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("models"), list):
+        return []
+    return [item for item in payload["models"][:MAX_CODEX_CACHE_MODELS] if isinstance(item, Mapping)]
+
+
+def _cached_codex_candidate(raw: Mapping[str, Any], index: int) -> Optional[AgentConfig]:
+    visibility = str(raw.get("visibility", "")).strip().lower()
+    if raw.get("hidden") is True or raw.get("is_hidden") is True or visibility in {"hide", "hidden"}:
+        return None
+    model_value = raw.get("slug", raw.get("model_id", raw.get("id", "")))
+    try:
+        model_id = _safe_cli_value(model_value, field_name="cached model_id")
+    except ValueError:
+        return None
+    effort = raw.get("default_reasoning_level", "high")
+    try:
+        effort = _safe_cli_value(effort, field_name="cached reasoning level", max_length=32)
+    except ValueError:
+        effort = "high"
+    advertised: Dict[str, Any] = {}
+    for key in (
+        "display_name",
+        "description",
+        "context_window",
+        "max_context_window",
+        "supported_reasoning_levels",
+        "input_modalities",
+        "supported_in_api",
+        "supports_search_tool",
+        "tool_mode",
+    ):
+        if key in raw:
+            advertised[key] = _clip_prompt_value(raw[key], max_items=20, max_string=1_000)
+    if "context_window" in advertised:
+        advertised["context_window"] = {
+            "value": advertised["context_window"],
+            "unit": "provider_tokens",
+            "status": "advertised",
+        }
+    if "max_context_window" in advertised:
+        advertised["max_context_window"] = {
+            "value": advertised["max_context_window"],
+            "unit": "provider_tokens",
+            "status": "advertised",
+        }
+    evidence = {
+        "provenance": "provider_advertised",
+        "source": "codex_models_cache",
+        "model_id": model_id,
+        "advertised": advertised,
+    }
+    return AgentConfig(
+        name=f"codex/{model_id}",
+        build_cmd=_configured_build_cmd(
+            "codex",
+            model_id,
+            {"effort": effort, "stdin": True},
+        ),
+        timeout=DEFAULT_ANALYSIS_TIMEOUT,
+        executor="codex",
+        provider="openai",
+        route="codex.exec",
+        model_id=model_id,
+        inference_settings={"effort": effort, "stdin": True},
+        availability=_codex_cache_availability(),
+        # Cache context_window values are provider tokens, never routing bytes.
+        context_window=None,
+        capabilities=(),
+        output_formats=(),
+        priority=1_000 + index,
+        capability_evidence=evidence,
+    )
+
+
+def _discover_codex_cache_candidates(path: Any) -> List[AgentConfig]:
+    result: List[AgentConfig] = []
+    for index, raw in enumerate(_read_codex_model_cache(path)):
+        candidate = _cached_codex_candidate(raw, index)
+        if candidate is not None:
+            result.append(candidate)
+    return result
 
 
 def _build_gemini_cmd(_prompt: str) -> List[str]:
@@ -502,6 +670,8 @@ def _build_operator_candidate(entry: Mapping[str, Any], existing: Optional[Agent
             candidate.capabilities = tuple(str(item) for item in entry["capabilities"])
         if "output_formats" in entry:
             candidate.output_formats = tuple(str(item) for item in entry["output_formats"])
+        if "capability_evidence" in entry:
+            candidate.capability_evidence = dict(entry["capability_evidence"])
         return candidate
 
     kwargs: Dict[str, Any] = {
@@ -522,6 +692,8 @@ def _build_operator_candidate(entry: Mapping[str, Any], existing: Optional[Agent
         kwargs["capabilities"] = tuple(str(item) for item in entry["capabilities"])
     if "output_formats" in entry:
         kwargs["output_formats"] = tuple(str(item) for item in entry["output_formats"])
+    if "capability_evidence" in entry:
+        kwargs["capability_evidence"] = entry["capability_evidence"]
     return AgentConfig(**kwargs)
 
 
@@ -529,11 +701,22 @@ def discover_agent_catalog(
     candidates: Optional[Sequence[AgentConfig]] = None,
     *,
     operator_entries: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+    model_cache_path: Optional[Any] = None,
+    codex_model_cache_path: Optional[Any] = None,
 ) -> List[AgentConfig]:
     """Refresh executable presence and apply explicit operator entries."""
 
+    using_default_catalog = candidates is None
     result = [(item.clone()) for item in (candidates if candidates is not None else _catalog_seed())]
-    for item in result:
+    base_count = len(result)
+    if using_default_catalog:
+        cache_path = codex_model_cache_path or model_cache_path or CODEX_MODEL_CACHE_PATH
+        existing_models = {str(item.model_id) for item in result}
+        for item in _discover_codex_cache_candidates(cache_path):
+            if item.model_id not in existing_models:
+                result.append(item)
+                existing_models.add(item.model_id)
+    for item in result[:base_count]:
         item.availability = _discovered_availability(item.executor)
     if isinstance(operator_entries, Mapping):
         entries = [dict(value, name=key) if isinstance(value, Mapping) else {"name": key, "status": value} for key, value in operator_entries.items()]
@@ -577,7 +760,15 @@ def operator_catalog(
                 break
         full_card = match_index is None or any(
             key in entry
-            for key in ("executor", "provider", "route", "model_id", "inference_settings", "settings")
+            for key in (
+                "executor",
+                "provider",
+                "route",
+                "model_id",
+                "inference_settings",
+                "settings",
+                "capability_evidence",
+            )
         )
         if match_index is not None and not full_card:
             result[match_index].availability = _operator_availability_from_entry(entry)
@@ -960,6 +1151,18 @@ def _bounded_prompt_layer(value: Any, *, max_bytes: int = 48_000) -> Any:
     }
 
 
+def _report_safe_capability_evidence(value: Any) -> Dict[str, Any]:
+    """Keep candidate evidence redacted and bounded in portable cards."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    try:
+        bounded = _bounded_prompt_layer(value, max_bytes=8_000)
+    except (TypeError, ValueError):
+        return {}
+    return bounded if isinstance(bounded, dict) else {}
+
+
 def _bundle_prompt_projection(bundle: Any) -> Dict[str, Any]:
     raw = _object_payload(bundle)
     if not isinstance(raw, Mapping):
@@ -1192,6 +1395,7 @@ def call_agent(
     backend: Any = None,
     model_override: str = "",
     request: Optional[AnalysisRequest] = None,
+    task_profile: Optional[Mapping[str, Any]] = None,
     use_jev: Optional[bool] = None,
     max_retries: int = 1,
     max_output_bytes: int = MAX_ANALYSIS_OUTPUT_BYTES,
@@ -1203,27 +1407,22 @@ def call_agent(
     source_chain = [TEST_AGENT] if test_mode else (agent_chain if agent_chain is not None else AGENT_CHAIN)
     candidates = [item.clone() for item in source_chain]
     chosen_backend = routing_backend if routing_backend is not None else backend
-    effective_request = request or AnalysisRequest(
-        context_bytes=len(prompt.encode("utf-8")),
-        output_bytes=max_output_bytes,
-        model_override=model_override,
-        budget=RoutingBudget(max_context_bytes=MAX_ANALYSIS_INPUT_BYTES, max_output_bytes=max_output_bytes, max_reselections=max_retries),
-    )
-    if model_override and not effective_request.model_override:
+    if request is None:
         effective_request = AnalysisRequest(
-            purpose=effective_request.purpose,
-            context_bytes=effective_request.context_bytes,
-            output_bytes=effective_request.output_bytes,
-            max_latency_seconds=effective_request.max_latency_seconds,
-            max_cost=effective_request.max_cost,
-            required_capabilities=effective_request.required_capabilities,
-            allowed_executors=effective_request.allowed_executors,
-            output_format=effective_request.output_format,
-            language=effective_request.language,
+            context_bytes=len(prompt.encode("utf-8")),
+            output_bytes=max_output_bytes,
             model_override=model_override,
-            inference_settings=effective_request.inference_settings,
-            budget=effective_request.budget,
+            task_profile=copy.deepcopy(task_profile if task_profile is not None else DEFAULT_SESSION_HEALTH_TASK_PROFILE),
+            budget=RoutingBudget(max_context_bytes=MAX_ANALYSIS_INPUT_BYTES, max_output_bytes=max_output_bytes, max_reselections=max_retries),
         )
+    elif task_profile is not None:
+        # An explicit call-site profile is the deliberate override; otherwise
+        # preserve the caller-owned request profile byte-for-byte.
+        effective_request = replace(request, task_profile=task_profile)
+    else:
+        effective_request = request
+    if model_override and not effective_request.model_override:
+        effective_request = replace(effective_request, model_override=model_override)
     jev_enabled = bool(chosen_backend is not None) if use_jev is None else use_jev
     excluded: List[str] = []
     attempts: List[Dict[str, Any]] = []
