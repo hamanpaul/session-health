@@ -291,6 +291,24 @@ def render_report_terminal(report: SessionReport, use_color: bool = True) -> str
                 parts.append(problemmap_box)
     if report.agent_analysis is not None and report.agent_analysis.success:
         parts.append(render_agent_terminal(report.agent_analysis))
+    if report.routing is not None:
+        route = report.routing
+        parts.append(
+            "Routing: {} / {} / candidate={}".format(
+                getattr(route, "routing_source", "unknown"),
+                getattr(route, "status", "unknown"),
+                getattr(route, "candidate_id", None) or "none",
+            )
+        )
+    if report.postcheck is not None:
+        parts.append(
+            "Post-check: {} / checked={}/{} / repairs={}".format(
+                getattr(report.postcheck, "status", "unknown"),
+                getattr(report.postcheck, "checked_count", 0),
+                getattr(report.postcheck, "claim_count", 0),
+                getattr(report.postcheck, "repair_count", 0),
+            )
+        )
     if report.process_v2 is not None:
         lines = [_c("Process-v2 observable profile", "bold", use_color)]
         for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
@@ -421,17 +439,15 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             "processing_status": item.processing_status,
             "processing_diagnostics": item.processing_diagnostics,
             "analysis_status": item.analysis_status,
+            "analysis_coverage": item.analysis_coverage,
             "diagnosis_summary": None if process_only else (asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None),
             "evidence_summary": _process_batch_summary(item) if process_only else item.evidence_summary,
             "artifact_sources": item.artifact_sources,
-            "agent_analysis": {
-                "agent_name": item.agent_analysis.agent_name,
-                "success": item.agent_analysis.success,
-                "raw_response": item.agent_analysis.raw_response,
-                "error": item.agent_analysis.error,
-            }
+            "agent_analysis": item.agent_analysis.to_dict()
             if item.agent_analysis is not None
             else None,
+            "routing": item.routing.to_dict() if hasattr(item.routing, "to_dict") else item.routing,
+            "postcheck": item.postcheck.to_dict() if hasattr(item.postcheck, "to_dict") else item.postcheck,
             "semantic": item.semantic.to_dict() if item.semantic is not None and hasattr(item.semantic, "to_dict") else None,
             "sessions": [
                 json.loads(render_json(report))
@@ -486,6 +502,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
                 "processing_status": item.processing_status,
                 "processing_diagnostics": item.processing_diagnostics,
                 "analysis_status": item.analysis_status,
+                "analysis_coverage": item.analysis_coverage,
                 "bundle": item.bundle_manifest or None,
                 "process_v2": item.process_v2.to_dict() if item.process_v2 is not None else None,
                 "diagnosis_summary": None if process_only else (asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None),
@@ -504,14 +521,11 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
                 }
                 if item.problemmap is not None
                 else None,
-                "agent_analysis": {
-                    "agent_name": item.agent_analysis.agent_name,
-                    "success": item.agent_analysis.success,
-                    "raw_response": item.agent_analysis.raw_response,
-                    "error": item.agent_analysis.error,
-                }
+                "agent_analysis": item.agent_analysis.to_dict()
                 if item.agent_analysis is not None
                 else None,
+                "routing": item.routing.to_dict() if hasattr(item.routing, "to_dict") else item.routing,
+                "postcheck": item.postcheck.to_dict() if hasattr(item.postcheck, "to_dict") else item.postcheck,
                 "semantic": item.semantic.to_dict() if item.semantic is not None and hasattr(item.semantic, "to_dict") else None,
             }
         )

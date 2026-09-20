@@ -2,6 +2,15 @@
 
 ## 2026-09-20
 
+- Added bounded stage-2 analyzer catalog/routing for concrete Codex, Copilot,
+  and agy executor/route/model/settings cards. Read-only CLI discovery now
+  preserves unknown account availability, while explicit overrides and
+  operator entries remain distinguishable; analyzer prompts use stdin and
+  retain requested versus actual identity plus native usage.
+- Added deterministic fallback, one bounded failed-execution reselection, and
+  evidence-frozen Jev post-checks that preserve contradictions/abstentions and
+  allow at most one repair round. Routing and post-check metadata are additive
+  in JSON, terminal, and HTML reports.
 - Added explicit `--jev` semantic reporting with bounded typed Choice/Noul/Score
   batches, seven versioned axis question groups, shared redacted state,
   request-level provenance/usage accounting, and deferred status when live Jev

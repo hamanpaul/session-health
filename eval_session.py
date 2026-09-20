@@ -42,9 +42,13 @@ from lib.problemmap import (
 from lib.radar import render_report_terminal, render_table, render_json
 from lib.html_report import render_html
 from lib.agent_analysis import (
+    AGENT_CHAIN,
+    discover_agent_catalog,
+    catalog_payload,
     prepare_analysis_prompt,
     prepare_batch_analysis_prompt,
     call_agent,
+    postcheck_analysis,
 )
 from lib.jev_analysis import SemanticEvaluation, evaluate_session_semantic
 from lib.semantic_backend import SemanticBudget, build_default_backend
@@ -235,7 +239,7 @@ def main() -> None:
     )
 
     # Input modes (mutually exclusive)
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "session_target",
         nargs="?",
@@ -325,7 +329,7 @@ def main() -> None:
     parser.add_argument(
         "--analyze", "-a",
         action="store_true",
-        help="Run AI agent analysis on the session (single session only)",
+        help="Run bounded AI agent analysis on the selected session or batch",
     )
     parser.add_argument(
         "--jev",
@@ -385,6 +389,26 @@ def main() -> None:
         help="Use test agent (copilot/gpt-5-mini) instead of production chain",
     )
     parser.add_argument(
+        "--analyze-model", "--model",
+        dest="analyze_model",
+        default="",
+        metavar="MODEL",
+        help="Explicit analyzer candidate/model override; never silently replaced",
+    )
+    parser.add_argument(
+        "--analyze-max-output-bytes",
+        type=_positive_int,
+        default=128_000,
+        metavar="N",
+        help="Maximum analyzer stdout bytes retained (default: 128000)",
+    )
+    parser.add_argument(
+        "--list-models", "--model-catalog",
+        dest="list_models",
+        action="store_true",
+        help="Read-only JSON catalog of concrete analyzer candidates and availability provenance",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Disable model/network analysis and produce only local deterministic results",
@@ -407,6 +431,12 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.list_models:
+        print(json.dumps(catalog_payload(discover_agent_catalog(AGENT_CHAIN)), ensure_ascii=False, indent=2))
+        return 0
+    if not any((args.session_target, args.dir, args.latest, args.import_bundle)):
+        parser.error("one of SESSION_OR_PATH, --dir, --latest, or --import-bundle is required")
 
     # Auto-detect format from output filename
     if args.output and args.format == "radar":
@@ -627,6 +657,7 @@ def main() -> None:
         sync_status="session-only",
     )
 
+    semantic_backend = None
     if args.jev:
         semantic_budget = SemanticBudget(
             max_requests=args.jev_max_requests,
@@ -721,11 +752,51 @@ def main() -> None:
                 problemmap=problemmap_payload,
                 evidence_summary=report.evidence_summary,
             )
-            analysis = call_agent(prompt, test_mode=args.test_agent)
+            analysis = call_agent(
+                prompt,
+                test_mode=args.test_agent,
+                routing_backend=semantic_backend if args.jev else None,
+                model_override=args.analyze_model,
+                use_jev=args.jev,
+                max_output_bytes=args.analyze_max_output_bytes,
+            )
             report.agent_analysis = analysis
+            report.analysis_coverage = {
+                "source_session_count": 1,
+                "selected_session_count": 1,
+                "excluded_session_count": 0,
+                "status": "complete" if analysis.success else "failed",
+            }
+            analysis.coverage = dict(report.analysis_coverage)
+            report.routing = analysis.routing
             report.analysis_status = "completed" if analysis.success else "failed"
             if analysis.success and "agent" not in report.analysis_layers:
                 report.analysis_layers.append("agent")
+            if report.routing is not None and "routing" not in report.analysis_layers:
+                report.analysis_layers.append("routing")
+            if args.jev and analysis.success:
+                report.postcheck = postcheck_analysis(
+                    report.session,
+                    analysis,
+                    backend=semantic_backend,
+                )
+                analysis.postcheck = report.postcheck
+                if "postcheck" not in report.analysis_layers:
+                    report.analysis_layers.append("postcheck")
+                if report.postcheck.status in {"failed", "partial", "unknown", "deferred"} and report.processing_status == "complete":
+                    report.processing_status = "partial"
+                    report.processing_diagnostics.append({
+                        "kind": "postcheck_processing",
+                        "status": report.postcheck.status,
+                        "message": "deterministic facts retained; generated claim verification is incomplete",
+                    })
+            if not analysis.success and report.processing_status == "complete":
+                report.processing_status = "partial"
+                report.processing_diagnostics.append({
+                    "kind": "analysis_processing",
+                    "status": "failed",
+                    "message": analysis.error,
+                })
         else:
             session_summaries = []
             for report in reports:
@@ -752,12 +823,78 @@ def main() -> None:
                 session_summaries,
                 diagnosis_summary=asdict(batch_report.diagnosis_summary) if batch_report.diagnosis_summary is not None else None,
             )
-            batch_report.agent_analysis = call_agent(prompt, test_mode=args.test_agent)
+            batch_report.agent_analysis = call_agent(
+                prompt,
+                test_mode=args.test_agent,
+                routing_backend=semantic_backend if args.jev else None,
+                model_override=args.analyze_model,
+                use_jev=args.jev,
+                max_output_bytes=args.analyze_max_output_bytes,
+            )
             batch_report.analysis_status = "completed" if batch_report.agent_analysis.success else "failed"
+            batch_report.analysis_coverage = {
+                "source_session_count": len(reports),
+                "selected_session_count": len(reports),
+                "excluded_session_count": 0,
+                "status": "complete" if batch_report.agent_analysis.success else "failed",
+            }
+            batch_report.agent_analysis.coverage = dict(batch_report.analysis_coverage)
+            batch_report.routing = batch_report.agent_analysis.routing
+            if args.jev and batch_report.agent_analysis.success:
+                frozen_batch_evidence = {
+                    "sessions": [
+                        {
+                            "session_id": report.session.id,
+                            "source": report.session.source,
+                            "turns": [
+                                {
+                                    "index": turn.index,
+                                    "user_input": turn.user_input,
+                                    "assistant_output": turn.assistant_output,
+                                    "tool_calls": [
+                                        {
+                                            "name": call.name,
+                                            "output": call.output,
+                                            "success": call.success,
+                                            "exit_code": call.exit_code,
+                                        }
+                                        for call in turn.tool_calls[:20]
+                                    ],
+                                }
+                                for turn in report.session.turns[:100]
+                            ],
+                        }
+                        for report in reports
+                    ]
+                }
+                batch_report.postcheck = postcheck_analysis(
+                    frozen_batch_evidence,
+                    batch_report.agent_analysis,
+                    backend=semantic_backend,
+                )
+                batch_report.agent_analysis.postcheck = batch_report.postcheck
+                if batch_report.postcheck.status in {"failed", "partial", "unknown", "deferred"} and batch_report.processing_status == "complete":
+                    batch_report.processing_status = "partial"
+                    batch_report.processing_diagnostics.append({
+                        "kind": "postcheck_processing",
+                        "status": batch_report.postcheck.status,
+                        "message": "deterministic facts retained; generated batch claims are not fully verified",
+                    })
+            if not batch_report.agent_analysis.success and batch_report.processing_status == "complete":
+                batch_report.processing_status = "partial"
+                batch_report.processing_diagnostics.append({
+                    "kind": "analysis_processing",
+                    "status": "failed",
+                    "message": batch_report.agent_analysis.error,
+                })
 
         layers = set(layer for item in reports for layer in item.analysis_layers)
         if batch_report.agent_analysis is not None and batch_report.agent_analysis.success:
             layers.add("agent")
+        if batch_report.routing is not None:
+            layers.add("routing")
+        if batch_report.postcheck is not None:
+            layers.add("postcheck")
         batch_report.analysis_layers = sorted(layers)
 
     if args.export_bundle:

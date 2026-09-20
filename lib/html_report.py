@@ -480,6 +480,23 @@ def _render_artifact_sources_html(sources: Dict[str, str]) -> str:
 """
 
 
+def _render_stage2_html(routing: object | None, postcheck: object | None) -> str:
+    """Render stage-2 metadata even when the analyzer was deferred/failed."""
+
+    if routing is None and postcheck is None:
+        return ""
+    payload = {
+        "routing": routing.to_dict() if hasattr(routing, "to_dict") else routing,
+        "postcheck": postcheck.to_dict() if hasattr(postcheck, "to_dict") else postcheck,
+    }
+    return f"""
+<div class="agent-analysis">
+    <h2>Stage-2 routing and evidence post-check</h2>
+    <pre>{html.escape(json.dumps(payload, indent=2, ensure_ascii=False))}</pre>
+</div>
+"""
+
+
 def _render_process_v2_html(process_result: object | None) -> str:
     """Render observable process-v2 facts without implying a composite score."""
 
@@ -525,6 +542,7 @@ def _render_process_v2_document(report: SessionReport) -> str:
             _render_process_v2_html(report.process_v2),
             render_semantic_html(report.semantic),
             _render_artifact_sources_html(report.artifact_sources),
+            _render_stage2_html(report.routing, report.postcheck),
             render_agent_html_section(report.agent_analysis)
             if report.agent_analysis is not None
             else "",
@@ -661,6 +679,7 @@ def _render_batch_html(batch: BatchReport) -> str:
         for report in batch.sessions
         if report.semantic is not None
     )
+    stage2_section = _render_stage2_html(batch.routing, batch.postcheck)
     diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary) if batch.profile == "legacy" else ""
     if batch.profile == "legacy":
         summary_headers = """
@@ -766,6 +785,7 @@ pre {{
 </div>
 {diagnosis_section}
 {agent_section}
+{stage2_section}
 {semantic_section}
 </body>
 </html>
@@ -802,6 +822,7 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
                 render_semantic_html(item.semantic),
                 _render_diagnosis_summary_html(item.diagnosis_summary),
                 _render_artifact_sources_html(item.artifact_sources),
+                _render_stage2_html(item.routing, item.postcheck),
                 render_agent_html_section(item.agent_analysis)
                 if item.agent_analysis is not None
                 else "",

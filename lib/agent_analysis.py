@@ -1,441 +1,637 @@
-"""Agent-based session analysis.
+"""Bounded second-stage analyzer adapters and model catalog.
 
-Calls external CLI agents (Codex/Copilot/Gemini) to provide
-AI-powered analysis and improvement suggestions for a session.
-
-Agent priority (production):
-  1. codex -c model=gpt-5.4 exec "prompt"
-  2. copilot -s --model claude-sonnet-4.6 -p "prompt" --yolo
-  3. gemini -m gemini-3-pro-preview -p "prompt"
-  4. copilot -s --model gpt-5-mini -p "prompt" --yolo
+The legacy ``call_agent`` entry point remains available, but its production
+path now routes concrete executor/provider/route/model/settings cards.  CLI
+presence is only read-only discovery evidence; it is never reported as account
+availability.  Analyzer prompts are sent through stdin and never placed in
+argv, while requested and provider-reported actual identities stay separate.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import copy
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .jev_routing import (
+    AnalysisRequest,
+    RouteDecision,
+    RoutingBudget,
+    choose_model,
+    mark_execution_failure,
+    candidate_id as routing_candidate_id,
+    catalog_payload,
+    routing_vs_baseline,
+    run_routing_baseline_pilot,
+)
+from .postcheck import postcheck_analysis
+from .semantic_backend import SemanticUsage
 from .scorer import SessionScore
 from .parser_base import Session
 
 
+MAX_ANALYSIS_INPUT_BYTES = 192_000
+MAX_ANALYSIS_OUTPUT_BYTES = 128_000
+DEFAULT_ANALYSIS_TIMEOUT = 180
+CATALOG_FRESHNESS_SECONDS = 24 * 60 * 60
+
+
+def _checked_at() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _freshness(checked_at: str, *, ttl_seconds: int = CATALOG_FRESHNESS_SECONDS) -> Dict[str, Any]:
+    try:
+        parsed = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        parsed = datetime.now(timezone.utc)
+    return {
+        "checked_at": checked_at,
+        "expires_at": (parsed + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
+        "freshness_seconds": ttl_seconds,
+        "stale": False,
+    }
+
+
+def _executable_for(executor: str) -> str:
+    return {"codex": "codex", "copilot": "copilot", "agy": "agy"}.get(executor, executor)
+
+
+def _discovered_availability(executor: str, *, checked_at: Optional[str] = None) -> Dict[str, Any]:
+    """Observe executable presence without claiming account/model access."""
+
+    checked = checked_at or _checked_at()
+    executable = _executable_for(executor)
+    present = bool(shutil.which(executable))
+    value = {
+        "status": "unknown" if present else "unavailable",
+        "provenance": "read_only_discovery",
+        "cli_present": present,
+        "discovery": "executable_presence_only",
+        "executor": executor,
+    }
+    value.update(_freshness(checked))
+    return value
+
+
+def _operator_availability(
+    *,
+    status: str = "available",
+    checked_at: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    if status not in {"available", "unavailable", "unknown"}:
+        raise ValueError("operator availability status must be available, unavailable, or unknown")
+    checked = checked_at or _checked_at()
+    value = {
+        "status": status,
+        "provenance": "operator",
+        "discovery": "operator_entry",
+    }
+    value.update(_freshness(checked))
+    if expires_at:
+        value["expires_at"] = expires_at
+    if note:
+        value["note"] = str(note)[:300]
+    return value
+
+
 @dataclass
 class AgentConfig:
-    """Configuration for an external agent CLI."""
+    """One concrete analyzer candidate."""
+
     name: str
-    build_cmd: "callable"  # (prompt: str) -> List[str]
-    timeout: int = 120
+    build_cmd: Callable[[str], List[str]]
+    timeout: int = DEFAULT_ANALYSIS_TIMEOUT
+    executor: str = ""
+    provider: str = ""
+    route: str = ""
+    model_id: str = ""
+    inference_settings: Dict[str, Any] = field(default_factory=dict)
+    availability: Optional[Dict[str, Any]] = None
+    context_window: Optional[int] = 192_000
+    max_output_bytes: Optional[int] = MAX_ANALYSIS_OUTPUT_BYTES
+    latency_seconds: Optional[float] = None
+    cost_per_request: Optional[float] = None
+    capabilities: Tuple[str, ...] = ("text", "zh-TW")
+    output_formats: Tuple[str, ...] = ("text", "json")
+    priority: int = 100
+    legacy: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.executor:
+            self.executor = self.name.split("/", 1)[0]
+        if not self.provider:
+            self.provider = self.executor
+        if not self.route:
+            self.route = self.name
+        if not self.model_id:
+            self.model_id = self.name.split("/", 1)[1] if "/" in self.name else self.name
+        self.inference_settings = dict(self.inference_settings or {})
+        self.capabilities = tuple(str(item) for item in (self.capabilities or ()))
+        self.output_formats = tuple(str(item) for item in (self.output_formats or ()))
+        if self.availability is None:
+            self.availability = _discovered_availability(self.executor)
+        else:
+            self.availability = dict(self.availability)
+            self.availability.setdefault("status", "unknown")
+            self.availability.setdefault("provenance", "operator")
+            self.availability.setdefault("checked_at", _checked_at())
+            self.availability.setdefault("freshness_seconds", CATALOG_FRESHNESS_SECONDS)
+        if self.timeout <= 0:
+            raise ValueError("timeout must be positive")
+
+    @property
+    def candidate_id(self) -> str:
+        settings = json.dumps(self.inference_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = __import__("hashlib").sha256(settings.encode("utf-8")).hexdigest()[:10]
+        return f"{self.executor}/{self.provider}/{self.route}/{self.model_id}/{digest}"
+
+    @property
+    def identity_tuple(self) -> Tuple[str, str, str, str, Dict[str, Any]]:
+        return (self.executor, self.provider, self.route, self.model_id, dict(self.inference_settings))
+
+    def clone(self) -> "AgentConfig":
+        return copy.deepcopy(self)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "candidate_id": self.candidate_id,
+            "executor": self.executor,
+            "provider": self.provider,
+            "route": self.route,
+            "model_id": self.model_id,
+            "inference_settings": dict(self.inference_settings),
+            "availability": dict(self.availability or {}),
+            "context_window": self.context_window,
+            "max_output_bytes": self.max_output_bytes,
+            "latency_seconds": self.latency_seconds,
+            "cost_per_request": self.cost_per_request,
+            "capabilities": list(self.capabilities),
+            "output_formats": list(self.output_formats),
+            "priority": self.priority,
+            "legacy": self.legacy,
+        }
 
 
-def _build_codex_cmd(prompt: str) -> List[str]:
-    return ["codex", "-c", "model=gpt-5.4", "exec", prompt]
+def _build_codex_cmd(_prompt: str) -> List[str]:
+    return ["codex", "-c", "model=gpt-5.4", "-c", "model_reasoning_effort=high", "exec", "-"]
 
 
-def _build_copilot_sonnet_cmd(prompt: str) -> List[str]:
-    return ["copilot", "-s", "--model", "claude-sonnet-4.6", "-p", prompt, "--yolo"]
+def _build_copilot_sonnet_cmd(_prompt: str) -> List[str]:
+    return ["copilot", "-s", "--model", "claude-sonnet-4.6", "-p", "-"]
 
 
-def _build_gemini_cmd(prompt: str) -> List[str]:
-    return ["gemini", "-m", "gemini-3-pro-preview", "-p", prompt]
+def _build_agy_cmd(_prompt: str) -> List[str]:
+    return ["agy", "--model", "gemini-3.8-flash-high", "--effort", "high", "--input", "-"]
 
 
-def _build_copilot_mini_cmd(prompt: str) -> List[str]:
-    return ["copilot", "-s", "--model", "gpt-5-mini", "-p", prompt, "--yolo"]
+def _build_gemini_cmd(_prompt: str) -> List[str]:
+    """Legacy compatibility adapter; agy never aliases this executor."""
+
+    return ["gemini", "-m", "gemini-3-pro-preview", "-p", "-"]
 
 
-# Production agent chain
-AGENT_CHAIN: List[AgentConfig] = [
-    AgentConfig(name="codex/gpt-5.4", build_cmd=_build_codex_cmd, timeout=180),
-    AgentConfig(name="copilot/sonnet-4.6", build_cmd=_build_copilot_sonnet_cmd, timeout=120),
-    AgentConfig(name="gemini/3-pro", build_cmd=_build_gemini_cmd, timeout=120),
-    AgentConfig(name="copilot/gpt-5-mini", build_cmd=_build_copilot_mini_cmd, timeout=90),
+def _build_copilot_mini_cmd(_prompt: str) -> List[str]:
+    return ["copilot", "-s", "--model", "gpt-5-mini", "-p", "-"]
+
+
+def _catalog_seed() -> List[AgentConfig]:
+    return [
+        AgentConfig("codex/gpt-5.4", _build_codex_cmd, timeout=180, executor="codex", provider="openai", route="codex.exec", model_id="gpt-5.4", inference_settings={"effort": "high", "stdin": True}, priority=10),
+        AgentConfig("copilot/sonnet-4.6", _build_copilot_sonnet_cmd, timeout=150, executor="copilot", provider="github", route="copilot.prompt", model_id="claude-sonnet-4.6", inference_settings={"stdin": True}, priority=20),
+        AgentConfig("agy/gemini-3.8-flash-high", _build_agy_cmd, timeout=150, executor="agy", provider="google", route="agy.prompt", model_id="gemini-3.8-flash-high", inference_settings={"effort": "high", "stdin": True}, priority=30),
+        AgentConfig("copilot/gpt-5-mini", _build_copilot_mini_cmd, timeout=90, executor="copilot", provider="github", route="copilot.prompt", model_id="gpt-5-mini", inference_settings={"stdin": True}, priority=40),
+    ]
+
+
+AGENT_CHAIN: List[AgentConfig] = _catalog_seed()
+
+# Kept out of the production catalog so the new router cannot silently treat
+# the old Gemini CLI as agy.  Callers that explicitly need legacy behavior may
+# pass this chain to ``call_agent``.
+LEGACY_AGENT_CHAIN: List[AgentConfig] = [
+    AgentConfig(
+        "gemini/3-pro",
+        _build_gemini_cmd,
+        timeout=120,
+        executor="gemini",
+        provider="google",
+        route="gemini.prompt",
+        model_id="gemini-3-pro-preview",
+        inference_settings={"stdin": True, "legacy": True},
+        legacy=True,
+        priority=90,
+    )
 ]
-
-# Test-only: always use copilot mini
 TEST_AGENT = AgentConfig(
-    name="copilot/gpt-5-mini (test)",
-    build_cmd=_build_copilot_mini_cmd,
+    "copilot/gpt-5-mini (test)",
+    _build_copilot_mini_cmd,
     timeout=90,
+    executor="copilot",
+    provider="github",
+    route="copilot.prompt",
+    model_id="gpt-5-mini",
+    inference_settings={"stdin": True, "test_only": True},
+    availability=_operator_availability(status="available", note="explicit test fixture"),
+    priority=1,
 )
+
+
+def discover_agent_catalog(
+    candidates: Optional[Sequence[AgentConfig]] = None,
+    *,
+    operator_entries: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+) -> List[AgentConfig]:
+    """Refresh executable presence and apply explicit operator entries."""
+
+    result = [(item.clone()) for item in (candidates or _catalog_seed())]
+    for item in result:
+        item.availability = _discovered_availability(item.executor)
+    if isinstance(operator_entries, Mapping):
+        entries = [dict(value, name=key) if isinstance(value, Mapping) else {"name": key, "status": value} for key, value in operator_entries.items()]
+    else:
+        entries = [entry for entry in (operator_entries or ()) if isinstance(entry, Mapping)]
+    for entry in entries:
+        wanted = str(entry.get("name", entry.get("candidate_id", entry.get("model_id", ""))))
+        for item in result:
+            if wanted not in {item.name, item.candidate_id, item.model_id}:
+                continue
+            item.availability = _operator_availability(
+                status=str(entry.get("status", "available")),
+                checked_at=str(entry.get("checked_at", "")) or None,
+                expires_at=str(entry.get("expires_at", "")) or None,
+                note=str(entry.get("note", "")),
+            )
+            break
+    return result
+
+
+def operator_catalog(entries: Mapping[str, Any] | Sequence[Mapping[str, Any]], *, candidates: Optional[Sequence[AgentConfig]] = None) -> List[AgentConfig]:
+    return discover_agent_catalog(candidates, operator_entries=entries)
+
+
+read_only_discover = discover_agent_catalog
 
 
 @dataclass
 class AgentAnalysis:
-    """Result of an AI agent analysis."""
+    """Result of one bounded analyzer execution."""
+
     agent_name: str = ""
     raw_response: str = ""
     success: bool = False
     error: str = ""
+    requested_model: Optional[str] = None
+    actual_model: Optional[str] = None
+    requested_settings: Dict[str, Any] = field(default_factory=dict)
+    actual_settings: Dict[str, Any] = field(default_factory=dict)
+    native_usage: Dict[str, Optional[int]] = field(default_factory=lambda: SemanticUsage().to_dict())
+    usage_scope: str = "analyzer_invocation_native"
+    structured_output: Dict[str, Any] = field(default_factory=dict)
+    claims: List[Dict[str, Any]] = field(default_factory=list)
+    recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    routing: Optional[RouteDecision] = None
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    postcheck: Any = None
+    coverage: Dict[str, Any] = field(default_factory=dict)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "agent_name": self.agent_name,
+            "success": self.success,
+            "raw_response": self.raw_response,
+            "error": self.error,
+            "requested_model": self.requested_model,
+            "actual_model": self.actual_model,
+            "requested_settings": dict(self.requested_settings),
+            "actual_settings": dict(self.actual_settings),
+            "native_usage": dict(self.native_usage),
+            "usage_scope": self.usage_scope,
+            "structured_output": dict(self.structured_output),
+            "claims": list(self.claims),
+            "recommendations": list(self.recommendations),
+            "routing": self.routing.to_dict() if self.routing is not None else None,
+            "attempts": list(self.attempts),
+            "postcheck": self.postcheck.to_dict() if hasattr(self.postcheck, "to_dict") else self.postcheck,
+            "coverage": dict(self.coverage),
+            "diagnostics": list(self.diagnostics),
+        }
 
 
-def prepare_analysis_prompt(
-    score: SessionScore,
-    session: Session,
-    diagnosis_summary: Optional[Dict[str, Any]] = None,
-    problemmap: Optional[Dict[str, Any]] = None,
-    evidence_summary: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Build a prompt summarizing the session for agent analysis."""
-    axes = score.radar_axes
-    weak_dims = [f"{k}={v:.0f}" for k, v in axes.items() if v < 70]
-
-    # Extract first 3 user messages
-    user_msgs = []
-    for t in session.turns[:5]:
-        if t.user_input:
-            msg = t.user_input[:200]
-            if len(t.user_input) > 200:
-                msg += "..."
-            user_msgs.append(msg)
-        if len(user_msgs) >= 3:
-            break
-
-    # Tool usage stats
-    tool_counts: Dict[str, int] = {}
-    tool_fails = 0
-    for t in session.turns:
-        for tc in t.tool_calls:
-            tool_counts[tc.name] = tool_counts.get(tc.name, 0) + 1
-            if tc.success is False or (tc.exit_code is not None and tc.exit_code != 0):
-                tool_fails += 1
-
-    tool_total = sum(tool_counts.values())
-    top_tools = sorted(tool_counts.items(), key=lambda x: -x[1])[:5]
-    tool_stats = ", ".join(f"{n}({c})" for n, c in top_tools)
-
-    axes_str = " / ".join(f"{k}={v:.0f}" for k, v in axes.items())
-    diagnosis_section = ""
-    if diagnosis_summary:
-        pm_lines = []
-        for item in diagnosis_summary.get("pm_candidates", [])[:3]:
-            pm_lines.append(
-                f"- {item.get('field')}: {item.get('label_zh')}｜欄位意義={item.get('field_meaning_zh')}｜Fx={item.get('fx_weight_ratio_zh')}"
-            )
-        fx_lines = ", ".join(
-            f"{item.get('fx')}={item.get('weight_pct')}"
-            for item in diagnosis_summary.get("fx_weights", [])[:4]
-            if float(item.get("weight", 0.0)) > 0
-        ) or "無"
-        weighted_dims = ", ".join(
-            f"{item.get('dimension_zh')}={item.get('combined_attention_pct')}"
-            for item in diagnosis_summary.get("weighted_dimensions", [])[:3]
-        ) or "無"
-        route = diagnosis_summary.get("route_summary", {})
-        diagnosis_section = f"""
-
-## 加權診斷摘要
-- 摘要: {diagnosis_summary.get("summary_zh", "無")}
-- 主家族: {route.get("primary_family_zh", "未解析")}
-- 次家族: {route.get("secondary_family_zh", "無")}
-- 破損不變量: {route.get("broken_invariant_zh", "尚未判定")}
-- 優先修復方向: {route.get("first_fix_zh", "無")}
-- Fx 權重: {fx_lines}
-- 加權後最值得關注的維度: {weighted_dims}
-{chr(10).join(pm_lines) if pm_lines else '- 無 PM 候選'}
-"""
-    elif problemmap:
-        pm1_candidates = problemmap.get("pm1_candidates", [])
-        pm1_str = ", ".join(
-            f"{item.get('number')}:{item.get('label_zh', item.get('label'))}"
-            for item in pm1_candidates[:3]
-        ) or "無"
-        atlas = problemmap.get("atlas", {})
-        diagnosis_section = f"""
-
-## ProblemMap / Atlas 診斷
-- PM 候選: {pm1_str}
-- 主家族: {atlas.get("primary_family_zh", atlas.get("primary_family", "未解析"))}
-- 次家族: {atlas.get("secondary_family_zh", atlas.get("secondary_family", "無"))}
-- 優先修復方向: {atlas.get("fix_surface_direction_zh", atlas.get("fix_surface_direction", "無"))}
-"""
-
-    evidence_section = ""
-    if evidence_summary:
-        weak_dim_str = ", ".join(
-            f"{name}={value:.0f}"
-            for name, value in evidence_summary.get("weak_dimensions", {}).items()
-        ) or "無"
-        top_turns = ", ".join(
-            f"T{item.get('turn')}({item.get('composite')})"
-            for item in evidence_summary.get("representative_turns", [])[:5]
-        ) or "無"
-        fail_str = ", ".join(evidence_summary.get("failed_tools", [])[:5]) or "無"
-        signal_str = ", ".join(evidence_summary.get("candidate_failure_signals", [])[:5]) or "無"
-        evidence_section = f"""
-
-## 補充 Evidence 摘要
-- Weak Dimensions: {weak_dim_str}
-- Candidate Failure Signals: {signal_str}
-- Representative Turns: {top_turns}
-- Failed Tools: {fail_str}
-"""
-
-    prompt = f"""你是一個 Agent CLI Session 品質分析師。以下是一個 session 的評估摘要，請提供專業的改善建議。
-
-## Session 基本資訊
-- Session ID: {score.session_id}
-- 來源: {score.source}, 模型: {score.model or 'unknown'}
-- 回合數: {score.turn_count}
-- 總分: {score.composite:.1f}/100 ({score.grade})
-
-## 各維度分數
-{axes_str}
-
-## 低分維度（<70 分）
-{', '.join(weak_dims) if weak_dims else '無（全部 ≥70）'}
-
-## 前幾輪使用者訊息
-{chr(10).join(f'{i+1}. {m}' for i, m in enumerate(user_msgs))}
-
-## 工具使用統計
-- 總呼叫數: {tool_total}, 失敗: {tool_fails}
-- 常用工具: {tool_stats}
-
-## 事件統計
-- Abort 次數: {score.abort_count}
-- Context Compaction 次數: {score.compaction_count}
-{diagnosis_section}
-{evidence_section}
-
-## 請提供：
-1. **整體評估**（2-3 句話概述此 session 的 prompt 品質）
-2. **針對每個低分維度（<70 分）的具體改善建議**（如果有的話）
-3. **最重要的 1 個改善行動**
-
-用繁體中文回覆，簡潔扼要。使用 Markdown 格式。"""
-
-    return prompt
+def _redact_error(value: Any) -> str:
+    text = str(value)
+    for marker in ("TYPESAFE_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "Authorization"):
+        text = text.replace(marker, "[redacted]")
+    return text[:300]
 
 
-def prepare_batch_analysis_prompt(
-    aggregate: Dict[str, Any],
-    session_summaries: List[Dict[str, Any]],
-    diagnosis_summary: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Build an analysis prompt for a batch of sessions."""
+_SECRET_VALUE = re.compile(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization)\s*[:=]\s*([^\s,;]+)")
+_ABSOLUTE_PATH = re.compile(r"(?:^|[\s(])(?:/home/[^\s)]+|/Users/[^\s)]+|[A-Za-z]:[\\/][^\s)]+)")
 
-    session_lines = []
-    for item in session_summaries[:12]:
-        weak_dims = ", ".join(item.get("weak_dimensions", [])) or "無"
-        session_lines.append(
-            "- {session_id}: score={score} grade={grade} 主家族={primary} 弱項={weak} 修復方向={route}".format(
-                session_id=item.get("session_id", "unknown"),
-                score=item.get("score", "?"),
-                grade=item.get("grade", "?"),
-                primary=item.get("primary_family", "未解析"),
-                weak=weak_dims,
-                route=item.get("route", "無"),
-            )
+
+def _redact_text(value: str) -> str:
+    value = _SECRET_VALUE.sub(lambda match: f"{match.group(1)}=[redacted]", value)
+    return _ABSOLUTE_PATH.sub(lambda match: match.group(0)[:1] + "[path-redacted]", value)
+
+
+def _redact_value(value: Any, depth: int = 0) -> Any:
+    if depth > 6:
+        return "[depth-limited]"
+    if isinstance(value, Mapping):
+        output: Dict[str, Any] = {}
+        for key, item in list(value.items())[:200]:
+            key_text = str(key)
+            if any(marker in key_text.lower() for marker in ("key", "token", "password", "secret", "authorization", "cookie")):
+                output[key_text] = "[redacted]"
+            else:
+                output[key_text] = _redact_value(item, depth + 1)
+        return output
+    if isinstance(value, list):
+        return [_redact_value(item, depth + 1) for item in value[:200]]
+    if isinstance(value, str):
+        return _redact_text(value[:12_000])
+    return value
+
+
+def _parse_structured_output(output: str) -> Tuple[str, Dict[str, Any], Optional[str], Dict[str, Any], Dict[str, Optional[int]]]:
+    try:
+        payload = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return output, {}, None, {}, SemanticUsage().to_dict()
+    if not isinstance(payload, Mapping):
+        return output, {}, None, {}, SemanticUsage().to_dict()
+    structured = _redact_value(dict(payload))
+    text = payload.get("text", payload.get("analysis", payload.get("output", "")))
+    if not isinstance(text, str):
+        text = output
+    text = _redact_text(text)
+    actual_model = payload.get("actual_model", payload.get("model", payload.get("model_id")))
+    actual_model = actual_model.strip() if isinstance(actual_model, str) and actual_model.strip() else None
+    actual_settings = payload.get("actual_settings", payload.get("settings", {}))
+    actual_settings = _redact_value(dict(actual_settings)) if isinstance(actual_settings, Mapping) else {}
+    usage = SemanticUsage.from_payload(payload.get("usage", payload.get("native_usage"))).to_dict()
+    return text, structured, actual_model, actual_settings, usage
+
+
+def _structured_items(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for item in value[:100]:
+        if isinstance(item, Mapping):
+            raw = dict(item)
+            text = raw.get("text", raw.get("claim", raw.get("recommendation", "")))
+        elif isinstance(item, str):
+            raw, text = {}, item
+        else:
+            continue
+        if isinstance(text, str) and text.strip():
+            raw["text"] = text.strip()[:12_000]
+            result.append(raw)
+    return result
+
+
+def _execute_candidate(prompt: str, candidate: AgentConfig, request: AnalysisRequest) -> AgentAnalysis:
+    if len(prompt.encode("utf-8")) > request.budget.max_context_bytes:
+        return AgentAnalysis(agent_name=candidate.name, success=False, error="analysis input exceeds routing context budget", requested_model=candidate.model_id, requested_settings=dict(candidate.inference_settings), diagnostics=[{"kind": "input_budget_exceeded", "status": "failed"}])
+    try:
+        argv = candidate.build_cmd("")
+        if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) for arg in argv):
+            raise ValueError("candidate command adapter must return a string argv list")
+        result = subprocess.run(
+            argv,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=min(candidate.timeout, int(request.budget.max_latency_seconds)),
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+            check=False,
         )
+    except subprocess.TimeoutExpired:
+        return AgentAnalysis(agent_name=candidate.name, success=False, error="analyzer timed out; execution outcome is unknown", requested_model=candidate.model_id, requested_settings=dict(candidate.inference_settings), diagnostics=[{"kind": "timeout", "status": "unknown"}])
+    except FileNotFoundError:
+        return AgentAnalysis(agent_name=candidate.name, success=False, error="analyzer executable is unavailable", requested_model=candidate.model_id, requested_settings=dict(candidate.inference_settings), diagnostics=[{"kind": "executable_unavailable", "status": "failed"}])
+    except Exception as exc:
+        return AgentAnalysis(agent_name=candidate.name, success=False, error=_redact_error(f"{type(exc).__name__}: {exc}"), requested_model=candidate.model_id, requested_settings=dict(candidate.inference_settings), diagnostics=[{"kind": "adapter_exception", "status": "failed"}])
 
-    diagnosis_section = ""
-    if diagnosis_summary:
-        fx_lines = ", ".join(
-            f"{item.get('fx')}={item.get('weight_pct')}"
-            for item in diagnosis_summary.get("fx_weights", [])[:4]
-            if float(item.get("weight", 0.0)) > 0
-        ) or "無"
-        dim_lines = ", ".join(
-            f"{item.get('dimension_zh')}={item.get('combined_attention_pct')}"
-            for item in diagnosis_summary.get("weighted_dimensions", [])[:3]
-        ) or "無"
-        diagnosis_section = f"""
-
-## 批次加權診斷摘要
-- 摘要: {diagnosis_summary.get('summary_zh', '無')}
-- 主要 Fx 權重: {fx_lines}
-- 加權後最值得關注的維度: {dim_lines}
-"""
-
-    prompt = f"""你是一個 Agent CLI Session 品質分析師。以下是一批 session 的彙整評估結果，請根據量化分數、ProblemMap / Atlas 診斷與 evidence 訊號，給出整體改善建議。
-
-## Batch 概況
-- Session 數量: {aggregate.get('session_count')}
-- 平均分數: {aggregate.get('average_score')}
-- 最低分數: {aggregate.get('min_score')}
-- 最高分數: {aggregate.get('max_score')}
-- 常見主家族: {', '.join(aggregate.get('primary_families', [])) or '無'}
-- 常見 Failure Signals: {', '.join(aggregate.get('failure_signals', [])) or '無'}
-{diagnosis_section}
-
-## Session 摘要
-{chr(10).join(session_lines)}
-
-## 請提供：
-1. **整體觀察**（2-3 句）
-2. **最常見的結構性問題模式**（聚焦 ProblemMap / Atlas）
-3. **最值得優先做的 1-2 個工程改善行動**
-
-用繁體中文回覆，簡潔扼要。使用 Markdown 格式。"""
-
-    return prompt
+    raw_output = result.stdout or ""
+    if isinstance(raw_output, bytes):
+        raw_output = raw_output.decode("utf-8", errors="replace")
+    output = str(raw_output).strip()
+    output_size = len(output.encode("utf-8"))
+    base = {"agent_name": candidate.name, "requested_model": candidate.model_id, "requested_settings": dict(candidate.inference_settings)}
+    if output_size > request.budget.max_output_bytes:
+        clipped = output.encode("utf-8")[: request.budget.max_output_bytes].decode("utf-8", errors="replace")
+        return AgentAnalysis(**base, raw_response=clipped, success=False, error="analyzer output exceeds routing output budget", diagnostics=[{"kind": "output_budget_exceeded", "status": "failed", "bytes": output_size}])
+    if result.returncode != 0:
+        return AgentAnalysis(**base, raw_response=output, success=False, error=f"analyzer exited with code {result.returncode}", diagnostics=[{"kind": "execution_failed", "status": "failed", "exit_code": result.returncode}])
+    if not output:
+        return AgentAnalysis(**base, success=False, error="analyzer returned empty output", diagnostics=[{"kind": "empty_output", "status": "failed"}])
+    text, structured, actual_model, actual_settings, usage = _parse_structured_output(output)
+    return AgentAnalysis(**base, raw_response=text, success=True, actual_model=actual_model, actual_settings=actual_settings, native_usage=usage, structured_output=structured, claims=_structured_items(structured.get("claims")), recommendations=_structured_items(structured.get("recommendations")), diagnostics=[{"kind": "execution_complete", "status": "complete"}])
 
 
 def call_agent(
     prompt: str,
     agent_chain: Optional[List[AgentConfig]] = None,
     test_mode: bool = False,
+    *,
+    routing_backend: Any = None,
+    backend: Any = None,
+    model_override: str = "",
+    request: Optional[AnalysisRequest] = None,
+    use_jev: Optional[bool] = None,
+    max_retries: int = 1,
+    max_output_bytes: int = MAX_ANALYSIS_OUTPUT_BYTES,
 ) -> AgentAnalysis:
-    """Call an external agent CLI, trying the chain in order.
+    """Route and execute one analyzer with bounded failed-execution retry."""
 
-    Args:
-        prompt: The analysis prompt to send
-        agent_chain: Custom agent chain (default: AGENT_CHAIN)
-        test_mode: If True, only use TEST_AGENT
-    """
-    if test_mode:
-        agents = [TEST_AGENT]
-    else:
-        agents = agent_chain or AGENT_CHAIN
-
-    for agent in agents:
-        # Check if the CLI tool is available
-        cmd_name = agent.build_cmd("test")[0]
-        if not shutil.which(cmd_name):
-            continue
-
-        cmd = agent.build_cmd(prompt)
-
-        try:
-            print(f"  🤖 Calling {agent.name}...", file=sys.stderr, end="", flush=True)
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=agent.timeout,
-                env={**os.environ, "NO_COLOR": "1"},
-            )
-
-            output = result.stdout.strip()
-            if result.returncode == 0 and output:
-                print(f" ✓", file=sys.stderr)
-                return AgentAnalysis(
-                    agent_name=agent.name,
-                    raw_response=output,
-                    success=True,
-                )
-            else:
-                err = result.stderr.strip()[:200]
-                print(f" ✗ (exit={result.returncode})", file=sys.stderr)
-
-        except subprocess.TimeoutExpired:
-            print(f" ✗ (timeout)", file=sys.stderr)
-        except Exception as e:
-            print(f" ✗ ({e})", file=sys.stderr)
-
-    return AgentAnalysis(
-        success=False,
-        error="All agents in the chain failed or are unavailable.",
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+    candidates = [TEST_AGENT.clone()] if test_mode else list(agent_chain or AGENT_CHAIN)
+    explicit_chain = agent_chain is not None or test_mode
+    chosen_backend = routing_backend if routing_backend is not None else backend
+    effective_request = request or AnalysisRequest(
+        context_bytes=len(prompt.encode("utf-8")),
+        output_bytes=max_output_bytes,
+        model_override=model_override,
+        budget=RoutingBudget(max_context_bytes=MAX_ANALYSIS_INPUT_BYTES, max_output_bytes=max_output_bytes, max_reselections=max_retries),
     )
+    if model_override and not effective_request.model_override:
+        effective_request = AnalysisRequest(
+            purpose=effective_request.purpose,
+            context_bytes=effective_request.context_bytes,
+            output_bytes=effective_request.output_bytes,
+            max_latency_seconds=effective_request.max_latency_seconds,
+            max_cost=effective_request.max_cost,
+            required_capabilities=effective_request.required_capabilities,
+            allowed_executors=effective_request.allowed_executors,
+            output_format=effective_request.output_format,
+            language=effective_request.language,
+            model_override=model_override,
+            inference_settings=effective_request.inference_settings,
+            budget=effective_request.budget,
+        )
+    jev_enabled = bool(chosen_backend is not None) if use_jev is None else use_jev
+    excluded: List[str] = []
+    attempts: List[Dict[str, Any]] = []
+    last: Optional[AgentAnalysis] = None
+    max_rounds = min(max_retries, effective_request.budget.max_reselections) + 1
+    for round_index in range(max_rounds):
+        decision = choose_model(candidates, effective_request, backend=chosen_backend, explicit_override=effective_request.model_override, allow_unknown=explicit_chain, use_jev=jev_enabled, exclude=excluded)
+        decision.reselection_count = round_index
+        if decision.candidate is None:
+            return AgentAnalysis(success=False, error="no suitable analyzer model", requested_model=effective_request.model_override or None, routing=decision, attempts=attempts, diagnostics=decision.diagnostics)
+        print(f"  🤖 Calling {decision.candidate.name}...", file=sys.stderr, end="", flush=True)
+        analysis = _execute_candidate(prompt, decision.candidate, effective_request)
+        analysis.routing = decision
+        attempts.append({"candidate_id": routing_candidate_id(decision.candidate), "name": decision.candidate.name, "status": "complete" if analysis.success else (analysis.diagnostics[0].get("status") if analysis.diagnostics else "failed"), "error": analysis.error})
+        analysis.attempts = list(attempts)
+        last = analysis
+        if analysis.success:
+            print(" ✓", file=sys.stderr)
+            return analysis
+        print(" ✗", file=sys.stderr)
+        mark_execution_failure(decision.candidate, error_kind=(analysis.diagnostics[0].get("kind") if analysis.diagnostics else "execution_failed"), message=analysis.error)
+        excluded.append(routing_candidate_id(decision.candidate))
+        if effective_request.model_override:
+            break
+    return last or AgentAnalysis(success=False, error="all bounded analyzer attempts failed", attempts=attempts)
+
+
+def prepare_analysis_prompt(score: SessionScore, session: Session, diagnosis_summary: Optional[Dict[str, Any]] = None, problemmap: Optional[Dict[str, Any]] = None, evidence_summary: Optional[Dict[str, Any]] = None) -> str:
+    axes = score.radar_axes
+    weak_dims = [f"{key}={value:.0f}" for key, value in axes.items() if value < 70]
+    user_msgs = [turn.user_input[:200] + ("..." if len(turn.user_input) > 200 else "") for turn in session.turns[:5] if turn.user_input][:3]
+    tool_counts: Dict[str, int] = {}
+    failures = 0
+    for turn in session.turns:
+        for call in turn.tool_calls:
+            tool_counts[call.name] = tool_counts.get(call.name, 0) + 1
+            failures += call.success is False or (call.exit_code is not None and call.exit_code != 0)
+    route = diagnosis_summary.get("route_summary", {}) if diagnosis_summary else {}
+    diagnosis = "" if not diagnosis_summary else f"\n## 加權診斷\n- 摘要: {diagnosis_summary.get('summary_zh', '無')}\n- 主家族: {route.get('primary_family_zh', '未解析')}\n- 優先修復方向: {route.get('first_fix_zh', '無')}\n"
+    if not diagnosis and problemmap:
+        atlas = problemmap.get("atlas", {})
+        diagnosis = f"\n## ProblemMap\n- 主家族: {atlas.get('primary_family_zh', atlas.get('primary_family', '未解析'))}\n"
+    evidence = "" if not evidence_summary else f"\n## Evidence 摘要\n- 弱項: {', '.join(evidence_summary.get('weak_dimensions', {}).keys()) or '無'}\n- Failure signals: {', '.join(evidence_summary.get('candidate_failure_signals', [])[:5]) or '無'}\n- Failed tools: {', '.join(evidence_summary.get('failed_tools', [])[:5]) or '無'}\n"
+    return f"""你是一個 Agent CLI Session 品質分析師。只根據下列 bounded facts 提供改善建議；請區分 observations、hypotheses、recommendations，不把推測寫成已驗證事實。
+
+## Session
+- ID: {score.session_id}
+- source/model: {score.source} / {score.model or 'unknown'}
+- turns: {score.turn_count}
+- legacy score (compatibility only): {score.composite:.1f}/100 ({score.grade})
+
+## Axes
+{' / '.join(f'{key}={value:.0f}' for key, value in axes.items())}
+- weak dimensions: {', '.join(weak_dims) or '無'}
+
+## User request samples
+{chr(10).join(f'{index + 1}. {value}' for index, value in enumerate(user_msgs)) or '無'}
+
+## Tool facts
+- calls: {sum(tool_counts.values())}; failures: {failures}; common: {', '.join(f'{key}({value})' for key, value in sorted(tool_counts.items(), key=lambda item: -item[1])[:5]) or '無'}
+- compactions: {score.compaction_count}; aborts: {score.abort_count}
+{diagnosis}{evidence}
+
+Return concise observations, bounded hypotheses, and one or two actionable recommendations. Use Traditional Chinese."""
+
+
+def prepare_batch_analysis_prompt(aggregate: Dict[str, Any], session_summaries: List[Dict[str, Any]], diagnosis_summary: Optional[Dict[str, Any]] = None, *, max_sessions: Optional[int] = None) -> str:
+    selected = session_summaries if max_sessions is None else session_summaries[:max_sessions]
+    lines = ["- {session_id}: score={score} grade={grade} family={primary} weak={weak} route={route}".format(session_id=item.get("session_id", "unknown"), score=item.get("score", "?"), grade=item.get("grade", "?"), primary=item.get("primary_family", "未解析"), weak=", ".join(item.get("weak_dimensions", [])) or "無", route=item.get("route", "無")) for item in selected]
+    return f"""你是一個 Agent CLI Session 品質分析師。請分析全部列出的 session 摘要，不把量化分數或 Jev 判讀當成 correctness proof。
+
+## Batch
+- selected sessions: {len(selected)}
+- source sessions: {len(session_summaries)}
+- omitted by prompt budget: {max(0, len(session_summaries) - len(selected))}
+- aggregate: {json.dumps(aggregate, ensure_ascii=False, sort_keys=True)}
+
+## Sessions
+{chr(10).join(lines) or '無'}
+
+Return concise observations, recurring bounded hypotheses, and one or two engineering recommendations in Traditional Chinese."""
 
 
 def render_agent_html_section(analysis: AgentAnalysis) -> str:
-    """Render the agent analysis as an HTML section for the report."""
     if not analysis.success:
         return ""
-
-    # Convert markdown-ish content to basic HTML
-    content = analysis.raw_response
-    content_html = _markdown_to_html(content)
-
-    return f"""
-    <div class="agent-analysis">
-        <h2>🤖 AI 分析報告</h2>
-        <div class="agent-meta">
-            分析引擎: <strong>{html.escape(analysis.agent_name)}</strong>
-        </div>
-        <div class="agent-content">
-            {content_html}
-        </div>
-    </div>
-    """
+    metadata = {"requested_model": analysis.requested_model, "actual_model": analysis.actual_model, "requested_settings": analysis.requested_settings, "actual_settings": analysis.actual_settings, "native_usage": analysis.native_usage, "usage_scope": analysis.usage_scope, "coverage": analysis.coverage, "routing": analysis.routing.to_dict() if analysis.routing else None, "postcheck": analysis.postcheck.to_dict() if hasattr(analysis.postcheck, "to_dict") else analysis.postcheck}
+    return f"""<div class="agent-analysis"><h2>🤖 AI 分析報告</h2><div class="agent-meta">分析引擎: <strong>{html.escape(analysis.agent_name)}</strong></div><div class="agent-content">{_markdown_to_html(analysis.raw_response)}</div><details><summary>Routing / identity / usage / post-check</summary><pre>{html.escape(json.dumps(metadata, ensure_ascii=False, indent=2))}</pre></details></div>"""
 
 
 def render_agent_terminal(analysis: AgentAnalysis) -> str:
-    """Render agent analysis for terminal output."""
     if not analysis.success:
         return ""
-
-    lines = [
-        "",
-        "╔════════════════════════════════════════════════════════╗",
-        f"║  🤖 AI Analysis (via {analysis.agent_name})",
-        "╠════════════════════════════════════════════════════════╣",
-    ]
-    # Wrap response text to fit box
-    for line in analysis.raw_response.split("\n"):
+    lines = ["", "╔════════════════════════════════════════════════════════╗", f"║  🤖 AI Analysis (via {analysis.agent_name})", f"║  requested={analysis.requested_model or 'unknown'} actual={analysis.actual_model or 'unknown'}", f"║  usage(total)={analysis.native_usage.get('total_tokens') if analysis.native_usage else None}", "╠════════════════════════════════════════════════════════╣"]
+    if analysis.routing:
+        lines.append(f"║  route={analysis.routing.routing_source} status={analysis.routing.status}")
+    for line in analysis.raw_response.split("\n")[:80]:
         if line.strip():
-            # Truncate long lines
-            if len(line) > 54:
-                lines.append(f"║  {line[:52]}…")
-            else:
-                lines.append(f"║  {line}")
+            lines.append(f"║  {line[:52]}{'…' if len(line) > 52 else ''}")
+    if analysis.postcheck is not None:
+        lines.append(f"║  postcheck={getattr(analysis.postcheck, 'status', 'unknown')} repairs={getattr(analysis.postcheck, 'repair_count', 0)}")
     lines.append("╚════════════════════════════════════════════════════════╝")
     return "\n".join(lines)
 
 
 def _markdown_to_html(md: str) -> str:
-    """Very basic markdown-to-HTML conversion (no external deps)."""
     import re
-    lines = md.split("\n")
-    out: List[str] = []
+    output: List[str] = []
     in_list = False
-
-    for line in lines:
+    list_tag = "ul"
+    for line in md.split("\n"):
         stripped = line.strip()
         if not stripped:
             if in_list:
-                out.append("</ul>")
+                output.append(f"</{list_tag}>")
                 in_list = False
-            out.append("<br>")
-            continue
-
-        # Headers
-        if stripped.startswith("### "):
-            out.append(f"<h4>{html.escape(stripped[4:])}</h4>")
+            output.append("<br>")
+        elif stripped.startswith("### "):
+            output.append(f"<h4>{html.escape(stripped[4:])}</h4>")
         elif stripped.startswith("## "):
-            out.append(f"<h3>{html.escape(stripped[3:])}</h3>")
+            output.append(f"<h3>{html.escape(stripped[3:])}</h3>")
         elif stripped.startswith("# "):
-            out.append(f"<h3>{html.escape(stripped[2:])}</h3>")
-        # List items
+            output.append(f"<h3>{html.escape(stripped[2:])}</h3>")
         elif stripped.startswith("- ") or stripped.startswith("* "):
             if not in_list:
-                out.append("<ul>")
+                list_tag = "ul"
+                output.append("<ul>")
                 in_list = True
-            item = stripped[2:]
-            # Bold
-            item = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', item)
-            out.append(f"<li>{item}</li>")
-        # Numbered list
-        elif re.match(r'^\d+\.\s', stripped):
+            output.append(f"<li>{html.escape(stripped[2:])}</li>")
+        elif re.match(r"^\d+\.\s", stripped):
             if not in_list:
-                out.append("<ol>")
+                list_tag = "ol"
+                output.append("<ol>")
                 in_list = True
-            item = re.sub(r'^\d+\.\s', '', stripped)
-            item = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', item)
-            out.append(f"<li>{item}</li>")
+            output.append(f"<li>{html.escape(re.sub(r'^\d+\.\s', '', stripped))}</li>")
         else:
             if in_list:
-                # Check if prev was <ol> or <ul>
-                for prev in reversed(out):
-                    if "<ol>" in prev:
-                        out.append("</ol>")
-                        break
-                    elif "<ul>" in prev:
-                        out.append("</ul>")
-                        break
+                output.append(f"</{list_tag}>")
                 in_list = False
-            # Bold inline
-            processed = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html.escape(stripped))
-            out.append(f"<p>{processed}</p>")
-
+            output.append(f"<p>{html.escape(stripped)}</p>")
     if in_list:
-        out.append("</ul>")
+        output.append(f"</{list_tag}>")
+    return "\n".join(output)
 
-    return "\n".join(out)
+
+# Re-export routing names from the historical module entry point.
+ModelCandidate = AgentConfig
+RoutingResult = RouteDecision
+route_analysis = choose_model
+build_agent_catalog = discover_agent_catalog
+catalog_json = catalog_payload

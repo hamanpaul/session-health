@@ -24,6 +24,8 @@ required for the offline parser and `process-v2` report.
 python3 eval_session.py SESSION.jsonl --offline --format json
 python3 eval_session.py --dir ./sessions --offline --format table
 python3 eval_session.py SESSION.jsonl --jev --format json
+python3 eval_session.py --list-models
+python3 eval_session.py SESSION.jsonl --analyze --jev --model codex/gpt-5.4 --format json
 ```
 
 Use `--analyze` only when an explicit external agent analysis is wanted;
@@ -60,6 +62,27 @@ not a claim about undocumented provider arithmetic. When a backend is reused
 for a batch, each session report snapshots only its own request/attempt usage,
 while request, attempt, and byte caps remain aggregate at backend-instance
 scope and are disclosed in provenance.
+
+### Stage-2 analyzer routing
+
+`--list-models` (also `--model-catalog`) prints concrete executor/provider/route/
+model/settings cards. Read-only executable discovery reports a present CLI as
+`unknown` account availability; it never infers login, quota, or model access.
+Operator availability entries and an explicit `--model` override are separate
+from discovery. The supported executor identities are Codex, Copilot, and agy;
+agy is not treated as a Gemini CLI alias. The historical Gemini CLI remains
+available only through the explicit `LEGACY_AGENT_CHAIN` compatibility path.
+
+`--analyze` sends a bounded prompt through an argv/stdin adapter. Reports keep
+requested versus provider-reported actual model/settings separate, and missing
+native usage remains `null`. A failed execution may trigger at most one
+reselection among hard-eligible candidates. With `--jev`, Jev Choice selects a
+concrete card and Jev post-checks structured claims/recommendations against a
+frozen evidence snapshot; contradictions and insufficient evidence remain
+visible and repair is limited to one round. A routing or analyzer failure keeps
+the deterministic process-v2 report and marks the second-stage status partial.
+The standard-library `routing_vs_baseline` pilot reports selection agreement
+only; it intentionally carries no quality authority or calibration claim.
 
 ## Version
 
@@ -103,7 +126,9 @@ session-health/
 │   ├── scorer.py                # 複合計分引擎（7 維度聚合）
 │   ├── radar.py                 # 終端渲染器（quant + weighted diagnosis + agent）
 │   ├── html_report.py           # HTML 報告產生器（single/batch report bundle）
-│   ├── agent_analysis.py        # AI Agent 分析模組（外部 CLI 呼叫）
+│   ├── agent_analysis.py        # bounded analyzer adapters/catalog/routing entrypoint
+│   ├── jev_routing.py           # hard eligibility, Jev Choice, fallback/reselection
+│   ├── postcheck.py             # frozen-evidence claim/recommendation checks
 │   └── metrics/
 │       ├── snr.py               # SNR   信噪比
 │       ├── state.py             # STATE 狀態完整度
@@ -434,7 +459,7 @@ options:
   --no-color                 停用 ANSI 色彩
   --output FILE, -o FILE     輸出至檔案（副檔名 .html/.json 自動偵測格式）
   --verbose, -v              顯示每輪詳細分數
-  --analyze, -a              啟用 AI Agent 分析（僅限單一 session）
+  --analyze, -a              啟用 bounded AI Agent 分析（single/batch）
   --jev                       啟用有界 Jev typed semantic judgments，不會自動分析
   --jev-model MODEL           記錄明示的 Jev evaluator model identity
   --jev-endpoint URL          覆寫 Jev endpoint
@@ -444,6 +469,11 @@ options:
   --jev-max-cases N           semantic case budget（預設：32）
   --jev-timeout SECONDS       Jev request timeout（預設：30）
   --test-agent               使用測試用 agent（copilot/gpt-5-mini）
+  --analyze-model MODEL      明示 analyzer candidate/model override
+  --analyze-max-output-bytes N
+                             analyzer stdout 保留上限（預設：128000）
+  --list-models, --model-catalog
+                             唯讀顯示 executor/model catalog 與 availability provenance
   --offline                  關閉 model/network，只做本機 deterministic 分析
   --profile {legacy,process-v2}
                              選擇舊 heuristic 或新版可觀察七軸 profile
@@ -565,21 +595,23 @@ session-health 019c8d32 --analyze --test-agent
 
 ## AI Agent 分析
 
-使用 `--analyze` (`-a`) 啟用 AI 分析功能。工具會依序嘗試以下 Agent CLI：
+使用 `--analyze` (`-a`) 啟用第二階段 AI 分析。工具會依序路由以下 concrete
+executor/model candidates（實際可用性仍需 operator entry 或 explicit override）：
 
 | 順位 | Agent | 命令 |
 |------|-------|------|
-| 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 exec "prompt"` |
-| 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p "prompt" --yolo` |
-| 3 | Gemini (3 Pro) | `gemini -m gemini-3-pro-preview -p "prompt"` |
-| 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p "prompt" --yolo` |
+| 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 -c model_reasoning_effort=high exec -` |
+| 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p -` |
+| 3 | agy (Gemini 3.8 Flash High) | `agy --model gemini-3.8-flash-high --effort high --input -` |
+| 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p -` |
 
 分析結果包含：
 - **整體評估** — 2-3 句話概述 session 的 prompt 品質
 - **低分維度改善建議** — 針對 <70 分的維度給出具體建議
 - **最重要的改善行動** — 單一最有效的改善步驟
 
-使用 `--test-agent` 強制使用 copilot/gpt-5-mini 進行測試。
+分析 prompt 由 stdin 傳入，並受 context/output/timeout 上限約束；不使用
+`--yolo`。使用 `--test-agent` 強制使用 copilot/gpt-5-mini 進行測試。
 
 ---
 

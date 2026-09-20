@@ -8,6 +8,7 @@ This directory holds the project's accepted plans, execution boards and research
 - `superpowers/specs/session-health-jev-spec.md` / `session-health-jev-design.md` — behavior and architecture contracts for the accepted plan.
 - `superpowers/workstreams/session-health-jev/todo.md` — Cortex work source and task boundary.
 - `superpowers/plans/session-health-jev-{offline,semantic,routing}.md` — sequential Cortex execution slices; matching stage workstreams own their slice todos.
+- `changelog.d/7-session-health-jev-routing.md` — stage-2 catalog, routing, bounded analyzer, and evidence post-check behavior.
 - `jev-support-refinement.md` — superseded discussion draft; the accepted plan controls implementation.
 - `research/https-github-com-onestardao-wfgy-tree-main-problem.md` — imported research report on integrating WFGY ProblemMap / skill-problemmap into `session-health`.
 - `plan.md` — synced mirror of the active implementation plan.
@@ -17,6 +18,7 @@ This directory holds the project's accepted plans, execution boards and research
 
 - The seven axis IDs and PM1/Atlas taxonomy remain stable.
 - The accepted Jev plan strengthens axis semantics in a versioned process-v2 profile, preserving the documented legacy profile.
+- Stage-2 routing is additive: catalog identity/availability, analyzer identity/usage, and evidence post-check status remain separate from offline facts and semantic stage usage.
 
 ## Sync contract
 
