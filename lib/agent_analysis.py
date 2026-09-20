@@ -636,8 +636,8 @@ class AgentAnalysis:
             "claims": list(self.claims),
             "recommendations": list(self.recommendations),
             "routing": self.routing.to_dict() if self.routing is not None else None,
-            "attempts": list(self.attempts),
-            "repair_attempts": list(self.repair_attempts),
+            "attempts": copy.deepcopy(self.attempts),
+            "repair_attempts": copy.deepcopy(self.repair_attempts),
             "postcheck": self.postcheck.to_dict() if hasattr(self.postcheck, "to_dict") else self.postcheck,
             "coverage": dict(self.coverage),
             "diagnostics": list(self.diagnostics),
@@ -1160,6 +1160,28 @@ def _execute_candidate(prompt: str, candidate: AgentConfig, request: AnalysisReq
     )
 
 
+def _invocation_attempt_record(
+    candidate: AgentConfig,
+    analysis: AgentAnalysis,
+) -> Dict[str, Any]:
+    """Snapshot one analyzer invocation before later repairs alter aggregates."""
+
+    status = "complete" if analysis.success else (
+        analysis.diagnostics[0].get("status") if analysis.diagnostics else "failed"
+    )
+    return {
+        "candidate_id": routing_candidate_id(candidate),
+        "name": candidate.name,
+        "status": status,
+        "error": analysis.error,
+        "requested_model": analysis.requested_model,
+        "actual_model": analysis.actual_model,
+        "requested_settings": copy.deepcopy(analysis.requested_settings),
+        "actual_settings": copy.deepcopy(analysis.actual_settings),
+        "native_usage": copy.deepcopy(analysis.native_usage),
+    }
+
+
 def call_agent(
     prompt: str,
     agent_chain: Optional[List[AgentConfig]] = None,
@@ -1227,8 +1249,8 @@ def call_agent(
         print(f"  🤖 Calling {decision.candidate.name}...", file=sys.stderr, end="", flush=True)
         analysis = _execute_candidate(prompt, decision.candidate, effective_request)
         analysis.routing = decision
-        attempts.append({"candidate_id": routing_candidate_id(decision.candidate), "name": decision.candidate.name, "status": "complete" if analysis.success else (analysis.diagnostics[0].get("status") if analysis.diagnostics else "failed"), "error": analysis.error})
-        analysis.attempts = list(attempts)
+        attempts.append(_invocation_attempt_record(decision.candidate, analysis))
+        analysis.attempts = copy.deepcopy(attempts)
         last = analysis
         if analysis.success:
             print(" ✓", file=sys.stderr)
@@ -1238,7 +1260,7 @@ def call_agent(
         excluded.append(routing_candidate_id(decision.candidate))
         if effective_request.model_override:
             break
-    return last or AgentAnalysis(success=False, error="all bounded analyzer attempts failed", attempts=attempts)
+    return last or AgentAnalysis(success=False, error="all bounded analyzer attempts failed", attempts=copy.deepcopy(attempts))
 
 
 def build_repair_callback(analysis: AgentAnalysis) -> Optional[Callable[..., Any]]:
@@ -1285,15 +1307,7 @@ def build_repair_callback(analysis: AgentAnalysis) -> Optional[Callable[..., Any
             ),
         )
         repaired = _execute_candidate(repair_prompt, candidate, request)
-        analysis.repair_attempts.append(
-            {
-                "candidate_id": routing_candidate_id(candidate),
-                "status": "complete" if repaired.success else "failed",
-                "error": repaired.error,
-                "actual_model": repaired.actual_model,
-                "native_usage": dict(repaired.native_usage),
-            }
-        )
+        analysis.repair_attempts.append(_invocation_attempt_record(candidate, repaired))
         analysis.native_usage = SemanticUsage.sum(
             [SemanticUsage.from_payload(analysis.native_usage), SemanticUsage.from_payload(repaired.native_usage)]
         ).to_dict()

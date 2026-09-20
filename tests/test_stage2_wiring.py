@@ -400,6 +400,74 @@ class Stage2WiringTest(unittest.TestCase):
         self.assertEqual(len(analysis.repair_attempts), 1)
         self.assertEqual(result.ledger["request_count"], 2)
 
+    def test_serialized_attempts_keep_original_usage_when_repair_times_out(self):
+        candidate = _available_agy()
+        original_response = {
+            "response": "bounded original finding",
+            "model": "agy-original",
+            "settings": {"effort": "actual"},
+            "usage": {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
+        }
+        with patch(
+            "lib.agent_analysis.subprocess.run",
+            side_effect=[
+                SimpleNamespace(returncode=0, stdout=json.dumps(original_response), stderr=""),
+                subprocess.TimeoutExpired(cmd=["agy"], timeout=1),
+            ],
+        ):
+            analysis = call_agent("bounded prompt", agent_chain=[candidate], use_jev=False, max_retries=0)
+            repair = build_repair_callback(analysis)
+            self.assertIsNotNone(repair)
+            self.assertIsNone(repair({"text": "overstated finding"}, {"cases": []}))
+
+        serialized = analysis.to_dict()
+        self.assertEqual(serialized["native_usage"]["total_tokens"], None)
+        self.assertEqual(serialized["attempts"][0]["native_usage"]["total_tokens"], 12)
+        self.assertEqual(serialized["attempts"][0]["requested_model"], candidate.model_id)
+        self.assertEqual(serialized["attempts"][0]["actual_model"], "agy-original")
+        self.assertEqual(serialized["attempts"][0]["requested_settings"], candidate.inference_settings)
+        self.assertEqual(serialized["attempts"][0]["actual_settings"], {"effort": "actual"})
+        self.assertEqual(serialized["repair_attempts"][0]["status"], "unknown")
+        self.assertIsNone(serialized["repair_attempts"][0]["native_usage"]["total_tokens"])
+
+    def test_serialized_attempts_keep_failed_usage_before_fallback(self):
+        first = _available_agy()
+        second = _available_agy()
+        second.name = "agy/fallback"
+        second.model_id = "gemini-fallback"
+        second.priority = 2
+        failed = AgentAnalysis(
+            agent_name=first.name,
+            success=False,
+            error="first invocation failed after provider usage",
+            requested_model=first.model_id,
+            actual_model="agy-failed",
+            requested_settings={"effort": "high", "attempt": 1},
+            actual_settings={"effort": "actual-high"},
+            native_usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+            diagnostics=[{"kind": "execution_failed", "status": "failed"}],
+        )
+        recovered = AgentAnalysis(
+            agent_name=second.name,
+            success=True,
+            requested_model=second.model_id,
+            native_usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+        )
+        with patch("lib.agent_analysis._execute_candidate", side_effect=[failed, recovered]):
+            result = call_agent("bounded prompt", agent_chain=[first, second], use_jev=False, max_retries=1)
+
+        serialized = result.to_dict()
+        self.assertTrue(result.success)
+        self.assertEqual(len(serialized["attempts"]), 2)
+        self.assertEqual(serialized["attempts"][0]["status"], "failed")
+        self.assertEqual(serialized["attempts"][0]["native_usage"]["total_tokens"], 7)
+        self.assertEqual(serialized["attempts"][0]["requested_model"], first.model_id)
+        self.assertEqual(serialized["attempts"][0]["actual_model"], "agy-failed")
+        self.assertEqual(serialized["attempts"][0]["requested_settings"], {"effort": "high", "attempt": 1})
+        self.assertEqual(serialized["attempts"][0]["actual_settings"], {"effort": "actual-high"})
+        serialized["attempts"][0]["native_usage"]["total_tokens"] = None
+        self.assertEqual(result.attempts[0]["native_usage"]["total_tokens"], 7)
+
     def test_operator_catalog_constructs_luna_max_and_keeps_unknown_hard_gate(self):
         cards = [
             {
