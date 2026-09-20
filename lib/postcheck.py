@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import copy
 import hashlib
 import json
+import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .semantic_backend import (
@@ -140,28 +141,141 @@ def normalize_claims(
             seen.add(claim_id)
             refs = item.get("evidence_refs", [])
             item["evidence_refs"] = [str(ref) for ref in refs[:20]] if isinstance(refs, list) else []
+            counter_refs = item.get("counterevidence_refs", [])
+            item["counterevidence_refs"] = [str(ref) for ref in counter_refs[:20]] if isinstance(counter_refs, list) else []
             result.append(item)
     return result
 
 
 def extract_generated_claims(output: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Extract explicitly labelled claims/recommendations from structured or text output."""
+    """Extract generated findings from structured or native-envelope output.
+
+    Providers commonly wrap a Markdown response in a JSON ``response`` field.
+    The analyzer prompt requests a JSON schema, but this parser keeps the
+    accepted text fallback so a non-conforming provider response is checked
+    rather than silently becoming ``not_applicable``.
+    """
+
+    def _as_items(value: Any, *, kind: str = "claim") -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        items: List[Dict[str, Any]] = []
+        for raw in value[:100]:
+            if isinstance(raw, Mapping):
+                item = dict(raw)
+                text = item.get("text", item.get("claim", item.get("recommendation", "")))
+            elif isinstance(raw, str):
+                item, text = {}, raw
+            else:
+                continue
+            if isinstance(text, str) and text.strip():
+                item["text"] = text.strip()[:12_000]
+                if kind not in {"claim", "recommendation"}:
+                    item.setdefault("kind", kind)
+                items.append(item)
+        return items
 
     if isinstance(output, Mapping):
-        return (
-            list(output.get("claims", [])) if isinstance(output.get("claims", []), list) else [],
-            list(output.get("recommendations", [])) if isinstance(output.get("recommendations", []), list) else [],
-        )
+        claims: List[Dict[str, Any]] = []
+        recommendations: List[Dict[str, Any]] = []
+        claims.extend(_as_items(output.get("claims"), kind="claim"))
+        recommendations.extend(_as_items(output.get("recommendations"), kind="recommendation"))
+        # Observations and hypotheses are generated conclusions too.  They are
+        # checked as claims while preserving their original kind in the report.
+        claims.extend(_as_items(output.get("observations"), kind="observation"))
+        claims.extend(_as_items(output.get("hypotheses"), kind="hypothesis"))
+        for key in ("response", "text", "analysis", "output"):
+            nested = output.get(key)
+            if nested is None or nested is output:
+                continue
+            nested_claims, nested_recommendations = extract_generated_claims(nested)
+            claims.extend(nested_claims)
+            recommendations.extend(nested_recommendations)
+        return claims, recommendations
+
     text = str(output or "")
-    claims: List[Dict[str, Any]] = []
-    recommendations: List[Dict[str, Any]] = []
-    for line in text.splitlines():
-        stripped = line.strip().lstrip("-* ").strip()
-        lowered = stripped.lower()
-        if lowered.startswith("claim:") or stripped.startswith("宣告:"):
-            claims.append({"text": stripped.split(":", 1)[1].strip()})
-        elif lowered.startswith("recommendation:") or stripped.startswith("建議:") or stripped.startswith("建議："):
-            recommendations.append({"text": stripped.split(":", 1)[1].strip() if ":" in stripped else stripped.split("：", 1)[1].strip()})
+    stripped_text = text.strip()
+    if stripped_text.startswith("```"):
+        stripped_text = re.sub(r"^```(?:json|markdown|text)?\s*|\s*```$", "", stripped_text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if stripped_text.startswith("{"):
+        try:
+            decoded = json.loads(stripped_text)
+        except (TypeError, json.JSONDecodeError):
+            decoded = None
+        if isinstance(decoded, Mapping):
+            return extract_generated_claims(decoded)
+
+    claims = []
+    recommendations = []
+    current_kind: Optional[str] = None
+    current_item: Optional[Dict[str, Any]] = None
+
+    def append_current() -> None:
+        nonlocal current_item
+        if not current_item or not str(current_item.get("text", "")).strip():
+            current_item = None
+            return
+        if current_item.get("kind") == "recommendation":
+            recommendations.append(current_item)
+        else:
+            claims.append(current_item)
+        current_item = None
+
+    def section_kind(value: str) -> Optional[str]:
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("recommendation", "recommendations", "建議")):
+            return "recommendation"
+        if any(marker in lowered for marker in ("observation", "observations", "觀察", "claim", "claims", "結論", "宣告")):
+            return "claim"
+        if any(marker in lowered for marker in ("hypothesis", "hypotheses", "假設", "推論")):
+            return "hypothesis"
+        return None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("> [!"):
+            continue
+        heading = re.sub(r"^#{1,6}\s*", "", line)
+        heading = re.sub(r"^\d+[.)]\s*", "", heading)
+        heading_kind = section_kind(heading)
+        if heading_kind is not None and (line.startswith("#") or not re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)", line)):
+            append_current()
+            current_kind = heading_kind
+            continue
+
+        direct = re.match(
+            r"^(?:[-*+]\s+|\d+[.)]\s+)?(?:\*\*)?"
+            r"(claim|recommendation|observation|hypothesis|宣告|建議|觀察|假設)"
+            r"(?:\*\*)?\s*[:：]\s*(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        marker = re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)(.+)$", line)
+        if direct:
+            append_current()
+            label = direct.group(1).lower()
+            kind = "recommendation" if label in {"recommendation", "建議"} else "hypothesis" if label in {"hypothesis", "假設"} else "claim"
+            claims_or_recommendation = {"text": direct.group(2).strip(), "kind": kind}
+            if kind == "recommendation":
+                recommendations.append(claims_or_recommendation)
+            else:
+                claims.append(claims_or_recommendation)
+            continue
+        if marker and current_kind is not None:
+            append_current()
+            body = marker.group(1).strip()
+            # Preserve the human-readable title while removing Markdown bold
+            # delimiters; both ASCII and full-width colons are accepted.
+            body = re.sub(r"\*\*(.*?)\*\*\s*[:：]\s*", r"\1: ", body)
+            body = body.replace("**", "")
+            current_item = {"text": body[:12_000], "kind": current_kind}
+            continue
+        if current_item is not None and (raw_line[:1].isspace() or current_kind == "recommendation"):
+            continuation = line.lstrip("- ")
+            if continuation and not continuation.startswith("#"):
+                current_item["text"] = f"{current_item['text']} {continuation}"[:12_000]
+
+    append_current()
     return claims, recommendations
 
 
@@ -173,6 +287,7 @@ class ClaimCheck:
     status: str = "insufficient"
     answer_status: str = "unknown"
     evidence_refs: List[str] = field(default_factory=list)
+    counterevidence_refs: List[str] = field(default_factory=list)
     rationale_ref: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     repaired_text: Optional[str] = None
@@ -186,6 +301,7 @@ class ClaimCheck:
             "status": self.status,
             "answer_status": self.answer_status,
             "evidence_refs": list(self.evidence_refs),
+            "counterevidence_refs": list(self.counterevidence_refs),
             "rationale_ref": self.rationale_ref,
             "metadata": dict(self.metadata),
             "repaired_text": self.repaired_text,
@@ -247,7 +363,9 @@ def _question(claim: Mapping[str, Any], frozen: Mapping[str, Any]) -> SemanticQu
             "Return supported only when the evidence directly supports it, contradicted "
             "when the evidence conflicts, overclaimed when it exceeds the evidence, "
             "and insufficient when the evidence cannot decide. Generated text is not evidence.\n"
-            f"Generated {claim.get('kind', 'claim')}: {claim['text']}"
+            f"Generated {claim.get('kind', 'claim')}: {claim['text']}\n"
+            f"Generated evidence refs: {list(claim.get('evidence_refs', [])[:20])}\n"
+            f"Generated counterevidence refs: {list(claim.get('counterevidence_refs', [])[:20])}"
         ),
         answer_type="choice",
         case_id=claim_id,
@@ -255,7 +373,11 @@ def _question(claim: Mapping[str, Any], frozen: Mapping[str, Any]) -> SemanticQu
         choices=CHECK_CHOICES,
         evidence_refs=tuple(str(item) for item in claim.get("evidence_refs", [])[:20]),
         group_version=POSTCHECK_VERSION,
-        metadata={"evidence_hash": evidence_hash(frozen), "claim_id": claim_id},
+        metadata={
+            "evidence_hash": evidence_hash(frozen),
+            "claim_id": claim_id,
+            "generated_counterevidence_refs": list(claim.get("counterevidence_refs", [])[:20]),
+        },
     )
 
 
@@ -284,6 +406,7 @@ def _run_checks(
                 status="insufficient",
                 answer_status="failed",
                 evidence_refs=list(claim.get("evidence_refs", [])),
+                counterevidence_refs=list(claim.get("counterevidence_refs", [])),
             )
             for claim in claims
         ]
@@ -307,6 +430,7 @@ def _run_checks(
                 status=status,
                 answer_status=str(getattr(answer, "status", "unknown")),
                 evidence_refs=list(claim.get("evidence_refs", [])),
+                counterevidence_refs=list(claim.get("counterevidence_refs", [])),
                 rationale_ref=str(getattr(answer, "rationale_ref", "") or ""),
                 metadata=dict(getattr(answer, "metadata", {}) or {}),
             )
@@ -352,7 +476,21 @@ def check_generated_claims(
     if not normalized:
         return result
     backend = backend or UnavailableSemanticBackend(reason="postcheck backend unavailable")
-    budget = budget or SemanticBudget(max_requests=2, max_attempts=2, max_questions=max(1, len(normalized)), max_cases=max(1, len(normalized)), max_retries=0)
+    if budget is None:
+        # Reuse the backend's declared aggregate cap after stage 1.  This keeps
+        # request/attempt accounting honest and makes exhaustion visible rather
+        # than silently turning the later check into an empty success.
+        aggregate_budget = getattr(backend, "aggregate_budget", None)
+        if isinstance(aggregate_budget, SemanticBudget):
+            budget = aggregate_budget
+        else:
+            budget = SemanticBudget(
+                max_requests=2,
+                max_attempts=2,
+                max_questions=max(1, len(normalized)),
+                max_cases=max(1, len(normalized)),
+                max_retries=0,
+            )
     checks, diagnostics, usage, ledger, response_status = _run_checks(normalized, frozen, backend, budget)
     result.checks = checks
     result.checked_count = sum(item.answer_status == "observed" for item in checks)
@@ -383,6 +521,7 @@ def check_generated_claims(
                             "kind": item.kind,
                             "text": text.strip()[:12_000],
                             "evidence_refs": list(item.evidence_refs),
+                            "counterevidence_refs": list(item.counterevidence_refs),
                         }
                     )
                     item.repaired_text = text.strip()[:12_000]
@@ -408,6 +547,16 @@ def check_generated_claims(
             result.diagnostics.append({"kind": "repair_exception", "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:300]})
     result.provenance["repair_count"] = result.repair_count
     result.provenance["max_repairs"] = result.max_repairs
+    result.provenance["residual_disagreement"] = [
+        {
+            "claim_id": item.claim_id,
+            "initial_status": item.status,
+            "repair_status": item.repair_status,
+        }
+        for item in result.checks
+        if item.status in {"contradicted", "overclaimed", "insufficient"}
+        or item.repair_status in {"contradicted", "overclaimed", "insufficient"}
+    ]
     return result
 
 
@@ -423,11 +572,24 @@ def postcheck_analysis(
     if not claims and not recommendations:
         structured = getattr(analysis, "structured_output", {})
         if isinstance(structured, Mapping):
-            claims = structured.get("claims", [])
-            recommendations = structured.get("recommendations", [])
+            claims, recommendations = extract_generated_claims(structured)
     if not claims and not recommendations:
         claims, recommendations = extract_generated_claims(getattr(analysis, "raw_response", ""))
-    return check_generated_claims(evidence, claims, recommendations, **kwargs)
+    result = check_generated_claims(evidence, claims, recommendations, **kwargs)
+    if not claims and not recommendations:
+        structured = getattr(analysis, "structured_output", {})
+        raw_response = getattr(analysis, "raw_response", "")
+        if structured or (isinstance(raw_response, str) and raw_response.strip()):
+            result.status = "partial"
+            result.diagnostics.append(
+                {
+                    "kind": "unparseable_generated_output",
+                    "status": "partial",
+                    "message": "non-empty analyzer output contained no parseable claims or recommendations",
+                }
+            )
+            result.provenance["output_parse_status"] = "unparseable"
+    return result
 
 
 # Compatibility aliases for callers using a verb-first name.

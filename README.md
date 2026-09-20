@@ -25,6 +25,7 @@ python3 eval_session.py SESSION.jsonl --offline --format json
 python3 eval_session.py --dir ./sessions --offline --format table
 python3 eval_session.py SESSION.jsonl --jev --format json
 python3 eval_session.py --list-models
+python3 eval_session.py --list-models --model-catalog-file ./model-catalog.json
 python3 eval_session.py SESSION.jsonl --analyze --jev --model codex/gpt-5.4 --format json
 ```
 
@@ -91,6 +92,32 @@ semantic backend and meaningful multi-case fixture are required. Budget
 exhaustion, Jev abstention, or another routing failure produces a partial
 comparison with no agreement value rather than being counted as baseline
 agreement.
+
+To make a concrete operator candidate eligible for automatic routing, pass a
+JSON catalog with explicit executor/provider/route/model/settings cards. This
+is data, not a shell template; only the built-in bounded adapters are accepted:
+
+```json
+[
+  {
+    "name": "codex/gpt-5.6-luna",
+    "executor": "codex",
+    "provider": "openai",
+    "route": "codex.exec",
+    "model_id": "gpt-5.6-luna",
+    "inference_settings": {"effort": "max", "stdin": true},
+    "status": "available",
+    "priority": 1
+  }
+]
+```
+
+Use `--model-catalog-file CATALOG.json` with `--analyze`; `--list-models`
+prints the resulting cards without selecting or invoking an analyzer. Omit
+`status` only when the operator intentionally wants the card to retain
+`unknown` access; installed CLI presence alone remains read-only discovery and
+does not make a seed card eligible. The AGY adapter continues to use its
+proven `--print <prompt>` argv transport.
 
 ## Version
 
@@ -441,6 +468,10 @@ usage: eval_session [-h] [--dir DIR] [--latest N]
                     [--jev-max-attempts N] [--jev-max-questions N]
                     [--jev-max-cases N] [--jev-timeout SECONDS]
                     [--test-agent]
+                    [--analyze-model MODEL]
+                    [--analyze-max-output-bytes N]
+                    [--list-models]
+                    [--model-catalog-file FILE]
                     [--offline] [--profile {legacy,process-v2}]
                     [--export-bundle FILE_OR_DIR] [--outcome-file FILE]
                     [SESSION_OR_PATH]
@@ -482,6 +513,7 @@ options:
                              analyzer stdout 保留上限（預設：128000）
   --list-models, --model-catalog
                              唯讀顯示 executor/model catalog 與 availability provenance
+  --model-catalog-file FILE  explicit operator model cards (JSON)
   --offline                  關閉 model/network，只做本機 deterministic 分析
   --profile {legacy,process-v2}
                              選擇舊 heuristic 或新版可觀察七軸 profile

@@ -73,6 +73,9 @@ class SessionReport:
     sync_status: str = "session-only"
     profile: str = "legacy"
     process_v2: Optional[ProcessV2Result] = None
+    # Retained in-memory for the stage-2 frozen evidence boundary; renderers
+    # expose only the portable manifest, never this internal object directly.
+    portable_bundle: Optional[Any] = None
     bundle_manifest: Dict[str, Any] = field(default_factory=dict)
     processing_status: str = "complete"
     processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)

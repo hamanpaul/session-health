@@ -15,7 +15,7 @@ from dataclasses import asdict
 import json
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 # Add parent dir to path for relative imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -43,14 +43,18 @@ from lib.radar import render_report_terminal, render_table, render_json
 from lib.html_report import render_html
 from lib.agent_analysis import (
     AGENT_CHAIN,
+    build_repair_callback,
+    build_stage2_context,
     discover_agent_catalog,
     catalog_payload,
+    operator_catalog,
     prepare_analysis_prompt,
     prepare_batch_analysis_prompt,
     call_agent,
     postcheck_analysis,
 )
 from lib.jev_analysis import SemanticEvaluation, evaluate_session_semantic
+from lib.postcheck import freeze_evidence
 from lib.semantic_backend import SemanticBudget, build_default_backend
 
 
@@ -232,6 +236,44 @@ def find_latest_sessions(
     return [(c[0], c[1]) for c in candidates[:n]]
 
 
+def _load_operator_catalog(path: str) -> Any:
+    """Read explicit JSON model cards; never interpret shell/config templates."""
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid model catalog JSON: {exc}") from exc
+    if isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
+        payload = payload["candidates"]
+    elif isinstance(payload, dict) and isinstance(payload.get("models"), list):
+        payload = payload["models"]
+    if not isinstance(payload, (list, dict)):
+        raise ValueError("model catalog must be a JSON array or object map")
+    return payload
+
+
+def _stage2_evidence(report: SessionReport) -> dict:
+    """Return original bounded layers used for both generation and postcheck."""
+
+    bundle = report.portable_bundle
+    bundle_payload = bundle.to_dict() if bundle is not None and hasattr(bundle, "to_dict") else {}
+    semantic_payload = (
+        report.semantic.to_dict()
+        if report.semantic is not None and hasattr(report.semantic, "to_dict")
+        else {}
+    )
+    return {
+        "bundle": bundle_payload,
+        "process_v2": report.process_v2.to_dict() if report.process_v2 is not None else {},
+        "semantic": semantic_payload,
+        "coverage": {
+            "processing_status": report.processing_status,
+            "analysis_layers": list(report.analysis_layers),
+            "bundle_manifest": dict(report.bundle_manifest),
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="eval_session",
@@ -409,6 +451,12 @@ def main() -> None:
         help="Read-only JSON catalog of concrete analyzer candidates and availability provenance",
     )
     parser.add_argument(
+        "--model-catalog-file", "--catalog-file",
+        dest="model_catalog_file",
+        metavar="FILE",
+        help="JSON operator catalog with explicit executor/provider/route/model/settings cards",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Disable model/network analysis and produce only local deterministic results",
@@ -432,8 +480,18 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    configured_agent_chain = None
+    if args.model_catalog_file:
+        try:
+            configured_agent_chain = operator_catalog(
+                _load_operator_catalog(args.model_catalog_file),
+                candidates=AGENT_CHAIN,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     if args.list_models:
-        print(json.dumps(catalog_payload(discover_agent_catalog(AGENT_CHAIN)), ensure_ascii=False, indent=2))
+        catalog = configured_agent_chain or discover_agent_catalog(AGENT_CHAIN)
+        print(json.dumps(catalog_payload(catalog), ensure_ascii=False, indent=2))
         return 0
     if not any((args.session_target, args.dir, args.latest, args.import_bundle)):
         parser.error("one of SESSION_OR_PATH, --dir, --latest, or --import-bundle is required")
@@ -529,7 +587,7 @@ def main() -> None:
                 session = bundle.to_session()
             else:
                 session = parse_session(path, source, input_limits=input_limits)
-            if args.profile == "process-v2" or args.export_bundle or args.offline or args.jev:
+            if args.profile == "process-v2" or args.export_bundle or args.offline or args.jev or args.analyze:
                 if bundle is None:
                     bundle = build_session_bundle(session, limits=bundle_limits)
             sc = score_session(session)
@@ -573,6 +631,7 @@ def main() -> None:
                     sync_status="session-only",
                     profile=args.profile,
                     process_v2=process_result,
+                    portable_bundle=bundle,
                     bundle_manifest=bundle.manifest if bundle else {},
                     processing_status=status,
                     processing_diagnostics=processing_diagnostics,
@@ -745,15 +804,28 @@ def main() -> None:
                     "atlas": report.problemmap.atlas,
                     "global_fix_route": report.problemmap.global_fix_route,
                 }
+            stage2_context = build_stage2_context(
+                process_v2=report.process_v2,
+                bundle=report.portable_bundle,
+                semantic=report.semantic,
+            )
+            # Freeze before the analyzer runs.  The exact same bounded object is
+            # passed to postcheck, including any single repair round.
+            frozen_stage2_evidence = freeze_evidence(_stage2_evidence(report))
             prompt = prepare_analysis_prompt(
                 report.score,
                 report.session,
                 diagnosis_summary=asdict(report.diagnosis_summary) if report.diagnosis_summary is not None else None,
                 problemmap=problemmap_payload,
                 evidence_summary=report.evidence_summary,
+                process_v2=report.process_v2,
+                bundle=report.portable_bundle,
+                semantic=report.semantic,
+                stage2_context=stage2_context,
             )
             analysis = call_agent(
                 prompt,
+                agent_chain=configured_agent_chain,
                 test_mode=args.test_agent,
                 routing_backend=semantic_backend if args.jev else None,
                 routing_budget=semantic_budget if args.jev else None,
@@ -777,9 +849,11 @@ def main() -> None:
                 report.analysis_layers.append("routing")
             if args.jev and analysis.success:
                 report.postcheck = postcheck_analysis(
-                    report.session,
+                    frozen_stage2_evidence,
                     analysis,
                     backend=semantic_backend,
+                    budget=semantic_budget,
+                    repair=build_repair_callback(analysis),
                 )
                 analysis.postcheck = report.postcheck
                 if "postcheck" not in report.analysis_layers:
@@ -819,13 +893,33 @@ def main() -> None:
                         ),
                     }
                 )
+            stage2_contexts = [
+                build_stage2_context(
+                    process_v2=report.process_v2,
+                    bundle=report.portable_bundle,
+                    semantic=report.semantic,
+                )
+                for report in reports
+            ]
+            frozen_batch_evidence = freeze_evidence(
+                {
+                    "sessions": [_stage2_evidence(report) for report in reports],
+                    "coverage": {
+                        "source_session_count": len(reports),
+                        "selected_session_count": len(reports),
+                        "excluded_session_count": 0,
+                    },
+                }
+            )
             prompt = prepare_batch_analysis_prompt(
                 batch_report.evidence_summary,
                 session_summaries,
                 diagnosis_summary=asdict(batch_report.diagnosis_summary) if batch_report.diagnosis_summary is not None else None,
+                stage2_contexts=stage2_contexts,
             )
             batch_report.agent_analysis = call_agent(
                 prompt,
+                agent_chain=configured_agent_chain,
                 test_mode=args.test_agent,
                 routing_backend=semantic_backend if args.jev else None,
                 routing_budget=semantic_budget if args.jev else None,
@@ -843,36 +937,12 @@ def main() -> None:
             batch_report.agent_analysis.coverage = dict(batch_report.analysis_coverage)
             batch_report.routing = batch_report.agent_analysis.routing
             if args.jev and batch_report.agent_analysis.success:
-                frozen_batch_evidence = {
-                    "sessions": [
-                        {
-                            "session_id": report.session.id,
-                            "source": report.session.source,
-                            "turns": [
-                                {
-                                    "index": turn.index,
-                                    "user_input": turn.user_input,
-                                    "assistant_output": turn.assistant_output,
-                                    "tool_calls": [
-                                        {
-                                            "name": call.name,
-                                            "output": call.output,
-                                            "success": call.success,
-                                            "exit_code": call.exit_code,
-                                        }
-                                        for call in turn.tool_calls[:20]
-                                    ],
-                                }
-                                for turn in report.session.turns[:100]
-                            ],
-                        }
-                        for report in reports
-                    ]
-                }
                 batch_report.postcheck = postcheck_analysis(
                     frozen_batch_evidence,
                     batch_report.agent_analysis,
                     backend=semantic_backend,
+                    budget=semantic_budget,
+                    repair=build_repair_callback(batch_report.agent_analysis),
                 )
                 batch_report.agent_analysis.postcheck = batch_report.postcheck
                 if batch_report.postcheck.status in {"failed", "partial", "unknown", "deferred"} and batch_report.processing_status == "complete":
