@@ -11,14 +11,19 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .parser_base import Session, ToolCall, Turn, read_jsonl_records
+from .parser_base import Session, SessionInputLimits, ToolCall, Turn, read_jsonl_records
 
 
-def parse_codex_session(path: str | Path) -> Session:
+def parse_codex_session(
+    path: str | Path,
+    *,
+    input_limits: SessionInputLimits | None = None,
+) -> Session:
     """Parse a bounded Codex CLI JSONL session into a normalized session."""
 
     path = Path(path)
-    records, diagnostics = read_jsonl_records(path)
+    input_limits = input_limits or SessionInputLimits()
+    records, diagnostics = read_jsonl_records(path, input_limits)
     session = Session(
         id="",
         source="codex",
@@ -31,6 +36,11 @@ def parse_codex_session(path: str | Path) -> Session:
             "supports_call_result_pairing": True,
             "supports_structured_exit_code": True,
             "outcome_states": ["success", "failed", "unknown"],
+            "input_limits": {
+                "max_bytes": input_limits.max_bytes,
+                "max_records": input_limits.max_records,
+                "max_record_chars": input_limits.max_record_chars,
+            },
         },
     )
 

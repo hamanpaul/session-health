@@ -338,6 +338,13 @@ case candidates 與 observation cutoffs；redaction 是有限的 heuristic 偵�
 找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
 join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
 
+Raw JSONL 讀取 budget 與 bundle budget 是兩個獨立邊界：預設 raw input 上限為 128 MiB、
+`50000` 筆 record、單筆 `1000000` 字元，可用 `--max-input-bytes`、
+`--max-input-records`、`--max-input-record-chars` 個別調整。超過 raw budget 時保留已讀
+prefix 並標成 `partial`/`failed`；不會把較小的 portable bundle 上限誤當成 raw session
+上限。Bundle 的文字 evidence 仍會 bounded，但 SNR 所需的完整 numeric noise facts 會
+一併保存，因此直接解析與 export/import replay 的可觀察統計一致。
+
 這個 slice 的驗證是 Linux 本機標準庫與 portable fixtures 的離線驗證；它不等同於
 live API/model、真實 agent CLI、Windows/macOS 或平台 correctness 驗證。那些執行環境與
 語意校準保留給後續切片，缺少資料時報告會保留 `unknown`、`not_applicable` 或
@@ -349,6 +356,8 @@ live API/model、真實 agent CLI、Windows/macOS 或平台 correctness 驗證�
 usage: eval_session [-h] [--dir DIR] [--latest N]
                     [--import-bundle FILE]
                     [--source {auto,codex,copilot}]
+                    [--max-input-bytes N] [--max-input-records N]
+                    [--max-input-record-chars N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
                     [--analyze] [--test-agent]
@@ -368,6 +377,9 @@ options:
   --latest N, -l N           評估最近 N 個 session
   --source, -s {auto,codex,copilot}
                              指定 session 來源格式（預設：auto 自動偵測）
+  --max-input-bytes N        raw JSONL 讀取上限（預設：128 MiB，超限保留 partial prefix）
+  --max-input-records N      raw JSONL record 上限（預設：50000）
+  --max-input-record-chars N 單筆 raw JSONL 字元上限（預設：1000000）
   --format, -f {radar,table,json,html}
                              輸出格式（預設：radar）
   --no-color                 停用 ANSI 色彩

@@ -8,12 +8,39 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-MAX_SESSION_INPUT_BYTES = 8_000_000
-MAX_SESSION_RECORDS = 50_000
-MAX_SESSION_RECORD_CHARS = 1_000_000
+@dataclass(frozen=True)
+class SessionInputLimits:
+    """Independent bounds for reading a raw JSONL session input.
+
+    These limits protect the parser's raw-input phase.  They are deliberately
+    separate from the much smaller portable-bundle limits, because a source
+    session may be large while its exported evidence remains bounded.
+    """
+
+    max_bytes: int = 128 * 1024 * 1024
+    max_records: int = 50_000
+    max_record_chars: int = 1_000_000
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_bytes", self.max_bytes),
+            ("max_records", self.max_records),
+            ("max_record_chars", self.max_record_chars),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
 
-def read_jsonl_records(path: str | Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+DEFAULT_SESSION_INPUT_LIMITS = SessionInputLimits()
+MAX_SESSION_INPUT_BYTES = DEFAULT_SESSION_INPUT_LIMITS.max_bytes
+MAX_SESSION_RECORDS = DEFAULT_SESSION_INPUT_LIMITS.max_records
+MAX_SESSION_RECORD_CHARS = DEFAULT_SESSION_INPUT_LIMITS.max_record_chars
+
+
+def read_jsonl_records(
+    path: str | Path,
+    limits: SessionInputLimits | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Read a bounded JSONL input while retaining line/record provenance.
 
     The adapters deliberately stop before constructing an unbounded in-memory
@@ -23,34 +50,75 @@ def read_jsonl_records(path: str | Path) -> tuple[list[dict[str, Any]], list[dic
     """
 
     source = Path(path)
-    size = source.stat().st_size
-    if size > MAX_SESSION_INPUT_BYTES:
-        raise ValueError(
-            f"session input exceeds max_bytes={MAX_SESSION_INPUT_BYTES}"
-        )
+    limits = limits or DEFAULT_SESSION_INPUT_LIMITS
     records: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
+    bytes_read = 0
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant: {value}")
 
     with open(source, "r", encoding="utf-8", errors="replace") as handle:
-        for line_number, raw_line in enumerate(handle, 1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            if len(line) > MAX_SESSION_RECORD_CHARS:
+        line_number = 0
+        read_chunk_chars = max(1, min(limits.max_record_chars + 1, limits.max_bytes // 4 + 1))
+        while True:
+            # Bound a single read even when a tool output was serialized as one
+            # enormous JSONL line.  The remainder is discarded in bounded
+            # chunks and reported as partial coverage.
+            raw_line = handle.readline(read_chunk_chars)
+            if not raw_line:
+                break
+            line_number += 1
+            line_bytes = len(raw_line.encode("utf-8", "replace"))
+            line_chars = len(raw_line.rstrip("\r\n"))
+            oversized = line_chars > limits.max_record_chars
+            line_parts = [] if oversized else [raw_line]
+            complete = raw_line.endswith(("\n", "\r"))
+            over_budget = False
+            while not complete:
+                if bytes_read + line_bytes >= limits.max_bytes:
+                    over_budget = True
+                    break
+                chunk = handle.readline(read_chunk_chars)
+                if not chunk:
+                    complete = True
+                    break
+                line_bytes += len(chunk.encode("utf-8", "replace"))
+                line_chars += len(chunk.rstrip("\r\n"))
+                oversized = line_chars > limits.max_record_chars
+                if oversized:
+                    line_parts = []
+                elif line_parts is not None:
+                    line_parts.append(chunk)
+                complete = chunk.endswith(("\n", "\r"))
+            if over_budget or bytes_read + line_bytes > limits.max_bytes:
+                diagnostics.append({
+                    "kind": "input_byte_limit_exceeded",
+                    "line": line_number,
+                    "status": "failed",
+                    "max_bytes": limits.max_bytes,
+                    "bytes_read": bytes_read,
+                })
+                break
+            bytes_read += line_bytes
+            if oversized:
                 diagnostics.append({
                     "kind": "oversize_record",
                     "line": line_number,
                     "status": "failed",
+                    "max_record_chars": limits.max_record_chars,
                 })
                 continue
-            if len(records) >= MAX_SESSION_RECORDS:
+            raw_line = "".join(line_parts)
+            line = raw_line.strip()
+            if not line:
+                continue
+            if len(records) >= limits.max_records:
                 diagnostics.append({
                     "kind": "record_limit_exceeded",
                     "line": line_number,
                     "status": "failed",
+                    "max_records": limits.max_records,
                 })
                 break
             try:
@@ -128,6 +196,10 @@ class Turn:
     raw_tool_output_chars: int = 0
     total_context_chars: int = 0
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    # Complete, non-text SNR sufficient statistics captured before bundle
+    # evidence truncation.  Empty means the adapter has not supplied a
+    # snapshot and the metric may analyze the available output directly.
+    snr_facts: Dict[str, int] = field(default_factory=dict)
 
     @property
     def has_tools(self) -> bool:

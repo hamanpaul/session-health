@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ..bundle import SessionBundle
 from ..parser_base import Session, ToolCall, Turn
-from .snr import analyze_snr
+from .snr import SNRResult, analyze_snr
 
 
 PROCESS_PROFILE = "process-v2"
@@ -196,11 +196,14 @@ def _snr_axis(session: Session, bundle: SessionBundle | None) -> AxisObservation
     duplicate = 0
     ansi = 0
     for turn in session.turns:
-        result = analyze_snr(turn)
+        result = _authoritative_snr(turn)
+        visible_result = analyze_snr(turn) if turn.snr_facts else result
         observed_chars = sum(len(call.output or "") for call in turn.tool_calls)
         raw_chars = max(int(turn.raw_tool_output_chars or 0), observed_chars)
+        if turn.snr_facts:
+            raw_chars = int(turn.snr_facts.get("total_chars", raw_chars))
         total += raw_chars
-        visible_total += result.total_chars
+        visible_total += visible_result.total_chars
         # A replay may retain only bounded evidence text.  Keep the original
         # observed denominator from the portable fact instead of silently
         # changing the statistic to the truncated payload length.
@@ -216,6 +219,34 @@ def _snr_axis(session: Session, bundle: SessionBundle | None) -> AxisObservation
         _event_refs(bundle, "result"),
         ["Does not judge task relevance or semantic sufficiency."],
     )
+
+
+def _authoritative_snr(turn: Turn) -> SNRResult:
+    """Use a portable full-output fact snapshot when replaying a bundle.
+
+    Bundle evidence is intentionally truncated.  Re-running the detector over
+    that excerpt would change duplicate/ANSI counts and make deterministic
+    metrics depend on whether the input was parsed directly or replayed.
+    """
+
+    facts = turn.snr_facts
+    required = ("total_chars", "noise_chars", "ansi_chars", "progress_chars", "duplicate_chars")
+    if facts and all(
+        isinstance(facts.get(name), int) and not isinstance(facts.get(name), bool)
+        and facts.get(name, 0) >= 0
+        for name in required
+    ):
+        total = int(facts["total_chars"])
+        noise = min(total, int(facts["noise_chars"]))
+        return SNRResult(
+            total_chars=total,
+            noise_chars=noise,
+            ansi_chars=int(facts["ansi_chars"]),
+            progress_chars=int(facts["progress_chars"]),
+            duplicate_chars=int(facts["duplicate_chars"]),
+            score=max(0.0, (1.0 - (noise / total)) * 100) if total else 100.0,
+        )
+    return analyze_snr(turn)
 
 
 def _state_axis(session: Session, bundle: SessionBundle | None) -> AxisObservation:
@@ -429,9 +460,10 @@ def _conv_axis(session: Session, bundle: SessionBundle | None) -> AxisObservatio
             ["A raw completion marker without a matching start is not delivery proof."],
         )
     # Some producers emit task_started once per turn and task_complete once for
-    # the session.  Count explicit task identities when available; otherwise
-    # use one session-level delivery unit rather than treating turn lifecycle
-    # events as independent deliveries.
+    # the session.  Without explicit task identity (or an adapter capability
+    # that defines the lifecycle unit), raw counts cannot establish a delivery
+    # pair.  Keep that observation unknown instead of turning a lone completion
+    # marker into delivery success.
     task_refs: set[str] = set()
     complete_refs: set[str] = set()
     lifecycle_events = bundle.events if bundle is not None else []
@@ -445,14 +477,28 @@ def _conv_axis(session: Session, bundle: SessionBundle | None) -> AxisObservatio
             task_refs.add(str(ref))
         elif event_type == "task_complete" and ref:
             complete_refs.add(str(ref))
-    if task_refs:
-        delivery_units = len(task_refs)
-        completed_units = len(task_refs & complete_refs)
-        method = "explicit_task_identity_pairs"
-    else:
-        delivery_units = 1
-        completed_units = 1 if session.task_complete_count > 0 else 0
-        method = "session_level_lifecycle_fallback"
+    if not task_refs:
+        return AxisObservation(
+            "CONV",
+            _unknown(
+                "lifecycle markers were observed without explicit task identity or pairing capability",
+                excluded=session.task_started_count + session.task_complete_count,
+            ),
+            {
+                "task_started": session.task_started_count,
+                "task_complete": session.task_complete_count,
+                "aborts": session.turn_aborted_count,
+                "delivery_units": None,
+                "completed_units": None,
+                "raw_start_markers": session.task_started_count,
+            },
+            {"delivery_judgment": None, "task_success": None, "method": "unpaired_lifecycle_markers"},
+            _event_refs(bundle),
+            ["Raw lifecycle counts are not treated as delivery success without explicit identity/pairing evidence."],
+        )
+    delivery_units = len(task_refs)
+    completed_units = len(task_refs & complete_refs)
+    method = "explicit_task_identity_pairs"
     metric = _ratio(completed_units, delivery_units, reason="paired delivery completion units / explicit delivery units")
     return AxisObservation(
         "CONV",
@@ -495,10 +541,6 @@ def join_external_outcome(session: Session | SessionBundle, artifact: Mapping[st
         else None
     )
     candidates = list(artifact) if isinstance(artifact, (list, tuple)) else [artifact]
-    session_id = normalized.id
-    task_id = normalized.metadata.get("task_id") or normalized.metadata.get("taskId")
-    session_id = str(session_id) if session_id else None
-    task_id = str(task_id) if task_id else None
     source = str(normalized.source) if normalized.source else None
     source_ref = str(normalized.source_ref) if normalized.source_ref else None
 
@@ -507,14 +549,55 @@ def join_external_outcome(session: Session | SessionBundle, artifact: Mapping[st
             return None
         return Path(value.replace("\\", "/").split("#", 1)[0]).name or None
 
+    def identity_aliases(value: Mapping[str, Any], aliases: Sequence[str]) -> tuple[str | None, bool]:
+        supplied = {
+            str(value[alias])
+            for alias in aliases
+            if alias in value and value[alias] not in (None, "")
+        }
+        if len(supplied) > 1:
+            return None, True
+        return (next(iter(supplied)) if supplied else None), False
+
+    metadata = normalized.metadata if isinstance(normalized.metadata, Mapping) else {}
+    session_values = [str(normalized.id)] if normalized.id else []
+    for alias in ("session_id", "sessionId"):
+        if metadata.get(alias) not in (None, ""):
+            session_values.append(str(metadata[alias]))
+    if len(set(session_values)) > 1:
+        return {
+            "status": "not_joined",
+            "identity_match": False,
+            "session_id": None,
+            "task_id": None,
+            "verdict": None,
+            "reason": "session identity fields are contradictory",
+        }
+    task_values = [
+        str(metadata[alias])
+        for alias in ("task_id", "taskId")
+        if metadata.get(alias) not in (None, "")
+    ]
+    if len(set(task_values)) > 1:
+        return {
+            "status": "not_joined",
+            "identity_match": False,
+            "session_id": session_values[0] if session_values else None,
+            "task_id": None,
+            "verdict": None,
+            "reason": "session task identity fields are contradictory",
+        }
+    session_id = session_values[0] if session_values else None
+    task_id = task_values[0] if task_values else None
+
     matches: List[Mapping[str, Any]] = []
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
             continue
-        candidate_session_id = candidate.get("session_id", candidate.get("sessionId"))
-        candidate_task_id = candidate.get("task_id", candidate.get("taskId"))
-        candidate_session_id = str(candidate_session_id) if candidate_session_id is not None and candidate_session_id != "" else None
-        candidate_task_id = str(candidate_task_id) if candidate_task_id is not None and candidate_task_id != "" else None
+        candidate_session_id, session_alias_conflict = identity_aliases(candidate, ("session_id", "sessionId"))
+        candidate_task_id, task_alias_conflict = identity_aliases(candidate, ("task_id", "taskId"))
+        if session_alias_conflict or task_alias_conflict:
+            continue
         supplied = [(candidate_session_id, session_id), (candidate_task_id, task_id)]
         if not any(left is not None and right is not None for left, right in supplied):
             continue
@@ -525,7 +608,9 @@ def join_external_outcome(session: Session | SessionBundle, artifact: Mapping[st
         candidate_source = candidate.get("source")
         if candidate_source is not None and (source is None or str(candidate_source) != source):
             continue
-        candidate_ref = candidate.get("source_ref")
+        candidate_ref, ref_alias_conflict = identity_aliases(candidate, ("source_ref", "sourceRef"))
+        if ref_alias_conflict:
+            continue
         if candidate_ref is not None:
             if source_ref is None or comparable_ref(candidate_ref) != comparable_ref(source_ref):
                 continue
@@ -536,6 +621,7 @@ def join_external_outcome(session: Session | SessionBundle, artifact: Mapping[st
         matches.append(candidate)
     if len(matches) == 1:
         candidate = matches[0]
+        candidate_ref, _ = identity_aliases(candidate, ("source_ref", "sourceRef"))
         source_refs = candidate.get("source_refs", candidate.get("refs", [])) or []
         if not isinstance(source_refs, list) or any(not isinstance(ref, str) for ref in source_refs):
             return {
@@ -556,7 +642,7 @@ def join_external_outcome(session: Session | SessionBundle, artifact: Mapping[st
             "version": candidate.get("version"),
             "authority": candidate.get("authority"),
             "source": candidate.get("source", source),
-            "source_ref": candidate.get("source_ref"),
+            "source_ref": candidate_ref,
             "source_refs": list(source_refs),
             "interpretation": "external_verdict_only; not an internally established correctness claim",
         }

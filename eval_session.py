@@ -20,7 +20,13 @@ from typing import List, Tuple
 # Add parent dir to path for relative imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib.parser_base import Session
+from lib.parser_base import (
+    MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_RECORD_CHARS,
+    MAX_SESSION_RECORDS,
+    Session,
+    SessionInputLimits,
+)
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.bundle import BundleError, SessionBundle, build_session_bundle, export_bundle, import_bundle
@@ -89,28 +95,41 @@ def is_bundle_path(path: Path) -> bool:
     return payload.get("schema") == "session-health.session-bundle"
 
 
-def parse_session(path: Path, source: str = "auto") -> Session:
+def parse_session(
+    path: Path,
+    source: str = "auto",
+    *,
+    input_limits: SessionInputLimits | None = None,
+) -> Session:
     """Parse a session file with auto-detection or explicit source."""
+    input_limits = input_limits or SessionInputLimits()
     if is_bundle_path(path):
         return import_bundle(path).to_session()
     if source == "auto":
         source = detect_source(path)
 
     if source == "codex":
-        return parse_codex_session(path)
+        return parse_codex_session(path, input_limits=input_limits)
     elif source == "copilot":
-        return parse_copilot_session(path)
+        return parse_copilot_session(path, input_limits=input_limits)
     else:
         # Try both, prefer whichever produces more turns
         try:
-            s1 = parse_codex_session(path)
+            s1 = parse_codex_session(path, input_limits=input_limits)
         except Exception:
             s1 = Session(id="", source="codex")
         try:
-            s2 = parse_copilot_session(path)
+            s2 = parse_copilot_session(path, input_limits=input_limits)
         except Exception:
             s2 = Session(id="", source="copilot")
         return s1 if len(s1.turns) >= len(s2.turns) else s2
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def find_sessions_in_dir(dir_path: Path, source: str = "auto") -> List[Path]:
@@ -239,6 +258,27 @@ def main() -> None:
         help="Session source format (default: auto-detect)",
     )
     parser.add_argument(
+        "--max-input-bytes",
+        type=_positive_int,
+        default=MAX_SESSION_INPUT_BYTES,
+        metavar="N",
+        help="Raw JSONL read budget in bytes (default: 128 MiB; over-budget input is partial)",
+    )
+    parser.add_argument(
+        "--max-input-records",
+        type=_positive_int,
+        default=MAX_SESSION_RECORDS,
+        metavar="N",
+        help="Maximum raw JSONL records to construct (default: 50000)",
+    )
+    parser.add_argument(
+        "--max-input-record-chars",
+        type=_positive_int,
+        default=MAX_SESSION_RECORD_CHARS,
+        metavar="N",
+        help="Maximum characters in one raw JSONL record (default: 1000000)",
+    )
+    parser.add_argument(
         "--format", "-f",
         choices=["radar", "table", "json", "html"],
         default="radar",
@@ -354,6 +394,12 @@ def main() -> None:
         print("No session files found.", file=sys.stderr)
         sys.exit(1)
 
+    input_limits = SessionInputLimits(
+        max_bytes=args.max_input_bytes,
+        max_records=args.max_input_records,
+        max_record_chars=args.max_input_record_chars,
+    )
+
     outcome_fixture = None
     if args.outcome_file:
         try:
@@ -373,7 +419,7 @@ def main() -> None:
                 bundle = import_bundle(path)
                 session = bundle.to_session()
             else:
-                session = parse_session(path, source)
+                session = parse_session(path, source, input_limits=input_limits)
             if args.profile == "process-v2" or args.export_bundle or args.offline:
                 if bundle is None:
                     bundle = build_session_bundle(session)

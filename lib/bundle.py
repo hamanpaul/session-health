@@ -79,6 +79,16 @@ _IDENTITY_KEYS = {
     "copilotversion",
     "copilotVersion",
 }
+_CAPABILITY_KEYS = {
+    "format",
+    "supports_nested_response_items",
+    "supports_json_string_arguments",
+    "supports_call_result_pairing",
+    "supports_structured_exit_code",
+    "outcome_states",
+    "input_limits",
+    "lifecycle_pairing",
+}
 
 
 def _key_name(key: Any) -> str:
@@ -255,11 +265,36 @@ def _safe_event_payload(kind: str, payload: Any, limits: BundleLimits, counters:
     return {"type": str(payload.get("type", kind) or kind), "status": "unknown"}
 
 
+def _safe_diagnostic(value: Any, counters: Dict[str, int]) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"kind": "unknown", "status": "unknown"}
+    allowed = {
+        key: value[key]
+        for key in ("kind", "line", "status", "record_type", "call_id", "raw_call_id", "source_ref")
+        if key in value
+    }
+    return _redact_value(allowed, 500, counters)
+
+
+def _safe_capabilities(value: Any, counters: Dict[str, int]) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    allowed = {key: value[key] for key in _CAPABILITY_KEYS if key in value}
+    return _redact_value(allowed, 500, counters)
+
+
 def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, Any]:
     """Serialize the minimum typed session model needed to replay offline."""
 
+    # Keep the complete numeric noise facts even when the textual output below
+    # is bounded.  Import locally to avoid making the parser/bundle layer
+    # depend on process-v2 at module import time.
+    from .metrics.snr import analyze_snr
+
     turns: List[Dict[str, Any]] = []
     for turn in session.turns:
+        snr = analyze_snr(turn)
+        observed_total = max(int(turn.raw_tool_output_chars or 0), snr.total_chars)
         user_input, user_counts = redact_text(turn.user_input)
         assistant_output, assistant_counts = redact_text(turn.assistant_output)
         counters["patterns"] += user_counts["patterns"] + assistant_counts["patterns"]
@@ -303,6 +338,13 @@ def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, 
                 "timestamp": turn.timestamp,
                 "raw_tool_output_chars": _observed_output_chars(turn),
                 "total_context_chars": turn.total_context_chars,
+                "snr_facts": {
+                    "total_chars": observed_total,
+                    "noise_chars": snr.noise_chars,
+                    "ansi_chars": snr.ansi_chars,
+                    "progress_chars": snr.progress_chars,
+                    "duplicate_chars": snr.duplicate_chars,
+                },
                 "diagnostics": _redact_value(turn.diagnostics, 500, counters),
             }
         )
@@ -325,10 +367,10 @@ def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, 
         "task_started_count": session.task_started_count,
         "task_complete_count": session.task_complete_count,
         "turn_aborted_count": session.turn_aborted_count,
-        "diagnostics": _redact_value(session.diagnostics, 500, counters),
+        "diagnostics": [_safe_diagnostic(item, counters) for item in session.diagnostics],
         "parser_version": session.parser_version,
         "source_ref": _relative_source_ref(session.source_ref),
-        "source_capabilities": _redact_value(session.source_capabilities, 500, counters),
+        "source_capabilities": _safe_capabilities(session.source_capabilities, counters),
     }
 
 
@@ -463,8 +505,15 @@ def _build_evidence_and_cases(session: Session, events: List[Dict[str, Any]], li
             if cutoff_sequence is None or int(event.get("sequence", 0) or 0) <= cutoff_sequence
         ]
         refs = [str(event["event_id"]) for event in cutoff_events if event.get("event_id")]
-        text_parts = [turn.user_input, turn.assistant_output]
-        text_parts.extend(call.output for call in turn.tool_calls if call.output)
+        text_parts: List[str] = []
+        for event in cutoff_events:
+            payload = event.get("payload", {})
+            if not isinstance(payload, Mapping):
+                continue
+            if event.get("kind") in {"user_message", "assistant_message"}:
+                text_parts.append(str(payload.get("text", "") or ""))
+            elif event.get("kind") == "tool_result":
+                text_parts.append(str(payload.get("output", "") or ""))
         safe_text, local = redact_text("\n".join(part for part in text_parts if part), limits.max_evidence_chars)
         counters["patterns"] += local["patterns"]
         counters["truncated_chars"] += local["truncated_chars"]
@@ -472,12 +521,8 @@ def _build_evidence_and_cases(session: Session, events: List[Dict[str, Any]], li
         cutoff_timestamp = ""
         if claim is not None:
             cutoff_timestamp = str(claim.get("timestamp") or "")
-            if not cutoff_timestamp:
-                cutoff_timestamp = session.timestamp_end or ""
         elif turn_events:
             cutoff_timestamp = str(turn_events[-1].get("timestamp") or "")
-        if not cutoff_timestamp:
-            cutoff_timestamp = session.timestamp_end or ""
         evidence.append(
             {
                 "ref_id": ref_id,
@@ -560,13 +605,13 @@ class SessionBundle:
             },
             events=events,
             facts=_build_facts(session, events),
-            source_capabilities=dict(session.source_capabilities),
+            source_capabilities=_safe_capabilities(session.source_capabilities, counters),
             source_refs=sorted({str(event.get("source_ref")) for event in events if event.get("source_ref")}),
             evidence_refs=evidence,
             cases=cases,
             coverage=coverage,
             session=canonical,
-            diagnostics=list(session.diagnostics),
+            diagnostics=[_safe_diagnostic(item, counters) for item in session.diagnostics],
         )
         encoded = bundle.to_json()
         if len(encoded.encode("utf-8")) > limits.max_bytes:
@@ -696,6 +741,13 @@ class SessionBundle:
                     raise BundleError(f"bundle turn {text_field} must be a string")
             if not isinstance(turn.get("events", []), list) or not isinstance(turn.get("context_meta", {}), Mapping):
                 raise BundleError("bundle turn event/context schema is invalid")
+            snr_facts = turn.get("snr_facts", {})
+            if not isinstance(snr_facts, Mapping):
+                raise BundleError("bundle turn snr_facts must be an object")
+            for fact_name in ("total_chars", "noise_chars", "ansi_chars", "progress_chars", "duplicate_chars"):
+                fact_value = snr_facts.get(fact_name, 0)
+                if not isinstance(fact_value, int) or isinstance(fact_value, bool) or fact_value < 0:
+                    raise BundleError(f"bundle turn snr_facts.{fact_name} must be a non-negative integer")
             if not isinstance(turn.get("diagnostics", []), list):
                 raise BundleError("bundle turn diagnostics must be a list")
             for raw_call in turn.get("tool_calls", []):
@@ -788,6 +840,11 @@ class SessionBundle:
                 raw_tool_output_chars=int(raw_turn.get("raw_tool_output_chars", 0) or 0),
                 total_context_chars=int(raw_turn.get("total_context_chars", 0) or 0),
                 diagnostics=list(raw_turn.get("diagnostics", [])),
+                snr_facts={
+                    str(key): int(value)
+                    for key, value in raw_turn.get("snr_facts", {}).items()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                },
             )
             for raw_call in raw_turn.get("tool_calls", []):
                 call = ToolCall(

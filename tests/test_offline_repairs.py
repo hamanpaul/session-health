@@ -12,7 +12,7 @@ import unittest
 from lib.bundle import BundleError, BundleLimits, SessionBundle, build_session_bundle
 from lib.html_report import render_html
 from lib.metrics.process_v2 import analyze_process_v2, join_external_outcome
-from lib.parser_base import Session, ToolCall, Turn
+from lib.parser_base import Session, SessionInputLimits, ToolCall, Turn
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.radar import render_table
@@ -50,6 +50,41 @@ def _copilot_duplicate_records() -> list[dict]:
 
 
 class OfflineRepairTest(unittest.TestCase):
+    def test_snr_noise_facts_survive_bounded_bundle_replay(self) -> None:
+        for output in (
+            "repeat\n" * 1200,
+            "\x1b[31mred\x1b[0m\n" * 900,
+            "\n".join(f"record #{index} value={index * 17}" for index in range(900)),
+        ):
+            session = Session(
+                id="snr-replay",
+                source="codex",
+                turns=[Turn(index=1, tool_calls=[ToolCall(name="bash", call_id="c1", output=output)])],
+            )
+            bundle = build_session_bundle(session)
+            replayed = SessionBundle.from_json(bundle.to_json()).to_session()
+            original = analyze_process_v2(session).axes["SNR"].metric.to_dict()
+            restored = analyze_process_v2(replayed).axes["SNR"].metric.to_dict()
+            for field in ("numerator", "denominator", "value", "status"):
+                self.assertEqual(original[field], restored[field])
+
+    def test_raw_input_budget_is_bounded_but_configurable_and_partial(self) -> None:
+        records = [
+            {"type": "session_meta", "payload": {"id": "budgeted"}},
+            {"type": "response_item", "payload": {"role": "user", "content": [{"text": "run"}]}},
+            {"type": "response_item", "payload": {"role": "assistant", "content": [{"text": "done"}]}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budgeted.jsonl"
+            _write_jsonl(path, records)
+            full = parse_codex_session(path, input_limits=SessionInputLimits(max_bytes=100_000))
+            self.assertEqual(full.id, "budgeted")
+            lines = path.read_bytes().splitlines(keepends=True)
+            partial_limit = len(lines[0]) + len(lines[1])
+            partial = parse_codex_session(path, input_limits=SessionInputLimits(max_bytes=partial_limit))
+            self.assertTrue(any(item.get("kind") == "input_byte_limit_exceeded" for item in partial.diagnostics))
+            self.assertTrue(partial.turns)
+
     def test_duplicate_ids_never_overwrite_and_result_line_is_retained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -77,9 +112,13 @@ class OfflineRepairTest(unittest.TestCase):
             _write_jsonl(path, records)
             session = parse_codex_session(path)
             session.turns[0].tool_calls[0].output = "A" * 5000
+            session.diagnostics.append({"kind": "unknown", "raw_system": "RAW_SYSTEM_SENTINEL"})
+            session.source_capabilities["raw_payload"] = "RAW_CAPABILITY_SENTINEL"
             bundle = build_session_bundle(session)
             self.assertNotIn("SYNTHETIC_SENTINEL", bundle.to_json())
             self.assertNotIn("/synthetic/private/project", bundle.to_json())
+            self.assertNotIn("RAW_SYSTEM_SENTINEL", bundle.to_json())
+            self.assertNotIn("RAW_CAPABILITY_SENTINEL", bundle.to_json())
             self.assertEqual([event["kind"] for event in bundle.events], ["user_message", "assistant_message", "tool_call", "tool_result"])
             self.assertEqual([event["timestamp"] for event in bundle.events], [row["timestamp"] for row in records[1:]])
             case = bundle.cases[0]
@@ -91,6 +130,15 @@ class OfflineRepairTest(unittest.TestCase):
             original_result = analyze_process_v2(session).axes["SNR"].metric.denominator
             replayed_result = analyze_process_v2(replayed).axes["SNR"].metric.denominator
             self.assertEqual(original_result, replayed_result)
+
+        missing_time = Session(
+            id="missing-time",
+            source="codex",
+            timestamp_end="2026-09-20T23:59:59Z",
+            turns=[Turn(index=1, user_input="claim", assistant_output="done")],
+        )
+        missing_time_bundle = build_session_bundle(missing_time)
+        self.assertIsNone(missing_time_bundle.cases[0]["observation_cutoff"])
 
     def test_process_axes_use_related_observations_and_structured_fields(self) -> None:
         calls = [ToolCall(name="bash", arguments={"cmd": f"false {index}"}, exit_code=1) for index in range(9)]
@@ -112,10 +160,34 @@ class OfflineRepairTest(unittest.TestCase):
 
     def test_lifecycle_and_external_join_do_not_overclaim(self) -> None:
         lifecycle = Session(id="lifecycle", source="codex", task_started_count=10, task_complete_count=1)
-        self.assertEqual(analyze_process_v2(lifecycle).axes["CONV"].metric.value, 1.0)
+        lifecycle_result = analyze_process_v2(lifecycle).axes["CONV"].metric
+        self.assertIsNone(lifecycle_result.value)
+        self.assertEqual(lifecycle_result.status, "unknown")
+        explicit = Session(
+            id="explicit-lifecycle",
+            source="codex",
+            task_started_count=1,
+            task_complete_count=1,
+            turns=[
+                Turn(
+                    index=1,
+                    events=[
+                        {"type": "task_started", "task_id": "task-1"},
+                        {"type": "task_complete", "task_id": "task-1"},
+                    ],
+                )
+            ],
+        )
+        explicit_result = analyze_process_v2(explicit, build_session_bundle(explicit)).axes["CONV"].metric
+        self.assertEqual(explicit_result.value, 1.0)
         session = Session(id="sess-1", source="codex", metadata={"task_id": "task-A"})
         rejected = join_external_outcome(session, {"session_id": "sess-2", "task_id": "task-A", "verdict": "FAIL"})
         self.assertEqual(rejected["status"], "not_joined")
+        alias_rejected = join_external_outcome(
+            session,
+            {"session_id": "sess-1", "sessionId": "sess-2", "verdict": "PASS"},
+        )
+        self.assertEqual(alias_rejected["status"], "not_joined")
         session.source_ref = "session.jsonl"
         rejected_ref = join_external_outcome(
             session,
