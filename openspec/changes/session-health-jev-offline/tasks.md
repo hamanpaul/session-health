@@ -12,3 +12,9 @@
   the offline behavior and compatibility profile.
 - [x] Run the pre-archive OpenSpec, policy, pytest, and synthetic offline
   verification gates for this slice.
+- [x] Repair the pre-archive bundle byte/event projection budget, projected-order
+  semantics, replay-stable identities, and direct lifecycle evidence pairing.
+- [x] Keep default process-v2 terminal/table/JSON/HTML surfaces free of legacy
+  aggregate narratives; preserve the explicit legacy profile.
+- [x] Repair the pre-archive policy workflow pin and make the test workflow's
+  Python/pytest setup self-contained.

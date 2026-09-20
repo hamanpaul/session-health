@@ -183,6 +183,13 @@ def _snr_axis(session: Session, bundle: SessionBundle | None) -> AxisObservation
     calls = _calls(session)
     outputs = [call for call in calls if call.output]
     if not outputs:
+        outputs = [
+            call
+            for turn in session.turns
+            if turn.snr_facts and int(turn.snr_facts.get("total_chars", 0) or 0) > 0
+            for call in turn.tool_calls[:1]
+        ]
+    if not outputs:
         return AxisObservation(
             "SNR",
             _not_applicable("no tool output characters were observed"),
@@ -328,6 +335,35 @@ def _ctx_axis(session: Session, bundle: SessionBundle | None) -> AxisObservation
     )
 
 
+def _lifecycle_events(session: Session, bundle: SessionBundle | None) -> List[Mapping[str, Any]]:
+    """Return lifecycle evidence from the same source for direct and bundle APIs."""
+
+    if bundle is not None:
+        metric_facts = bundle.facts.get("metric_facts", {}) if isinstance(bundle.facts, Mapping) else {}
+        lifecycle_facts = metric_facts.get("lifecycle") if isinstance(metric_facts, Mapping) else None
+        if isinstance(metric_facts, Mapping) and metric_facts.get("complete") is True and isinstance(lifecycle_facts, list):
+            return [item for item in lifecycle_facts if isinstance(item, Mapping)]
+        return [
+            event.get("payload", {})
+            for event in bundle.events
+            if event.get("kind") == "session_event"
+            and isinstance(event.get("payload"), Mapping)
+        ]
+    if session.event_log:
+        return [
+            event.get("payload", {})
+            for event in session.event_log
+            if event.get("kind") == "session_event"
+            and isinstance(event.get("payload"), Mapping)
+        ]
+    return [
+        event
+        for turn in session.turns
+        for event in turn.events
+        if isinstance(event, Mapping)
+    ]
+
+
 def _command_text(call: ToolCall) -> str:
     if not isinstance(call.arguments, Mapping):
         return ""
@@ -466,11 +502,7 @@ def _conv_axis(session: Session, bundle: SessionBundle | None) -> AxisObservatio
     # marker into delivery success.
     task_refs: set[str] = set()
     complete_refs: set[str] = set()
-    lifecycle_events = bundle.events if bundle is not None else []
-    for event in lifecycle_events:
-        if event.get("kind") != "session_event" or not isinstance(event.get("payload"), Mapping):
-            continue
-        payload = event["payload"]
+    for payload in _lifecycle_events(session, bundle):
         event_type = str(payload.get("type", ""))
         ref = payload.get("task_id", payload.get("taskId", payload.get("task_ref")))
         if event_type == "task_started" and ref:

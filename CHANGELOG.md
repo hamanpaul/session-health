@@ -11,3 +11,6 @@
   identity-checked outcome fixtures.
 - Preserved the legacy composite fields and added CLI/documentation coverage for
   the compatibility profile.
+- Kept process-v2 renderers free of uncalibrated legacy aggregates, made projected
+  chronology explicit, and bounded canonical bundle projections while preserving
+  separate typed facts for replay.

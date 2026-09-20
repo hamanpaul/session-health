@@ -42,6 +42,18 @@ class BundleLimits:
     max_turns: int = 10_000
     max_tool_calls: int = 20_000
 
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_events", self.max_events),
+            ("max_bytes", self.max_bytes),
+            ("max_evidence_chars", self.max_evidence_chars),
+            ("max_cases", self.max_cases),
+            ("max_turns", self.max_turns),
+            ("max_tool_calls", self.max_tool_calls),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
@@ -283,7 +295,11 @@ def _safe_capabilities(value: Any, counters: Dict[str, int]) -> Dict[str, Any]:
     return _redact_value(allowed, 500, counters)
 
 
-def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, Any]:
+def _canonical_session(
+    session: Session,
+    counters: Dict[str, int],
+    events: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
     """Serialize the minimum typed session model needed to replay offline."""
 
     # Keep the complete numeric noise facts even when the textual output below
@@ -291,18 +307,107 @@ def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, 
     # depend on process-v2 at module import time.
     from .metrics.snr import analyze_snr
 
+    projection: Dict[int, Dict[str, Any]] | None = None
+    if events is not None:
+        projection = {}
+        for event in events:
+            turn_index = event.get("turn_index")
+            if not isinstance(turn_index, int):
+                continue
+            item = projection.setdefault(
+                turn_index,
+                {"kinds": set(), "calls": [], "results": [], "events": []},
+            )
+            kind = str(event.get("kind", ""))
+            item["kinds"].add(kind)
+            if kind == "tool_call":
+                item["calls"].append(event)
+            elif kind == "tool_result":
+                item["results"].append(event)
+            elif kind in {"session_event", "context_metadata", "lifecycle"}:
+                item["events"].append(event)
+
+    def matching_event(
+        candidates: List[Dict[str, Any]],
+        call: ToolCall,
+        *,
+        result: bool = False,
+        used: set[str] | None = None,
+    ) -> Dict[str, Any] | None:
+        call_ref = _relative_source_ref(
+            call.result_source_ref if result else call.source_ref
+        )
+        sequence = call.result_sequence if result else call.sequence
+        raw_id = call.raw_call_id or call.call_id
+        if result and not sequence and not call_ref:
+            available = [
+                candidate
+                for candidate in candidates
+                if used is None or str(candidate.get("event_id", "")) not in used
+            ]
+            if len(available) != 1:
+                return None
+        for event in candidates:
+            event_id = str(event.get("event_id", ""))
+            if used is not None and event_id in used:
+                continue
+            payload = event.get("payload", {})
+            event_call_id = payload.get("call_id") if isinstance(payload, Mapping) else None
+            if sequence and event.get("sequence") == sequence:
+                return event
+            if call_ref and _relative_source_ref(str(event.get("source_ref", ""))) == call_ref:
+                return event
+            if event_call_id is not None and str(event_call_id) == str(raw_id):
+                return event
+        return None
+
     turns: List[Dict[str, Any]] = []
     for turn in session.turns:
+        turn_projection = projection.get(turn.index) if projection is not None else None
+        if projection is not None and turn_projection is None:
+            continue
         snr = analyze_snr(turn)
         observed_total = max(int(turn.raw_tool_output_chars or 0), snr.total_chars)
-        user_input, user_counts = redact_text(turn.user_input)
-        assistant_output, assistant_counts = redact_text(turn.assistant_output)
+        kinds = turn_projection["kinds"] if turn_projection is not None else {
+            "user_message",
+            "assistant_message",
+            "tool_call",
+            "tool_result",
+            "session_event",
+            "context_metadata",
+        }
+        user_input, user_counts = redact_text(
+            turn.user_input if "user_message" in kinds else ""
+        )
+        assistant_output, assistant_counts = redact_text(
+            turn.assistant_output if "assistant_message" in kinds else ""
+        )
         counters["patterns"] += user_counts["patterns"] + assistant_counts["patterns"]
         counters["truncated_chars"] += user_counts["truncated_chars"] + assistant_counts["truncated_chars"]
         calls: List[Dict[str, Any]] = []
+        used_call_events: set[str] = set()
+        used_result_events: set[str] = set()
         for call in turn.tool_calls:
+            call_event = matching_event(
+                turn_projection["calls"] if turn_projection is not None else [],
+                call,
+                used=used_call_events,
+            ) if turn_projection is not None else {"event_id": "full"}
+            if call_event is None:
+                continue
+            if turn_projection is not None:
+                used_call_events.add(str(call_event.get("event_id", "")))
+            result_event = matching_event(
+                turn_projection["results"] if turn_projection is not None else [],
+                call,
+                result=True,
+                used=used_result_events,
+            ) if turn_projection is not None else {"event_id": "full"}
+            has_result = result_event is not None
+            if has_result and turn_projection is not None:
+                used_result_events.add(str(result_event.get("event_id", "")))
             arguments = _redact_value(call.arguments, 1_000, counters)
-            output, output_counts = redact_text(call.output)
+            output, output_counts = redact_text(call.output if has_result else "")
             counters["patterns"] += output_counts["patterns"]
             counters["truncated_chars"] += output_counts["truncated_chars"]
             calls.append(
@@ -312,29 +417,39 @@ def _canonical_session(session: Session, counters: Dict[str, int]) -> Dict[str, 
                     "call_id": call.call_id,
                     "raw_call_id": call.raw_call_id or call.call_id,
                     "output": output,
-                    "success": call.success,
-                    "exit_code": call.exit_code,
-                    "status": _safe_status(call),
+                    "success": call.success if has_result else None,
+                    "exit_code": call.exit_code if has_result else None,
+                    "status": _safe_status(call) if has_result else "unknown",
                     "source_ref": _relative_source_ref(call.source_ref),
-                    "result_source_ref": _relative_source_ref(call.result_source_ref),
+                    "result_source_ref": _relative_source_ref(call.result_source_ref) if has_result else "",
                     "timestamp": call.timestamp,
-                    "result_timestamp": call.result_timestamp,
+                    "result_timestamp": call.result_timestamp if has_result else "",
                     "sequence": call.sequence,
-                    "result_sequence": call.result_sequence,
-                    "result_metadata": _redact_value(call.result_metadata, 500, counters),
-                    "diagnostics": list(call.diagnostics),
+                    "result_sequence": call.result_sequence if has_result else 0,
+                    "result_metadata": _redact_value(call.result_metadata, 500, counters) if has_result else {},
+                    "diagnostics": list(call.diagnostics) if has_result else ["result_not_in_projection"],
                 }
             )
+        retained_events = []
+        if turn_projection is None:
+            retained_events = [_safe_turn_event(event, counters) for event in turn.events]
+        else:
+            for event in turn_projection["events"]:
+                payload = event.get("payload", {})
+                if event.get("kind") == "session_event" and isinstance(payload, Mapping):
+                    retained_events.append(_safe_turn_event(payload, counters))
         turns.append(
             {
                 "index": turn.index,
                 "user_input": user_input,
                 "assistant_output": assistant_output,
                 "tool_calls": calls,
-                "events": [
-                    _safe_turn_event(event, counters) for event in turn.events
-                ],
-                "context_meta": _redact_value(turn.context_meta, 200, counters),
+                "events": retained_events,
+                "context_meta": _redact_value(
+                    turn.context_meta if "context_metadata" in kinds else {},
+                    200,
+                    counters,
+                ),
                 "timestamp": turn.timestamp,
                 "raw_tool_output_chars": _observed_output_chars(turn),
                 "total_context_chars": turn.total_context_chars,
@@ -398,11 +513,20 @@ def _fallback_event_log(session: Session) -> List[Dict[str, Any]]:
     return result
 
 
-def _build_events(session: Session, limits: BundleLimits, counters: Dict[str, int]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _build_events(
+    session: Session,
+    limits: BundleLimits,
+    counters: Dict[str, int],
+    event_limit: int | None = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     raw_events = sorted(session.event_log or _fallback_event_log(session), key=lambda item: int(item.get("sequence", 0) or 0))
     events: List[Dict[str, Any]] = []
+    export_limit = event_limit if event_limit is not None else limits.max_events
+    projected_order = not session.event_log or all(
+        event.get("ordering") == "projected" for event in session.event_log
+    )
     for raw in raw_events:
-        if len(events) >= limits.max_events:
+        if len(events) >= export_limit:
             break
         sequence = int(raw.get("sequence", len(events) + 1) or len(events) + 1)
         kind = str(raw.get("kind", "unknown_event") or "unknown_event")
@@ -414,8 +538,9 @@ def _build_events(session: Session, limits: BundleLimits, counters: Dict[str, in
                 "sequence": sequence,
                 "kind": kind,
                 "turn_index": raw.get("turn_index"),
-                "timestamp": str(raw.get("timestamp", "") or "") or None,
+                "timestamp": None if projected_order else str(raw.get("timestamp", "") or "") or None,
                 "source_ref": source_ref,
+                "ordering": "projected" if projected_order else "observed",
                 "payload": _safe_event_payload(kind, payload, limits, counters),
             }
         )
@@ -425,15 +550,99 @@ def _build_events(session: Session, limits: BundleLimits, counters: Dict[str, in
         "input_events": len(raw_events),
         "exported_events": len(events),
         "max_events": limits.max_events,
+        "export_budget": export_limit,
         "excluded_events": max(0, len(raw_events) - len(events)),
-        "observed_cutoff": session.timestamp_end or None,
+        "observed_cutoff": session.timestamp_end or None if not projected_order else None,
+        "ordering": "projected" if projected_order else "observed",
+        "temporal_support": not projected_order,
     }
     return events, coverage
 
 
-def _build_facts(session: Session, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_facts(
+    session: Session,
+    events: List[Dict[str, Any]],
+    counters: Dict[str, int],
+) -> Dict[str, Any]:
     calls = [call for turn in session.turns for call in turn.tool_calls]
     known = [call for call in calls if _safe_status(call) != "unknown"]
+    from .metrics.snr import analyze_snr
+
+    turn_facts: List[Dict[str, Any]] = []
+    for turn in session.turns:
+        snr = analyze_snr(turn)
+        turn_facts.append(
+            {
+                "index": turn.index,
+                "timestamp": turn.timestamp,
+                "tool_call_count": len(turn.tool_calls),
+                "raw_tool_output_chars": _observed_output_chars(turn),
+                "snr_facts": {
+                    "total_chars": max(_observed_output_chars(turn), snr.total_chars),
+                    "noise_chars": snr.noise_chars,
+                    "ansi_chars": snr.ansi_chars,
+                    "progress_chars": snr.progress_chars,
+                    "duplicate_chars": snr.duplicate_chars,
+                },
+                "context_fields": sorted(
+                    str(key) for key, value in turn.context_meta.items() if value is True
+                ),
+                "context_values": {
+                    str(key): _redact_value(value, 100, counters, key)
+                    for key, value in turn.context_meta.items()
+                    if key in {"task_ref", "session_ref", "continuity_event"}
+                },
+                "event_types": sorted(
+                    str(event.get("type", ""))
+                    for event in turn.events
+                    if isinstance(event, Mapping) and event.get("type")
+                ),
+            }
+        )
+    call_facts: List[Dict[str, Any]] = []
+    for turn in session.turns:
+        for call in turn.tool_calls:
+            call_facts.append(
+                {
+                    "turn_index": turn.index,
+                    "name": call.name,
+                    "arguments": _redact_value(call.arguments, 300, counters),
+                    "call_id": call.call_id,
+                    "raw_call_id": call.raw_call_id or call.call_id,
+                    "status": _safe_status(call),
+                    "success": call.success,
+                    "exit_code": call.exit_code,
+                    "output_chars": len(call.output or ""),
+                    "result_metadata": _redact_value(call.result_metadata, 300, counters),
+                }
+            )
+    lifecycle_facts: List[Dict[str, Any]] = []
+    lifecycle_source = session.event_log or [
+        {"kind": "session_event", "payload": event}
+        for turn in session.turns
+        for event in turn.events
+        if isinstance(event, Mapping)
+    ]
+    for event in lifecycle_source:
+        if not isinstance(event, Mapping) or event.get("kind") != "session_event":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, Mapping) or not payload.get("type"):
+            continue
+        item: Dict[str, Any] = {"type": str(payload.get("type"))}
+        for key in (
+            "task_ref",
+            "task_id",
+            "taskId",
+            "session_ref",
+            "session_id",
+            "sessionId",
+            "status",
+            "reason",
+        ):
+            if key in payload:
+                item[key] = _redact_value(payload[key], 100, counters, key)
+        lifecycle_facts.append(item)
     return {
         "session_id": session.id,
         "source": session.source,
@@ -460,6 +669,12 @@ def _build_facts(session: Session, events: List[Dict[str, Any]]) -> Dict[str, An
             "task_id": bool(session.metadata.get("task_id") or session.metadata.get("taskId")),
         },
         "raw_tool_output_chars": sum(_observed_output_chars(turn) for turn in session.turns),
+        "metric_facts": {
+            "turns": turn_facts,
+            "calls": call_facts,
+            "lifecycle": lifecycle_facts,
+            "complete": True,
+        },
     }
 
 
@@ -492,14 +707,24 @@ def _event_is_verification(event: Mapping[str, Any]) -> bool:
 def _build_evidence_and_cases(session: Session, events: List[Dict[str, Any]], limits: BundleLimits, counters: Dict[str, int]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     evidence: List[Dict[str, Any]] = []
     cases: List[Dict[str, Any]] = []
+    observed_order = bool(session.event_log) and not all(
+        event.get("ordering") == "projected" for event in session.event_log
+    )
+    source_ref = _relative_source_ref(session.source_ref)
     for turn in session.turns:
-        if len(cases) >= limits.max_cases:
-            break
         turn_events = [event for event in events if event.get("turn_index") == turn.index]
         turn_events.sort(key=lambda event: int(event.get("sequence", 0) or 0))
+        if not turn_events:
+            continue
+        if len(cases) >= limits.max_cases:
+            break
         claim_events = [event for event in turn_events if event.get("kind") == "assistant_message"]
-        claim = claim_events[0] if claim_events else None
-        cutoff_sequence = int(claim.get("sequence")) if claim is not None else (int(turn_events[-1].get("sequence")) if turn_events else None)
+        claim = claim_events[0] if claim_events and observed_order else None
+        cutoff_sequence = (
+            int(claim.get("sequence"))
+            if claim is not None
+            else (int(turn_events[-1].get("sequence")) if turn_events and observed_order else None)
+        )
         cutoff_events = [
             event for event in turn_events
             if cutoff_sequence is None or int(event.get("sequence", 0) or 0) <= cutoff_sequence
@@ -517,11 +742,11 @@ def _build_evidence_and_cases(session: Session, events: List[Dict[str, Any]], li
         safe_text, local = redact_text("\n".join(part for part in text_parts if part), limits.max_evidence_chars)
         counters["patterns"] += local["patterns"]
         counters["truncated_chars"] += local["truncated_chars"]
-        ref_id = f"evidence-{_stable_id(session.source, session.id, session.source_ref, turn.index)}"
+        ref_id = f"evidence-{_stable_id(session.source, session.id, source_ref, turn.index)}"
         cutoff_timestamp = ""
-        if claim is not None:
+        if claim is not None and observed_order:
             cutoff_timestamp = str(claim.get("timestamp") or "")
-        elif turn_events:
+        elif turn_events and observed_order:
             cutoff_timestamp = str(turn_events[-1].get("timestamp") or "")
         evidence.append(
             {
@@ -534,21 +759,23 @@ def _build_evidence_and_cases(session: Session, events: List[Dict[str, Any]], li
                 "redaction": {"bounded": True, "patterns": local["patterns"]},
             }
         )
-        has_verification = any(_event_is_verification(event) for event in cutoff_events)
+        has_verification = observed_order and any(_event_is_verification(event) for event in cutoff_events)
         cases.append(
             {
-                "case_id": f"case-{_stable_id(session.source, session.id, session.source_ref, turn.index)}",
+                "case_id": f"case-{_stable_id(session.source, session.id, source_ref, turn.index)}",
                 "kind": "offline_observation_candidate",
                 "turn_index": turn.index,
                 "evidence_refs": [ref_id],
                 "event_refs": refs,
                 "relations": {
-                    "requirement_to_action": "candidate" if any(event.get("kind") == "user_message" for event in cutoff_events) and any(event.get("kind") == "tool_call" for event in cutoff_events) else "insufficient",
-                    "failure_to_disposition_to_result": "candidate" if any(event.get("kind") == "tool_result" and isinstance(event.get("payload"), Mapping) and event["payload"].get("exit_code") not in (None, 0) for event in cutoff_events) else "not_observed",
-                    "claim_to_verification": "candidate" if claim is not None and has_verification else "insufficient",
+                    "requirement_to_action": "candidate" if observed_order and any(event.get("kind") == "user_message" for event in cutoff_events) and any(event.get("kind") == "tool_call" for event in cutoff_events) else "unknown" if not observed_order else "insufficient",
+                    "failure_to_disposition_to_result": "candidate" if observed_order and any(event.get("kind") == "tool_result" and isinstance(event.get("payload"), Mapping) and event["payload"].get("exit_code") not in (None, 0) for event in cutoff_events) else "unknown" if not observed_order else "not_observed",
+                    "claim_to_verification": "candidate" if claim is not None and has_verification else "unknown" if not observed_order else "insufficient",
                 },
                 "observation_cutoff": cutoff_timestamp or None,
                 "observation_cutoff_sequence": cutoff_sequence,
+                "ordering": "observed" if observed_order else "projected",
+                "temporal_support": observed_order,
                 "semantic_judgment": "not_requested",
             }
         )
@@ -578,45 +805,66 @@ class SessionBundle:
         tool_count = sum(len(turn.tool_calls) for turn in session.turns)
         if tool_count > limits.max_tool_calls:
             raise BundleError(f"session tool-call limit exceeded: {limits.max_tool_calls}")
-        counters = {"patterns": 0, "truncated_chars": 0}
-        events, coverage = _build_events(session, limits, counters)
-        evidence, cases = _build_evidence_and_cases(session, events, limits, counters)
-        canonical = _canonical_session(session, counters)
         source_ref = _relative_source_ref(session.source_ref)
         artifact_id = _stable_id(session.source, session.id, source_ref)
-        bundle = cls(
-            manifest={
-                "schema": BUNDLE_SCHEMA,
-                "version": BUNDLE_VERSION,
-                "schema_version": BUNDLE_VERSION,
-                "bundle_version": BUNDLE_VERSION,
-                "session_id": session.id,
-                "source": session.source,
-                "source_ref": source_ref,
-                "artifact_id": artifact_id,
-                "parser_version": session.parser_version,
-                "portable": True,
-                "redaction": {
-                    "patterns": counters["patterns"],
-                    "absolute_paths": counters.get("absolute_paths", 0),
-                    "truncated_chars": counters["truncated_chars"],
-                    "secret_detection_disclaimer": "Redaction is bounded heuristic detection, not proof that no secret remains.",
+
+        def assemble(event_budget: int) -> "SessionBundle":
+            counters = {"patterns": 0, "truncated_chars": 0}
+            events, coverage = _build_events(session, limits, counters, event_limit=event_budget)
+            evidence, cases = _build_evidence_and_cases(session, events, limits, counters)
+            canonical = _canonical_session(session, counters, events=events)
+            facts = _build_facts(session, events, counters)
+            source_capabilities = _safe_capabilities(session.source_capabilities, counters)
+            coverage["canonical_turns"] = len(canonical.get("turns", []))
+            coverage["canonical_calls"] = sum(
+                len(turn.get("tool_calls", []))
+                for turn in canonical.get("turns", [])
+            )
+            return cls(
+                manifest={
+                    "schema": BUNDLE_SCHEMA,
+                    "version": BUNDLE_VERSION,
+                    "schema_version": BUNDLE_VERSION,
+                    "bundle_version": BUNDLE_VERSION,
+                    "session_id": session.id,
+                    "source": session.source,
+                    "source_ref": source_ref,
+                    "artifact_id": artifact_id,
+                    "parser_version": session.parser_version,
+                    "portable": True,
+                    "redaction": {
+                        "patterns": counters["patterns"],
+                        "absolute_paths": counters.get("absolute_paths", 0),
+                        "truncated_chars": counters["truncated_chars"],
+                        "secret_detection_disclaimer": "Redaction is bounded heuristic detection, not proof that no secret remains.",
+                    },
                 },
-            },
-            events=events,
-            facts=_build_facts(session, events),
-            source_capabilities=_safe_capabilities(session.source_capabilities, counters),
-            source_refs=sorted({str(event.get("source_ref")) for event in events if event.get("source_ref")}),
-            evidence_refs=evidence,
-            cases=cases,
-            coverage=coverage,
-            session=canonical,
-            diagnostics=[_safe_diagnostic(item, counters) for item in session.diagnostics],
-        )
-        encoded = bundle.to_json()
-        if len(encoded.encode("utf-8")) > limits.max_bytes:
-            raise BundleError(f"bundle exceeds max_bytes={limits.max_bytes}; reduce input or raise the explicit limit")
-        return bundle
+                events=events,
+                facts=facts,
+                source_capabilities=source_capabilities,
+                source_refs=sorted({str(event.get("source_ref")) for event in events if event.get("source_ref")}),
+                evidence_refs=evidence,
+                cases=cases,
+                coverage=coverage,
+                session=canonical,
+                diagnostics=[_safe_diagnostic(item, counters) for item in session.diagnostics],
+            )
+
+        event_budget = limits.max_events
+        while True:
+            bundle = assemble(event_budget)
+            encoded_size = len(bundle.to_json().encode("utf-8"))
+            if encoded_size <= limits.max_bytes:
+                return bundle
+            if event_budget <= 1:
+                raise BundleError(
+                    f"bundle exceeds max_bytes={limits.max_bytes}; reduce input or raise the explicit limit"
+                )
+            # Evidence, cases, and the canonical projection all use the same
+            # event budget.  Reduce that projection until the byte contract is
+            # met, while facts retains bounded typed sufficient statistics for
+            # the complete parsed input.
+            event_budget = max(1, event_budget // 2)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -660,6 +908,16 @@ class SessionBundle:
         for field_name in ("manifest", "facts", "source_capabilities", "coverage"):
             if not isinstance(payload.get(field_name, {}), Mapping):
                 raise BundleError(f"bundle {field_name} must be an object")
+        metric_facts = payload.get("facts", {}).get("metric_facts")
+        if metric_facts is not None:
+            if not isinstance(metric_facts, Mapping):
+                raise BundleError("bundle metric_facts must be an object")
+            fact_turns = metric_facts.get("turns", [])
+            fact_calls = metric_facts.get("calls", [])
+            if not isinstance(fact_turns, list) or len(fact_turns) > limits.max_turns:
+                raise BundleError("bundle metric fact turn limit exceeded")
+            if not isinstance(fact_calls, list) or len(fact_calls) > limits.max_tool_calls:
+                raise BundleError("bundle metric fact tool-call limit exceeded")
         if not isinstance(payload.get("diagnostics", []), list):
             raise BundleError("bundle diagnostics must be a list")
         manifest = payload.get("manifest", {})
@@ -867,6 +1125,90 @@ class SessionBundle:
                 )
                 turn.tool_calls.append(call)
             session.turns.append(turn)
+
+        # A bounded canonical projection may omit later turns/calls from the
+        # evidence surface.  Rehydrate only the redacted typed metric facts so
+        # offline replay can retain numeric coverage without restoring raw
+        # payloads or bypassing the portable evidence cap.
+        metric_facts = self.facts.get("metric_facts", {})
+        if isinstance(metric_facts, Mapping) and metric_facts.get("complete") is True:
+            turns_by_index = {turn.index: turn for turn in session.turns}
+            raw_fact_turns = metric_facts.get("turns", [])
+            if isinstance(raw_fact_turns, list):
+                for raw_fact in raw_fact_turns:
+                    if not isinstance(raw_fact, Mapping):
+                        continue
+                    try:
+                        index = int(raw_fact.get("index", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if index <= 0:
+                        continue
+                    turn = turns_by_index.get(index)
+                    if turn is None:
+                        turn = Turn(index=index, timestamp=str(raw_fact.get("timestamp", "")))
+                        session.turns.append(turn)
+                        turns_by_index[index] = turn
+                    turn.raw_tool_output_chars = max(
+                        turn.raw_tool_output_chars,
+                        int(raw_fact.get("raw_tool_output_chars", 0) or 0)
+                        if isinstance(raw_fact.get("raw_tool_output_chars", 0), int)
+                        else 0,
+                    )
+                    facts = raw_fact.get("snr_facts", {})
+                    if isinstance(facts, Mapping) and not turn.snr_facts:
+                        turn.snr_facts = {
+                            str(key): int(value)
+                            for key, value in facts.items()
+                            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                        }
+                    for field_name in raw_fact.get("context_fields", []):
+                        if isinstance(field_name, str):
+                            turn.context_meta[field_name] = True
+                    context_values = raw_fact.get("context_values", {})
+                    if isinstance(context_values, Mapping):
+                        for field_name, value in context_values.items():
+                            if field_name in {"task_ref", "session_ref", "continuity_event"} and isinstance(value, str):
+                                turn.context_meta[str(field_name)] = value
+                    known_event_types = {
+                        str(event.get("type", ""))
+                        for event in turn.events
+                        if isinstance(event, Mapping)
+                    }
+                    for event_type in raw_fact.get("event_types", []):
+                        if isinstance(event_type, str) and event_type not in known_event_types:
+                            turn.events.append({"type": event_type, "status": "unknown"})
+                            known_event_types.add(event_type)
+
+            raw_fact_calls = metric_facts.get("calls", [])
+            if isinstance(raw_fact_calls, list):
+                for raw_fact in raw_fact_calls:
+                    if not isinstance(raw_fact, Mapping):
+                        continue
+                    try:
+                        turn_index = int(raw_fact.get("turn_index", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    turn = turns_by_index.get(turn_index)
+                    if turn is None:
+                        continue
+                    call_id = str(raw_fact.get("call_id", ""))
+                    name = str(raw_fact.get("name", "unknown"))
+                    if any(call.call_id == call_id and call.name == name for call in turn.tool_calls):
+                        continue
+                    status = str(raw_fact.get("status", "unknown"))
+                    call = ToolCall(
+                        name=name,
+                        arguments=dict(raw_fact.get("arguments", {})) if isinstance(raw_fact.get("arguments", {}), Mapping) else {},
+                        call_id=call_id,
+                        raw_call_id=str(raw_fact.get("raw_call_id", call_id)),
+                        success=raw_fact.get("success") if isinstance(raw_fact.get("success"), bool) else None,
+                        exit_code=raw_fact.get("exit_code") if isinstance(raw_fact.get("exit_code"), int) and not isinstance(raw_fact.get("exit_code"), bool) else None,
+                        status=status,
+                        result_metadata=dict(raw_fact.get("result_metadata", {})) if isinstance(raw_fact.get("result_metadata", {}), Mapping) else {},
+                    )
+                    turn.tool_calls.append(call)
+            session.turns.sort(key=lambda turn: turn.index)
         return session
 
 

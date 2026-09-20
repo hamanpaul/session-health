@@ -279,6 +279,98 @@ class OfflineRepairTest(unittest.TestCase):
         self.assertNotIn("radar", rendered.lower())
         self.assertNotIn("grade", rendered.lower())
 
+    def test_r2_bundle_projection_is_bounded_and_keeps_typed_facts(self) -> None:
+        session = Session(
+            id="many-turns",
+            source="codex",
+            turns=[
+                Turn(index=index, user_input="run test", assistant_output="complete")
+                for index in range(1, 1_201)
+            ],
+        )
+        bundle = build_session_bundle(session)
+        self.assertLessEqual(len(bundle.to_json().encode("utf-8")), BundleLimits().max_bytes)
+        self.assertEqual(bundle.coverage["status"], "truncated")
+        self.assertEqual(len(bundle.facts["metric_facts"]["turns"]), 1_200)
+
+        capped_source = Session(
+            id="event-cap",
+            source="codex",
+            turns=[
+                Turn(
+                    index=index,
+                    user_input=f"user-{index}",
+                    tool_calls=[ToolCall(name="bash", call_id=f"c{index}", output="ok", exit_code=0)],
+                )
+                for index in range(1, 11)
+            ],
+        )
+        capped = build_session_bundle(
+            capped_source,
+            limits=BundleLimits(max_events=1),
+        )
+        self.assertLessEqual(len(capped.session["turns"]), 1)
+        self.assertEqual(sum(len(turn["tool_calls"]) for turn in capped.session["turns"]), 0)
+        self.assertEqual(len(capped.facts["metric_facts"]["calls"]), 10)
+        restored = SessionBundle.from_json(capped.to_json()).to_session()
+        self.assertEqual(len(restored.turns), 10)
+        self.assertEqual(sum(len(turn.tool_calls) for turn in restored.turns), 10)
+        self.assertEqual(
+            analyze_process_v2(capped_source).axes["SNR"].metric.denominator,
+            analyze_process_v2(restored, capped).axes["SNR"].metric.denominator,
+        )
+
+    def test_r2_projected_order_is_explicitly_unknown_and_ids_are_replay_stable(self) -> None:
+        session = Session(
+            id="unordered",
+            source="codex",
+            source_ref="/synthetic/path/session.jsonl",
+            timestamp_end="2026-09-20T23:59:59Z",
+            turns=[
+                Turn(
+                    index=1,
+                    user_input="run test",
+                    assistant_output="All tests passed",
+                    timestamp="2026-09-20T00:00:00Z",
+                    tool_calls=[ToolCall(name="bash", arguments={"cmd": "pytest -q"}, output="1 passed", exit_code=0)],
+                )
+            ],
+        )
+        bundle = build_session_bundle(session)
+        self.assertEqual(bundle.coverage["ordering"], "projected")
+        self.assertFalse(bundle.coverage["temporal_support"])
+        self.assertEqual(bundle.cases[0]["relations"]["claim_to_verification"], "unknown")
+        self.assertTrue(all(event["timestamp"] is None for event in bundle.events))
+        replayed = build_session_bundle(SessionBundle.from_json(bundle.to_json()).to_session())
+        self.assertEqual(replayed.coverage["ordering"], "projected")
+        self.assertEqual(
+            [case["case_id"] for case in bundle.cases],
+            [case["case_id"] for case in replayed.cases],
+        )
+        self.assertEqual(
+            [item["ref_id"] for item in bundle.evidence_refs],
+            [item["ref_id"] for item in replayed.evidence_refs],
+        )
+
+    def test_r2_direct_lifecycle_uses_event_log_identity_pairs(self) -> None:
+        session = Session(
+            id="direct-lifecycle",
+            source="codex",
+            task_started_count=2,
+            task_complete_count=1,
+            event_log=[
+                {"sequence": 1, "kind": "session_event", "turn_index": 1, "payload": {"type": "task_started", "task_id": "a"}},
+                {"sequence": 2, "kind": "session_event", "turn_index": 1, "payload": {"type": "task_started", "task_id": "b"}},
+                {"sequence": 3, "kind": "session_event", "turn_index": 1, "payload": {"type": "task_complete", "task_id": "a"}},
+            ],
+            turns=[Turn(index=1)],
+        )
+        direct = analyze_process_v2(session).axes["CONV"].metric
+        replayed_bundle = build_session_bundle(session)
+        replayed = analyze_process_v2(session, replayed_bundle).axes["CONV"].metric
+        self.assertEqual((direct.value, direct.status), (0.5, "observed"))
+        self.assertEqual((replayed.value, replayed.status), (0.5, "observed"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,7 @@ from lib.parser_base import (
 )
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
-from lib.bundle import BundleError, SessionBundle, build_session_bundle, export_bundle, import_bundle
+from lib.bundle import BundleError, BundleLimits, SessionBundle, build_session_bundle, export_bundle, import_bundle
 from lib.metrics.process_v2 import analyze_process_v2
 from lib.scorer import score_session, SessionScore
 from lib.report_types import BatchReport, SessionReport
@@ -279,6 +279,20 @@ def main() -> None:
         help="Maximum characters in one raw JSONL record (default: 1000000)",
     )
     parser.add_argument(
+        "--max-bundle-bytes",
+        type=_positive_int,
+        default=BundleLimits().max_bytes,
+        metavar="N",
+        help="Portable bundle byte budget (default: 2000000; evidence is truncated to fit)",
+    )
+    parser.add_argument(
+        "--max-bundle-events",
+        type=_positive_int,
+        default=BundleLimits().max_events,
+        metavar="N",
+        help="Portable bundle event budget (default: 10000)",
+    )
+    parser.add_argument(
         "--format", "-f",
         choices=["radar", "table", "json", "html"],
         default="radar",
@@ -399,6 +413,10 @@ def main() -> None:
         max_records=args.max_input_records,
         max_record_chars=args.max_input_record_chars,
     )
+    bundle_limits = BundleLimits(
+        max_bytes=args.max_bundle_bytes,
+        max_events=args.max_bundle_events,
+    )
 
     outcome_fixture = None
     if args.outcome_file:
@@ -416,13 +434,13 @@ def main() -> None:
         processing_diagnostics = []
         try:
             if is_bundle_path(path):
-                bundle = import_bundle(path)
+                bundle = import_bundle(path, limits=bundle_limits)
                 session = bundle.to_session()
             else:
                 session = parse_session(path, source, input_limits=input_limits)
             if args.profile == "process-v2" or args.export_bundle or args.offline:
                 if bundle is None:
-                    bundle = build_session_bundle(session)
+                    bundle = build_session_bundle(session, limits=bundle_limits)
             sc = score_session(session)
             evidence_summary = build_evidence_summary(session, sc)
             problemmap = diagnose_problemmap(session, sc, evidence_summary=evidence_summary)
@@ -438,6 +456,8 @@ def main() -> None:
                 else None
             )
             status = "complete" if session.turns else "failed"
+            if bundle is not None and bundle.coverage.get("status") == "truncated" and status == "complete":
+                status = "partial"
             if session.diagnostics and status == "complete":
                 status = "partial"
             processing_diagnostics.extend(session.diagnostics)
@@ -614,7 +634,7 @@ def main() -> None:
     if args.export_bundle:
         export_target = Path(args.export_bundle)
         if len(reports) == 1 and (export_target.suffix or not export_target.exists()):
-            export_bundle(reports[0].session, export_target)
+            export_bundle(reports[0].session, export_target, limits=bundle_limits)
             print(f"✓ SessionBundle exported to: {export_target}", file=sys.stderr)
         else:
             export_target.mkdir(parents=True, exist_ok=True)
@@ -631,7 +651,7 @@ def main() -> None:
                     filename = f"{stem}-{suffix}.bundle.json"
                     suffix += 1
                 used_names.add(filename)
-                export_bundle(report.session, export_target / filename)
+                export_bundle(report.session, export_target / filename, limits=bundle_limits)
                 export_manifest.append(
                     {
                         "input": report.artifact_sources.get("session_input", "unknown"),
@@ -695,7 +715,11 @@ def main() -> None:
     if len(reports) > 1 and args.format != "json":
         _print_batch_summary(reports, use_color)
 
-    return 1 if any(report.processing_status != "complete" for report in reports) else 0
+    if any(report.processing_status == "failed" for report in reports):
+        return 1
+    if any(report.processing_status == "partial" for report in reports):
+        return 2
+    return 0
 
 
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
@@ -726,16 +750,30 @@ def _extreme_evaluated_score(reports: List[SessionReport], *, minimum: bool) -> 
 
 def _print_batch_summary(reports: List[SessionReport], use_color: bool) -> None:
     """Print summary for batch evaluation."""
-    import statistics
-    evaluated = [report.score.composite for report in reports if report.processing_status != "failed"]
-    avg = statistics.mean(evaluated) if evaluated else None
-    med = statistics.median(evaluated) if evaluated else None
     complete = sum(report.processing_status == "complete" for report in reports)
     partial = sum(report.processing_status == "partial" for report in reports)
     failed = sum(report.processing_status == "failed" for report in reports)
 
     print("=" * 52)
     print(f"Batch Summary: {len(reports)} selected; {complete} complete, {partial} partial, {failed} failed")
+    if reports and all(report.profile != "legacy" for report in reports):
+        print("  Process-v2 axis observations:")
+        for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+            present = 0
+            observed = 0
+            for report in reports:
+                axis = report.process_v2.axes.get(axis_id) if report.process_v2 is not None else None
+                if axis is not None:
+                    present += 1
+                    if axis.metric.status == "observed":
+                        observed += 1
+            print(f"    {axis_id}: {observed}/{present} observed")
+        return
+
+    import statistics
+    evaluated = [report.score.composite for report in reports if report.processing_status != "failed"]
+    avg = statistics.mean(evaluated) if evaluated else None
+    med = statistics.median(evaluated) if evaluated else None
     print(f"  Evaluated: {len(evaluated)}")
     print(f"  Mean:   {'unknown' if avg is None else f'{avg:.1f}'}")
     print(f"  Median: {'unknown' if med is None else f'{med:.1f}'}")

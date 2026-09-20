@@ -280,13 +280,14 @@ def render_report_terminal(report: SessionReport, use_color: bool = True) -> str
         parts.append(render_radar(report, use_color))
     else:
         parts.append(f"Process-v2 report: {report.session.id or 'unknown'}  status={report.processing_status}")
-    diagnosis_box = render_diagnosis_summary_terminal(report.diagnosis_summary, use_color)
-    if diagnosis_box:
-        parts.append(diagnosis_box)
-    else:
-        problemmap_box = render_problemmap_terminal(report.problemmap, use_color)
-        if problemmap_box:
-            parts.append(problemmap_box)
+    if report.profile == "legacy":
+        diagnosis_box = render_diagnosis_summary_terminal(report.diagnosis_summary, use_color)
+        if diagnosis_box:
+            parts.append(diagnosis_box)
+        else:
+            problemmap_box = render_problemmap_terminal(report.problemmap, use_color)
+            if problemmap_box:
+                parts.append(problemmap_box)
     if report.agent_analysis is not None and report.agent_analysis.success:
         parts.append(render_agent_terminal(report.agent_analysis))
     if report.process_v2 is not None:
@@ -329,13 +330,14 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
         if item.profile:
             lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
         lines.append("-" * 150)
-        lines.append(f"{'Session':20s} {'Status':9s} {'Score':>7s} {'Grade':6s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
+        if item.profile == "legacy":
+            lines.append(f"{'Session':20s} {'Status':9s} {'Score':>7s} {'Grade':6s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
+        else:
+            lines.append(f"{'Session':20s} {'Status':9s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
         lines.append("-" * 150)
         for report in item.sessions:
             session_id = (report.score.session_id or "unknown")[:24]
             status = report.processing_status
-            score = "unknown" if status == "failed" or item.profile != "legacy" else f"{report.score.composite:.1f}"
-            grade = "unknown" if status == "failed" or item.profile != "legacy" else report.score.grade
             values: List[str] = []
             coverage = "unknown"
             if report.process_v2 is not None:
@@ -343,7 +345,12 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
                 coverage = _format_process_coverage(report.process_v2)
             else:
                 values = ["null"] * 7
-            lines.append(f"{session_id:20s} {status:9s} {score:>7s} {grade:6s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
+            if item.profile == "legacy":
+                score = "unknown" if status == "failed" else f"{report.score.composite:.1f}"
+                grade = "unknown" if status == "failed" else report.score.grade
+                lines.append(f"{session_id:20s} {status:9s} {score:>7s} {grade:6s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
+            else:
+                lines.append(f"{session_id:20s} {status:9s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
         lines.append("-" * 150)
         return "\n".join(lines)
 
@@ -351,7 +358,7 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
     lines = []
     lines.append(f"Session: {score.session_id}  ({score.source}, {score.model})")
     if isinstance(item, SessionReport) and item.profile != "legacy":
-        lines.append(f"Turns: {score.turn_count}  Legacy composite: not rendered for profile {item.profile}")
+        lines.append(f"Turns: {score.turn_count}")
     else:
         lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
     if isinstance(item, SessionReport):
@@ -395,6 +402,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
     """Render as JSON string."""
     import json
     if isinstance(item, BatchReport):
+        process_only = item.profile != "legacy"
         payload = {
             "schema_version": "report-2",
             "report_kind": item.report_kind,
@@ -405,8 +413,8 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             "processing_status": item.processing_status,
             "processing_diagnostics": item.processing_diagnostics,
             "analysis_status": item.analysis_status,
-            "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
-            "evidence_summary": item.evidence_summary,
+            "diagnosis_summary": None if process_only else (asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None),
+            "evidence_summary": _process_batch_summary(item) if process_only else item.evidence_summary,
             "artifact_sources": item.artifact_sources,
             "agent_analysis": {
                 "agent_name": item.agent_analysis.agent_name,
@@ -458,6 +466,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             }
         )
     if isinstance(item, SessionReport):
+        process_only = item.profile != "legacy"
         payload.update(
             {
                 "report_kind": item.report_kind,
@@ -470,10 +479,10 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
                 "analysis_status": item.analysis_status,
                 "bundle": item.bundle_manifest or None,
                 "process_v2": item.process_v2.to_dict() if item.process_v2 is not None else None,
-                "diagnosis_summary": asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None,
-                "evidence_summary": item.evidence_summary,
+                "diagnosis_summary": None if process_only else (asdict(item.diagnosis_summary) if item.diagnosis_summary is not None else None),
+                "evidence_summary": {} if process_only else item.evidence_summary,
                 "artifact_sources": item.artifact_sources,
-                "problemmap": {
+                "problemmap": None if process_only else {
                     "status": item.problemmap.status,
                     "diagnostic_mode": item.problemmap.diagnostic_mode,
                     "pm1_candidates": item.problemmap.pm1_candidates,
@@ -497,6 +506,26 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             }
         )
     return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _process_batch_summary(batch: BatchReport) -> Dict[str, object]:
+    """Return batch facts that do not derive from the legacy composite."""
+
+    axes: Dict[str, Dict[str, int]] = {}
+    for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+        observed = 0
+        present = 0
+        for report in batch.sessions:
+            axis = report.process_v2.axes.get(axis_id) if report.process_v2 is not None else None
+            if axis is not None:
+                present += 1
+                observed += axis.metric.status == "observed"
+        axes[axis_id] = {"sessions": present, "observed": observed}
+    return {
+        "session_count": len(batch.sessions),
+        "processing_status": batch.processing_status,
+        "axis_observations": axes,
+    }
 
 
 def _wrap_visible(text: str, width: int) -> List[str]:

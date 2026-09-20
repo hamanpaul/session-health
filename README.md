@@ -311,7 +311,7 @@ agent analysis 都必須明確選擇。`--profile legacy` 才會啟用歷史 heu
 
 - `--format html` 或輸出 `.html` 才會產生 HTML 報告
 - `--analyze` 才會啟用外部 agent analysis
-- parse failure 會保留在 batch 報告中，並以 `partial`/`failed` 狀態與非零 exit code 表示
+- parse failure 會保留在 batch 報告中；`partial` 回傳 exit code 2，`failed` 回傳 exit code 1
 
 ### 可攜式離線分析
 
@@ -334,13 +334,16 @@ session-health --dir ./fixtures --offline --format json
 ```
 
 Bundle 只保留 bounded canonical events/facts、相對 source refs、redacted evidence、
-case candidates 與 observation cutoffs；redaction 是有限的 heuristic 偵測，不能宣稱
+case candidates 與 observation cutoffs；當 bundle byte/event budget 觸頂時，證據 projection
+會縮減並明示 `partial`，完整的 typed numeric facts 仍分開保存；redaction 是有限的 heuristic 偵測，不能宣稱
 找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
 join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
 
 Raw JSONL 讀取 budget 與 bundle budget 是兩個獨立邊界：預設 raw input 上限為 128 MiB、
 `50000` 筆 record、單筆 `1000000` 字元，可用 `--max-input-bytes`、
-`--max-input-records`、`--max-input-record-chars` 個別調整。超過 raw budget 時保留已讀
+`--max-input-records`、`--max-input-record-chars` 個別調整。Portable bundle 另有預設 2 MiB
+與 10000 events 上限，可用 `--max-bundle-bytes`、`--max-bundle-events` 調整；超過 bundle
+budget 時保留 bounded prefix 並標成 `partial`。超過 raw budget 時保留已讀
 prefix 並標成 `partial`/`failed`；不會把較小的 portable bundle 上限誤當成 raw session
 上限。Bundle 的文字 evidence 仍會 bounded，但 SNR 所需的完整 numeric noise facts 會
 一併保存，因此直接解析與 export/import replay 的可觀察統計一致。
@@ -358,6 +361,7 @@ usage: eval_session [-h] [--dir DIR] [--latest N]
                     [--source {auto,codex,copilot}]
                     [--max-input-bytes N] [--max-input-records N]
                     [--max-input-record-chars N]
+                    [--max-bundle-bytes N] [--max-bundle-events N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
                     [--analyze] [--test-agent]
@@ -380,6 +384,8 @@ options:
   --max-input-bytes N        raw JSONL 讀取上限（預設：128 MiB，超限保留 partial prefix）
   --max-input-records N      raw JSONL record 上限（預設：50000）
   --max-input-record-chars N 單筆 raw JSONL 字元上限（預設：1000000）
+  --max-bundle-bytes N      portable bundle byte budget（預設：2000000）
+  --max-bundle-events N     portable bundle event budget（預設：10000）
   --format, -f {radar,table,json,html}
                              輸出格式（預設：radar）
   --no-color                 停用 ANSI 色彩
