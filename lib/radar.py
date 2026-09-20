@@ -17,6 +17,7 @@ from dataclasses import asdict
 from typing import Dict, List
 
 from .agent_analysis import render_agent_terminal
+from .jev_analysis import render_semantic_terminal
 from .report_types import BatchReport, DiagnosisSummary, ProblemMapDiagnosis, SessionReport
 from .scorer import SessionScore
 
@@ -300,6 +301,8 @@ def render_report_terminal(report: SessionReport, use_color: bool = True) -> str
             rendered = "null" if value is None else f"{value:.3f}"
             lines.append(f"  {axis_id:5s} {rendered:>7s}  {axis.metric.status}  ({axis.metric.reason})")
         parts.append("\n".join(lines))
+    if report.semantic is not None:
+        parts.append(render_semantic_terminal(report.semantic, use_color=use_color))
     return "\n".join(part for part in parts if part)
 
 
@@ -331,9 +334,9 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
             lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
         lines.append("-" * 150)
         if item.profile == "legacy":
-            lines.append(f"{'Session':20s} {'Status':9s} {'Score':>7s} {'Grade':6s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
+            lines.append(f"{'Session':20s} {'Status':9s} {'Score':>7s} {'Grade':6s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s} {'Semantic':>16s}")
         else:
-            lines.append(f"{'Session':20s} {'Status':9s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
+            lines.append(f"{'Session':20s} {'Status':9s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s} {'Semantic':>16s}")
         lines.append("-" * 150)
         for report in item.sessions:
             session_id = (report.score.session_id or "unknown")[:24]
@@ -345,12 +348,15 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
                 coverage = _format_process_coverage(report.process_v2)
             else:
                 values = ["null"] * 7
+            semantic_status = "—"
+            if report.semantic is not None:
+                semantic_status = f"{report.semantic.status}/{report.semantic.live_status}"
             if item.profile == "legacy":
                 score = "unknown" if status == "failed" else f"{report.score.composite:.1f}"
                 grade = "unknown" if status == "failed" else report.score.grade
-                lines.append(f"{session_id:20s} {status:9s} {score:>7s} {grade:6s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
+                lines.append(f"{session_id:20s} {status:9s} {score:>7s} {grade:6s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s} {semantic_status:>16s}")
             else:
-                lines.append(f"{session_id:20s} {status:9s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
+                lines.append(f"{session_id:20s} {status:9s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s} {semantic_status:>16s}")
         lines.append("-" * 150)
         return "\n".join(lines)
 
@@ -363,6 +369,8 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
         lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
     if isinstance(item, SessionReport):
         lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
+        if item.semantic is not None:
+            lines.append(f"Semantic: {item.semantic.status} / {item.semantic.live_status}")
         if item.profile == "legacy" and item.diagnosis_summary is not None:
             lines.append(f"加權診斷: {item.diagnosis_summary.summary_zh}")
         elif item.profile == "legacy" and item.problemmap is not None:
@@ -424,6 +432,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
             }
             if item.agent_analysis is not None
             else None,
+            "semantic": item.semantic.to_dict() if item.semantic is not None and hasattr(item.semantic, "to_dict") else None,
             "sessions": [
                 json.loads(render_json(report))
                 for report in item.sessions
@@ -503,6 +512,7 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
                 }
                 if item.agent_analysis is not None
                 else None,
+                "semantic": item.semantic.to_dict() if item.semantic is not None and hasattr(item.semantic, "to_dict") else None,
             }
         )
     return json.dumps(payload, indent=2, ensure_ascii=False)

@@ -23,10 +23,28 @@ required for the offline parser and `process-v2` report.
 ```bash
 python3 eval_session.py SESSION.jsonl --offline --format json
 python3 eval_session.py --dir ./sessions --offline --format table
+python3 eval_session.py SESSION.jsonl --jev --format json
 ```
 
 Use `--analyze` only when an explicit external agent analysis is wanted;
 offline mode never calls a model, network, or agent CLI.
+
+### Optional Jev semantic judgments
+
+`--jev` adds a bounded semantic layer on top of the portable offline facts. It
+uses one shared, redacted state snapshot for versioned SNR/STATE/CTX/REACT/
+DEPTH/CONV/TOOL questions, preserves typed Choice/Noul/Score answers, and
+records request attempts and provider-reported usage. It does not enable
+`--analyze` or any generative report automatically. Request, case, question,
+attempt, timeout, and conservative UTF-8 byte budgets can be lowered with the
+`--jev-max-*` and `--jev-timeout` options.
+
+The HTTP adapter reads `TYPESAFE_API_KEY` only from the process environment and
+never writes it to reports, bundles, argv, or diagnostics. Without a key (or
+with `--offline`) the report keeps the deterministic process-v2 result and
+marks Jev as `live_status: deferred`; this is not a live/API validation. Mock
+backends are only synthetic regression fixtures, and their results are labeled
+as mock rather than live.
 
 ## Version
 
@@ -370,7 +388,11 @@ usage: eval_session [-h] [--dir DIR] [--latest N]
                     [--max-bundle-bytes N] [--max-bundle-events N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
-                    [--analyze] [--test-agent]
+                    [--analyze] [--jev] [--jev-model MODEL]
+                    [--jev-endpoint URL] [--jev-max-requests N]
+                    [--jev-max-attempts N] [--jev-max-questions N]
+                    [--jev-max-cases N] [--jev-timeout SECONDS]
+                    [--test-agent]
                     [--offline] [--profile {legacy,process-v2}]
                     [--export-bundle FILE_OR_DIR] [--outcome-file FILE]
                     [SESSION_OR_PATH]
@@ -398,6 +420,14 @@ options:
   --output FILE, -o FILE     輸出至檔案（副檔名 .html/.json 自動偵測格式）
   --verbose, -v              顯示每輪詳細分數
   --analyze, -a              啟用 AI Agent 分析（僅限單一 session）
+  --jev                       啟用有界 Jev typed semantic judgments，不會自動分析
+  --jev-model MODEL           記錄明示的 Jev evaluator model identity
+  --jev-endpoint URL          覆寫 Jev endpoint
+  --jev-max-requests N        Jev request budget（預設：8）
+  --jev-max-attempts N        Jev attempt budget（預設：12）
+  --jev-max-questions N       每個 Jev request 的 question budget（預設：64）
+  --jev-max-cases N           semantic case budget（預設：32）
+  --jev-timeout SECONDS       Jev request timeout（預設：30）
   --test-agent               使用測試用 agent（copilot/gpt-5-mini）
   --offline                  關閉 model/network，只做本機 deterministic 分析
   --profile {legacy,process-v2}

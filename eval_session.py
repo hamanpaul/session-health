@@ -46,6 +46,8 @@ from lib.agent_analysis import (
     prepare_batch_analysis_prompt,
     call_agent,
 )
+from lib.jev_analysis import SemanticEvaluation, evaluate_session_semantic
+from lib.semantic_backend import SemanticBudget, build_default_backend
 
 
 def detect_source(path: Path) -> str:
@@ -129,6 +131,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
     return parsed
 
 
@@ -319,6 +328,58 @@ def main() -> None:
         help="Run AI agent analysis on the session (single session only)",
     )
     parser.add_argument(
+        "--jev",
+        action="store_true",
+        help="Run bounded optional Jev semantic judgments; does not enable generative analysis",
+    )
+    parser.add_argument(
+        "--jev-model",
+        default="",
+        metavar="MODEL",
+        help="Requested Jev evaluator model identity (recorded, never inferred)",
+    )
+    parser.add_argument(
+        "--jev-endpoint",
+        default=None,
+        metavar="URL",
+        help="Jev endpoint override (default: Typesafe systemone endpoint)",
+    )
+    parser.add_argument(
+        "--jev-max-requests",
+        type=_positive_int,
+        default=8,
+        metavar="N",
+        help="Maximum Jev requests for this run (default: 8)",
+    )
+    parser.add_argument(
+        "--jev-max-attempts",
+        type=_positive_int,
+        default=12,
+        metavar="N",
+        help="Maximum Jev HTTP attempts for this run (default: 12)",
+    )
+    parser.add_argument(
+        "--jev-max-questions",
+        type=_positive_int,
+        default=64,
+        metavar="N",
+        help="Maximum questions in one Jev request (default: 64)",
+    )
+    parser.add_argument(
+        "--jev-max-cases",
+        type=_positive_int,
+        default=32,
+        metavar="N",
+        help="Maximum semantic cases (default: 32)",
+    )
+    parser.add_argument(
+        "--jev-timeout",
+        type=_positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Jev request timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
         "--test-agent",
         action="store_true",
         help="Use test agent (copilot/gpt-5-mini) instead of production chain",
@@ -438,7 +499,7 @@ def main() -> None:
                 session = bundle.to_session()
             else:
                 session = parse_session(path, source, input_limits=input_limits)
-            if args.profile == "process-v2" or args.export_bundle or args.offline:
+            if args.profile == "process-v2" or args.export_bundle or args.offline or args.jev:
                 if bundle is None:
                     bundle = build_session_bundle(session, limits=bundle_limits)
             sc = score_session(session)
@@ -565,6 +626,68 @@ def main() -> None:
         },
         sync_status="session-only",
     )
+
+    if args.jev:
+        semantic_budget = SemanticBudget(
+            max_requests=args.jev_max_requests,
+            max_attempts=max(args.jev_max_attempts, args.jev_max_requests),
+            max_questions=args.jev_max_questions,
+            max_cases=args.jev_max_cases,
+            timeout_seconds=args.jev_timeout,
+        )
+        semantic_backend = build_default_backend(
+            offline=args.offline,
+            endpoint=args.jev_endpoint,
+            model=args.jev_model,
+        )
+        for report in reports:
+            try:
+                semantic = evaluate_session_semantic(
+                    report.session,
+                    backend=semantic_backend,
+                    budget=semantic_budget,
+                    offline=args.offline,
+                )
+                report.semantic = semantic
+                if "semantic" not in report.analysis_layers:
+                    report.analysis_layers.append("semantic")
+                if semantic.status in {"partial", "failed", "unknown"} and report.processing_status == "complete":
+                    report.processing_status = "partial"
+                    report.processing_diagnostics.append({
+                        "kind": "semantic_processing",
+                        "status": semantic.status,
+                        "message": "offline facts retained; semantic coverage is incomplete",
+                    })
+            except Exception as exc:
+                # A remote semantic failure must never discard the deterministic
+                # report.  Keep the failure bounded and machine-readable.
+                report.semantic = SemanticEvaluation(
+                    status="failed",
+                    live_status="failed",
+                    backend=type(semantic_backend).__name__,
+                    diagnostics=[{
+                        "kind": "semantic_exception",
+                        "status": "failed",
+                        "message": f"{type(exc).__name__}: {exc}"[:300],
+                    }],
+                )
+                report.processing_status = "partial" if report.processing_status == "complete" else report.processing_status
+                report.processing_diagnostics.append({
+                    "kind": "semantic_exception",
+                    "status": "failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                })
+        batch_report.analysis_layers = sorted({layer for report in reports for layer in report.analysis_layers} | {"quantitative"})
+        batch_report.processing_status = (
+            "failed" if any(report.processing_status == "failed" for report in reports)
+            else "partial" if any(report.processing_status == "partial" for report in reports)
+            else "complete"
+        )
+        batch_report.processing_diagnostics = [
+            {"session_id": report.score.session_id, "status": report.processing_status, "diagnostics": report.processing_diagnostics}
+            for report in reports
+            if report.processing_status != "complete"
+        ]
 
     if args.analyze and args.offline:
         # Explicit offline mode wins over positional auto-analysis and over an

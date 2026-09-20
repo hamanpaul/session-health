@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-20
+
+- Added explicit `--jev` semantic reporting with bounded typed Choice/Noul/Score
+  batches, seven versioned axis question groups, shared redacted state,
+  request-level provenance/usage accounting, and deferred status when live Jev
+  credentials are unavailable.
+
 ## 2026-09-19
 
 - Added nested Codex call/result and Copilot JSON-string argument pairing with

@@ -14,6 +14,7 @@ import math
 from typing import Dict, List, Tuple
 
 from .agent_analysis import render_agent_html_section
+from .jev_analysis import render_semantic_html
 from .report_types import BatchReport, DiagnosisSummary, ProblemMapDiagnosis, SessionReport
 from .scorer import SessionScore
 
@@ -522,6 +523,7 @@ def _render_process_v2_document(report: SessionReport) -> str:
     extra_sections = "".join(
         [
             _render_process_v2_html(report.process_v2),
+            render_semantic_html(report.semantic),
             _render_artifact_sources_html(report.artifact_sources),
             render_agent_html_section(report.agent_analysis)
             if report.agent_analysis is not None
@@ -585,6 +587,9 @@ def _render_batch_html(batch: BatchReport) -> str:
             )
             coverage = report.process_v2.coverage or {}
             process_coverage = f"{coverage.get('observed_axis_count', 'unknown')}/{coverage.get('axis_count', 'unknown')}"
+        semantic_status = "—"
+        if report.semantic is not None:
+            semantic_status = f"{report.semantic.status} / {report.semantic.live_status}"
         legacy_score = "—" if report.processing_status == "failed" else f"{report.score.composite:.1f}"
         legacy_grade = "—" if report.processing_status == "failed" else report.score.grade
         diagnostic = "; ".join(
@@ -605,6 +610,7 @@ def _render_batch_html(batch: BatchReport) -> str:
                 <td>{status}</td>
                 {legacy_cells}
                 {diagnosis_cells}
+                <td>{semantic_status}</td>
                 <td><code>{process_axes}</code></td>
                 <td>{coverage}</td>
                 <td>{diagnostic}</td>
@@ -614,6 +620,7 @@ def _render_batch_html(batch: BatchReport) -> str:
                 status=html.escape(report.processing_status),
                 legacy_cells=legacy_cells,
                 diagnosis_cells=diagnosis_cells,
+                semantic_status=html.escape(semantic_status),
                 process_axes=html.escape(process_axes),
                 coverage=html.escape(process_coverage),
                 diagnostic=html.escape(diagnostic or "—"),
@@ -649,6 +656,11 @@ def _render_batch_html(batch: BatchReport) -> str:
     agent_section = ""
     if batch.agent_analysis is not None:
         agent_section = render_agent_html_section(batch.agent_analysis)
+    semantic_section = "".join(
+        render_semantic_html(report.semantic)
+        for report in batch.sessions
+        if report.semantic is not None
+    )
     diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary) if batch.profile == "legacy" else ""
     if batch.profile == "legacy":
         summary_headers = """
@@ -737,6 +749,7 @@ pre {{
                 <th>Status</th>
                 {summary_headers}
                 {diagnosis_headers}
+                <th>Semantic</th>
                 <th>process-v2 axes</th>
                 <th>Coverage</th>
                 <th>Diagnostics</th>
@@ -753,6 +766,7 @@ pre {{
 </div>
 {diagnosis_section}
 {agent_section}
+{semantic_section}
 </body>
 </html>
 """
@@ -785,6 +799,7 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
         extra_sections = "".join(
             [
                 _render_process_v2_html(item.process_v2),
+                render_semantic_html(item.semantic),
                 _render_diagnosis_summary_html(item.diagnosis_summary),
                 _render_artifact_sources_html(item.artifact_sources),
                 render_agent_html_section(item.agent_analysis)

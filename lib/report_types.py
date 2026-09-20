@@ -77,6 +77,9 @@ class SessionReport:
     processing_status: str = "complete"
     processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     analysis_status: str = "not_requested"
+    # Optional Jev semantic layer.  It is additive and never replaces the
+    # offline process-v2 facts or the legacy score.
+    semantic: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -89,6 +92,8 @@ class SessionReport:
                 self.analysis_layers.append("agent")
             if self.process_v2 is not None:
                 self.analysis_layers.append("process-v2")
+            if self.semantic is not None:
+                self.analysis_layers.append("semantic")
 
     @property
     def report_kind(self) -> str:
@@ -113,6 +118,7 @@ class BatchReport:
     processing_status: str = "complete"
     processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     analysis_status: str = "not_requested"
+    semantic: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -125,6 +131,8 @@ class BatchReport:
                 layers.add("agent")
             if self.profile == "process-v2":
                 layers.add("process-v2")
+            if self.semantic is not None:
+                layers.add("semantic")
             self.analysis_layers = sorted(layers)
 
     @property
