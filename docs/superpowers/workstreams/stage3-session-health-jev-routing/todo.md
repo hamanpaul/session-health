@@ -14,7 +14,7 @@ This is execution slice 3/3 of the accepted [master plan](../../plans/session-he
 
 Prerequisite: session-health-jev-semantic must be independently accepted and its exact candidate integrated into the canonical local base before intake. Do not dispatch concurrently against a stale base.
 
-Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.1-pro-high, read-only exact candidate. One builder writer; no other repository, registry, credentials, push/PR/merge/deploy mutations by builder. Follow master plan section 9. Unhandled defects/gaps fail review; documented bounded residual risk alone does not, unless reviewer rebuts its impact analysis. Findings: at most 10 BLOCKER/MAJOR with reproducible triggers, file locations and PASS/FAIL.
+Builder: codex/gpt-5.6-luna with max; reviewer: agy/gemini-3.8-flash-high with high, read-only exact candidate. One builder writer; no other repository, registry, credentials, push/PR/merge/deploy mutations by builder. Follow master plan section 9. Unhandled defects/gaps fail review; documented bounded residual risk alone does not, unless reviewer rebuts its impact analysis. Findings: at most 10 BLOCKER/MAJOR with reproducible triggers, file locations and PASS/FAIL.
 
 
 ## Tasks
