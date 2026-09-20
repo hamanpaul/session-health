@@ -25,3 +25,7 @@ rejecting gross contradictions. Reused backends expose per-session ledger and
 usage snapshots; aggregate request, attempt, and byte budgets remain bounded at
 backend-instance scope. Offline parser diagnostic provenance is also aligned
 with the accepted prerequisite repair.
+
+The follow-up offline repair treats JSON boolean `exitCode` values as unknown
+rather than integer exit codes, and keeps long session IDs within the fixed
+batch-table column width.

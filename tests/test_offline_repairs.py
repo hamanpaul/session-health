@@ -16,7 +16,7 @@ from lib.parser_base import Session, SessionInputLimits, ToolCall, Turn
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.radar import render_table
-from lib.report_types import SessionReport
+from lib.report_types import BatchReport, SessionReport
 from lib.scorer import score_session
 
 
@@ -122,6 +122,58 @@ class OfflineRepairTest(unittest.TestCase):
                 self.assertIs(type(diagnostic["line"]), int)
                 self.assertEqual(diagnostic["line"], 3)
                 self.assertEqual(diagnostic["source_ref"], f"{path.name}#L3")
+
+    def test_structured_boolean_exit_codes_remain_unknown(self) -> None:
+        cases = (
+            (
+                parse_codex_session,
+                [
+                    {"type": "session_meta", "payload": {"id": "structured-codex"}},
+                    {"type": "response_item", "payload": {"role": "user", "content": [{"type": "input_text", "text": "run"}]}},
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "bash", "call_id": "call-1", "arguments": {}}},
+                    {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-1", "output": "ok", "exitCode": None}},
+                ],
+            ),
+            (
+                parse_copilot_session,
+                [
+                    {"type": "session.start", "data": {"sessionId": "structured-copilot"}},
+                    {"type": "user.message", "data": {"content": "run"}},
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1", "toolName": "bash", "arguments": {}}},
+                    {"type": "tool.execution_complete", "data": {"toolCallId": "tool-1", "result": {"content": "ok"}, "exitCode": None}},
+                ],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (parser, records) in enumerate(cases):
+                for exit_code in (True, False, 0, 1):
+                    if parser is parse_codex_session:
+                        records[-1]["payload"]["exitCode"] = exit_code
+                    else:
+                        records[-1]["data"]["exitCode"] = exit_code
+                    path = Path(directory) / f"structured-{index}-{str(exit_code).lower()}.jsonl"
+                    _write_jsonl(path, records)
+                    session = parser(path)
+                    turn = session.turns[0]
+                    expected = isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                    self.assertEqual(turn.context_meta.get("exit_code_present", False), expected)
+                    self.assertEqual(turn.tool_calls[0].exit_code, exit_code if expected else None)
+
+    def test_batch_table_keeps_status_column_aligned_for_long_ids(self) -> None:
+        session = Session(
+            id="s" * 24,
+            source="codex",
+            turns=[Turn(index=1, user_input="run")],
+        )
+        report = SessionReport(session=session, score=score_session(session))
+        lines = render_table(
+            BatchReport(sessions=[report], profile="process-v2"),
+            use_color=False,
+        ).splitlines()
+        header = next(line for line in lines if line.startswith("Session"))
+        row = next(line for line in lines if line.startswith("s" * 20))
+        self.assertEqual(row.index("complete"), header.index("Status"))
+        self.assertNotIn("s" * 21, row)
 
     def test_r3_source_coverage_is_separate_from_observed_fact_replay(self) -> None:
         records = [

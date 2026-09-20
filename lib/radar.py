@@ -339,7 +339,7 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
             lines.append(f"{'Session':20s} {'Status':9s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s} {'Semantic':>16s}")
         lines.append("-" * 150)
         for report in item.sessions:
-            session_id = (report.score.session_id or "unknown")[:24]
+            session_id = (report.score.session_id or "unknown")[:20]
             status = report.processing_status
             values: List[str] = []
             coverage = "unknown"

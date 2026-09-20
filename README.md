@@ -61,6 +61,10 @@ for a batch, each session report snapshots only its own request/attempt usage,
 while request, attempt, and byte caps remain aggregate at backend-instance
 scope and are disclosed in provenance.
 
+Structured `exitCode` metadata counts as present only when its JSON value is an
+integer; JSON booleans remain unknown. Batch tables truncate session IDs to the
+declared 20-character column so long IDs do not shift later fields.
+
 ## Version
 
 0.1.0

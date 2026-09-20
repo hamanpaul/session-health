@@ -8,4 +8,6 @@
 - [x] Repair pre-archive native Score finite-precision decoding, per-session
   ledger snapshots with aggregate backend budgets, and accepted offline
   diagnostic provenance.
+- [x] Repair structured boolean exit-code presence guards and batch-table
+  session-ID column width with focused regression coverage and documentation.
 - [ ] Submit this pre-archive candidate to the existing adversarial review and root verification gates.
