@@ -82,8 +82,46 @@ class OfflineRepairTest(unittest.TestCase):
             lines = path.read_bytes().splitlines(keepends=True)
             partial_limit = len(lines[0]) + len(lines[1])
             partial = parse_codex_session(path, input_limits=SessionInputLimits(max_bytes=partial_limit))
-            self.assertTrue(any(item.get("kind") == "input_byte_limit_exceeded" for item in partial.diagnostics))
+            byte_diagnostic = next(item for item in partial.diagnostics if item.get("kind") == "input_byte_limit_exceeded")
+            self.assertEqual(byte_diagnostic["status"], "partial")
             self.assertTrue(partial.turns)
+
+            first_record_chars = len(lines[0].decode("utf-8").rstrip("\r\n"))
+            oversized = parse_codex_session(path, input_limits=SessionInputLimits(max_record_chars=first_record_chars))
+            oversized_diagnostic = next(item for item in oversized.diagnostics if item.get("kind") == "oversize_record")
+            self.assertEqual(oversized_diagnostic["status"], "partial")
+
+            no_usable_records = parse_codex_session(path, input_limits=SessionInputLimits(max_record_chars=10))
+            no_usable_diagnostic = next(item for item in no_usable_records.diagnostics if item.get("kind") == "oversize_record")
+            self.assertEqual(no_usable_diagnostic["status"], "failed")
+
+    def test_missing_result_diagnostics_keep_numeric_line_and_source_ref(self) -> None:
+        cases = (
+            (
+                parse_codex_session,
+                [
+                    {"type": "session_meta", "payload": {"id": "missing-codex"}},
+                    {"type": "response_item", "payload": {"role": "user", "content": [{"type": "input_text", "text": "run"}]}},
+                    {"type": "response_item", "payload": {"type": "function_call", "name": "bash", "arguments": {}, "call_id": "call-1"}},
+                ],
+            ),
+            (
+                parse_copilot_session,
+                [
+                    {"type": "session.start", "data": {"sessionId": "missing-copilot"}},
+                    {"type": "user.message", "data": {"content": "run"}},
+                    {"type": "tool.execution_start", "data": {"toolCallId": "tool-1", "toolName": "bash", "arguments": {}}},
+                ],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (parser, records) in enumerate(cases):
+                path = Path(directory) / f"missing-{index}.jsonl"
+                _write_jsonl(path, records)
+                diagnostic = next(item for item in parser(path).diagnostics if item.get("kind") == "missing_call_result")
+                self.assertIs(type(diagnostic["line"]), int)
+                self.assertEqual(diagnostic["line"], 3)
+                self.assertEqual(diagnostic["source_ref"], f"{path.name}#L3")
 
     def test_r3_source_coverage_is_separate_from_observed_fact_replay(self) -> None:
         records = [
@@ -99,6 +137,8 @@ class OfflineRepairTest(unittest.TestCase):
                 path,
                 input_limits=SessionInputLimits(max_records=2),
             )
+            record_diagnostic = next(item for item in session.diagnostics if item.get("kind") == "record_limit_exceeded")
+            self.assertEqual(record_diagnostic["status"], "partial")
             bundle = build_session_bundle(session)
             self.assertEqual(bundle.coverage["input_status"], "partial")
             self.assertFalse(bundle.coverage["input_complete"])

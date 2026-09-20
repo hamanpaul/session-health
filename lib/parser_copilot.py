@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .parser_base import Session, SessionInputLimits, ToolCall, Turn, read_jsonl_records
+from .parser_base import Session, SessionInputLimits, ToolCall, Turn, read_jsonl_records, source_ref_line
 
 
 def parse_copilot_session(
@@ -403,7 +403,8 @@ def parse_copilot_session(
                         "kind": "missing_call_result",
                         "call_id": call.call_id,
                         "raw_call_id": raw_id,
-                        "line": call.source_ref,
+                        "line": source_ref_line(call.source_ref),
+                        "source_ref": call.source_ref,
                         "status": "unknown",
                     }
                 )
