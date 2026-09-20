@@ -103,7 +103,7 @@ class RoutingContextTest(unittest.TestCase):
     def test_capability_evidence_is_sanitized_bounded_and_kept_in_operator_card(self):
         evidence = {
             "provenance": "provider_advertised",
-            "description": "/home/paul_chen/private description",
+            "description": r"C:\fixture-account\private description",
             "api_key": "do-not-export",
             "nested": {"text": "x" * 20_000},
         }
@@ -112,7 +112,7 @@ class RoutingContextTest(unittest.TestCase):
         encoded = json.dumps(payload, ensure_ascii=False)
         self.assertEqual(payload["capability_evidence"]["provenance"], "provider_advertised")
         self.assertNotIn("do-not-export", encoded)
-        self.assertNotIn("/home/paul_chen", encoded)
+        self.assertNotIn("fixture-account", encoded)
         self.assertLess(len(encoded.encode("utf-8")), 9_000)
         self.assertEqual(candidate.clone().to_dict(), payload)
 
