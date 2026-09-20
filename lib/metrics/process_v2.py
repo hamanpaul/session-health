@@ -15,7 +15,7 @@ import shlex
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from ..bundle import SessionBundle
-from ..parser_base import Session, ToolCall, Turn
+from ..parser_base import Session, ToolCall, Turn, argument_fingerprint, command_fingerprint
 from .snr import SNRResult, analyze_snr
 
 
@@ -157,6 +157,52 @@ def _calls(session: Session) -> List[ToolCall]:
     return [call for turn in session.turns for call in turn.tool_calls]
 
 
+_INPUT_PARTIAL_KINDS = {
+    "input_byte_limit_exceeded",
+    "record_limit_exceeded",
+    "oversize_record",
+    "malformed_record",
+    "non_object_record",
+    "malformed_payload",
+    "bundle_input_coverage",
+}
+
+
+def _processing_status(session: Session, bundle: SessionBundle | None) -> str:
+    """Classify source processing without conflating evidence caps."""
+
+    input_status = _input_status(session, bundle)
+    if input_status == "failed":
+        return "failed"
+    if input_status == "partial":
+        return "partial"
+    # Semantic parser diagnostics (duplicate IDs, unknown records, and
+    # missing results) are honest partial observations even when every source
+    # record was read.  They do not make an evidence-only event cap partial.
+    if session.diagnostics:
+        return "partial"
+    return "complete"
+
+
+def _input_status(session: Session, bundle: SessionBundle | None) -> str:
+    """Return original source-read status, excluding semantic warnings."""
+
+    if bundle is not None and isinstance(bundle.coverage, Mapping):
+        declared = str(bundle.coverage.get("input_status", ""))
+        if declared in {"complete", "partial", "failed"}:
+            return declared
+    kinds = {
+        str(item.get("kind", ""))
+        for item in session.diagnostics
+        if isinstance(item, Mapping)
+    }
+    if "parse_failure" in kinds:
+        return "failed"
+    if kinds & _INPUT_PARTIAL_KINDS:
+        return "partial"
+    return "complete"
+
+
 def _status(call: ToolCall) -> str:
     if call.success is True or call.exit_code == 0:
         return "success"
@@ -263,34 +309,73 @@ def _state_axis(session: Session, bundle: SessionBundle | None) -> AxisObservati
     fields = ("cwd_present", "exit_code_present", "permission_present", "git_present")
     present: Dict[str, int] = {field_name: 0 for field_name in fields}
     observed: Dict[str, int] = {field_name: 0 for field_name in fields}
+    emitted: Dict[str, int] = {field_name: 0 for field_name in fields}
+
+    def normalized_key(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+    aliases = {
+        "cwd_present": ("cwd_present", "cwd", "working_directory", "workingDirectory"),
+        "exit_code_present": ("exit_code_present", "exit_code", "exitCode"),
+        "permission_present": ("permission_present", "permission", "permissions"),
+        "git_present": ("git_present", "git", "git_status"),
+    }
+
+    def lookup(mapping: Mapping[str, Any], names: Sequence[str]) -> tuple[bool, Any, str]:
+        for name in names:
+            for key, value in mapping.items():
+                if normalized_key(key) == normalized_key(name):
+                    return True, value, normalized_key(name)
+        return False, None, ""
+
+    def field_observation(turn: Turn, call: ToolCall, field_name: str) -> tuple[bool, bool]:
+        names = aliases[field_name]
+        context = turn.context_meta if isinstance(turn.context_meta, Mapping) else {}
+        metadata = call.result_metadata if isinstance(call.result_metadata, Mapping) else {}
+        found, raw, matched = lookup(context, names)
+        if not found:
+            found, raw, matched = lookup(metadata, names)
+        if not found and field_name == "exit_code_present" and call.exit_code is not None:
+            return True, True
+        if not found and field_name == "cwd_present" and session.cwd:
+            # Session-level cwd is inherited context, unless an explicit
+            # per-turn field above said false.
+            return True, True
+        if not found:
+            return False, False
+        if field_name == "exit_code_present" and matched in {"exitcode", "exitcodepresent"}:
+            return True, bool(raw) if isinstance(raw, bool) else raw is not None
+        if isinstance(raw, bool):
+            return True, raw
+        return True, bool(raw)
+
     for turn in applicable:
         for call in turn.tool_calls:
-            metadata = call.result_metadata if isinstance(call.result_metadata, Mapping) else {}
-            values = {
-                "cwd_present": bool(turn.context_meta.get("cwd_present") or metadata.get("cwd") or metadata.get("working_directory") or metadata.get("workingDirectory") or session.cwd),
-                "exit_code_present": call.exit_code is not None or turn.context_meta.get("exit_code_present") is True,
-                "permission_present": bool(turn.context_meta.get("permission_present") or metadata.get("permission") or metadata.get("permissions")),
-                "git_present": bool(turn.context_meta.get("git_present") or metadata.get("git") or metadata.get("git_status")),
-            }
-            for field_name, value in values.items():
-                # Missing fields are unknown, not negative observations.  A
-                # source that actually emits a field participates in its own
-                # denominator; there is no universal four-field penalty.
-                if value or field_name in turn.context_meta or field_name in metadata or (field_name == "exit_code_present" and call.exit_code is not None):
-                    observed[field_name] += 1
-                    if value:
-                        present[field_name] += 1
+            for field_name in fields:
+                was_observed, value = field_observation(turn, call, field_name)
+                if not was_observed:
+                    continue
+                observed[field_name] += 1
+                emitted[field_name] += 1
+                if value:
+                    present[field_name] += 1
     numerator = sum(present.values())
     denominator = sum(observed.values())
+    emitted_fields = [field_name for field_name in fields if emitted[field_name]]
+    total_calls = sum(len(turn.tool_calls) for turn in applicable)
+    excluded = sum(total_calls - observed[field_name] for field_name in emitted_fields)
     if denominator <= 0:
-        metric = _unknown("tool turns were observed, but no typed state fields were emitted", excluded=len(applicable))
+        metric = _unknown("tool turns were observed, but no typed state fields were emitted")
     else:
-        metric = _ratio(numerator, denominator, excluded=max(0, len(applicable) - denominator), reason="present typed state fields / fields actually emitted")
-    observed_turns = sum(1 for turn in applicable if any(turn.context_meta.get(name) is True for name in fields) or any(call.exit_code is not None for call in turn.tool_calls))
+        metric = _ratio(numerator, denominator, excluded=max(0, excluded), reason="present typed state fields / emitted state fields")
+    observed_turns = 0
+    for turn in applicable:
+        if any(field_observation(turn, call, field_name)[0] for call in turn.tool_calls for field_name in fields):
+            observed_turns += 1
     return AxisObservation(
         "STATE",
         metric,
-        {"applicable_turns": len(applicable), "observed_turns": observed_turns, "fields": list(fields), "present_fields": numerator, "observed_fields": observed, "field_presence": present},
+        {"applicable_turns": len(applicable), "observed_turns": observed_turns, "fields": list(fields), "emitted_fields": emitted_fields, "present_fields": numerator, "observed_fields": observed, "field_presence": present, "excluded_fields": {field_name: max(0, total_calls - observed[field_name]) for field_name in emitted_fields}},
         {"quality_judgment": None, "method": "typed_result_and_adapter_context_fields"},
         _event_refs(bundle),
         ["Fields absent from a source record remain unknown and are not treated as a failed universal checklist."],
@@ -349,6 +434,8 @@ def _lifecycle_events(session: Session, bundle: SessionBundle | None) -> List[Ma
             if event.get("kind") == "session_event"
             and isinstance(event.get("payload"), Mapping)
         ]
+    if session.lifecycle_facts:
+        return [item for item in session.lifecycle_facts if isinstance(item, Mapping)]
     if session.event_log:
         return [
             event.get("payload", {})
@@ -370,10 +457,18 @@ def _command_text(call: ToolCall) -> str:
     return str(call.arguments.get("command", call.arguments.get("cmd", "")) or "").strip()
 
 
+def _argument_identity(call: ToolCall) -> str:
+    return call.argument_fingerprint or argument_fingerprint(call.arguments)
+
+
+def _command_identity(call: ToolCall) -> str:
+    return call.command_fingerprint or command_fingerprint(call.arguments)
+
+
 def _related_retry(previous: ToolCall, later: ToolCall) -> bool:
     """Conservatively identify a changed retry in the same episode."""
 
-    if previous.name != later.name or previous.arguments == later.arguments:
+    if previous.name != later.name or _argument_identity(previous) == _argument_identity(later):
         return False
     previous_command = _command_text(previous)
     later_command = _command_text(later)
@@ -389,7 +484,11 @@ def _related_retry(previous: ToolCall, later: ToolCall) -> bool:
             return False
         # A changed argument to the same executable is related.  Different
         # shell commands (e.g. ``false`` then ``pwd``) are separate episodes.
-        return previous_tokens[0].lower() == later_tokens[0].lower()
+        previous_command_identity = _command_identity(previous)
+        later_command_identity = _command_identity(later)
+        if not previous_command_identity or not later_command_identity:
+            return False
+        return previous_command_identity == later_command_identity
     # For structured non-shell tools, retain only stable non-value keys as a
     # bounded relation hint; arbitrary same-name calls are not auto-recovery.
     previous_keys = set(previous.arguments) - {"raw"}
@@ -550,7 +649,7 @@ def _tool_axis(session: Session, bundle: SessionBundle | None) -> AxisObservatio
     successful = sum(1 for call in known if _status(call) == "success")
     redundant = 0
     for previous, current in zip(calls, calls[1:]):
-        if previous.name == current.name and previous.arguments == current.arguments:
+        if previous.name == current.name and _argument_identity(previous) == _argument_identity(current):
             redundant += 1
     metric = _ratio(successful, len(known), excluded=len(calls) - len(known), reason="successful known outcomes / known outcomes")
     return AxisObservation(
@@ -701,14 +800,17 @@ def analyze_process_v2(
 
     axis_builders = (_snr_axis, _state_axis, _ctx_axis, _react_axis, _depth_axis, _conv_axis, _tool_axis)
     axes = {axis.axis_id: axis for axis in (builder(session, bundle) for builder in axis_builders)}
+    processing_status = _processing_status(session, bundle)
     result = ProcessV2Result(
         axes=axes,
+        status=processing_status,
         observed_facts={
             "session_id": session.id,
             "source": session.source,
             "turn_count": len(session.turns),
             "parser_version": session.parser_version,
             "diagnostics": len(session.diagnostics),
+            "input_status": _input_status(session, bundle),
         },
         inference={
             "semantic_judgment": None,
@@ -724,6 +826,7 @@ def analyze_process_v2(
         },
         processing={
             "mode": "offline",
+            "status": processing_status,
             "network": "disabled_by_contract",
             "model": "not_requested",
             "sdk": "not_used",

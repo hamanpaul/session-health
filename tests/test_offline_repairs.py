@@ -85,6 +85,46 @@ class OfflineRepairTest(unittest.TestCase):
             self.assertTrue(any(item.get("kind") == "input_byte_limit_exceeded" for item in partial.diagnostics))
             self.assertTrue(partial.turns)
 
+    def test_r3_source_coverage_is_separate_from_observed_fact_replay(self) -> None:
+        records = [
+            {"type": "session_meta", "payload": {"id": "r3-budgeted"}},
+            {"type": "response_item", "payload": {"role": "user", "content": [{"text": "run"}]}},
+            {"type": "response_item", "payload": {"role": "assistant", "content": [{"text": "done"}]}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "r3-budgeted.jsonl"
+            _write_jsonl(path, records)
+            lines = path.read_bytes().splitlines(keepends=True)
+            session = parse_codex_session(
+                path,
+                input_limits=SessionInputLimits(max_records=2),
+            )
+            bundle = build_session_bundle(session)
+            self.assertEqual(bundle.coverage["input_status"], "partial")
+            self.assertFalse(bundle.coverage["input_complete"])
+            self.assertEqual(bundle.coverage["evidence_status"], "complete")
+            self.assertTrue(bundle.facts["metric_facts"]["complete"])
+            self.assertEqual(bundle.facts["metric_facts"]["input_status"], "partial")
+            replayed = SessionBundle.from_json(bundle.to_json()).to_session()
+            self.assertEqual(analyze_process_v2(session).status, "partial")
+            self.assertEqual(analyze_process_v2(session, bundle).status, "partial")
+            self.assertEqual(analyze_process_v2(replayed, bundle).status, "partial")
+
+            byte_limited = parse_codex_session(
+                path,
+                input_limits=SessionInputLimits(max_bytes=len(lines[0]) + len(lines[1])),
+            )
+            byte_bundle = build_session_bundle(byte_limited)
+            self.assertEqual(byte_bundle.coverage["input_status"], "partial")
+            self.assertTrue(byte_bundle.facts["metric_facts"]["complete"])
+
+        failed = Session(
+            id="r3-failed",
+            source="codex",
+            diagnostics=[{"kind": "parse_failure", "status": "failed"}],
+        )
+        self.assertEqual(analyze_process_v2(failed).status, "failed")
+
     def test_duplicate_ids_never_overwrite_and_result_line_is_retained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -158,6 +198,36 @@ class OfflineRepairTest(unittest.TestCase):
         self.assertIsNone(analyze_process_v2(clean).axes["CTX"].metric.value)
         self.assertIsNone(analyze_process_v2(compacted).axes["CTX"].metric.value)
 
+        metadata_cwd = Session(
+            id="metadata-cwd",
+            source="codex",
+            turns=[Turn(index=1, tool_calls=[ToolCall(name="bash", result_metadata={"cwd": "/synthetic"})])],
+        )
+        metadata_axis = analyze_process_v2(metadata_cwd).axes["STATE"]
+        self.assertEqual(metadata_axis.metric.value, 1.0)
+        self.assertEqual(metadata_axis.observed_facts["observed_turns"], 1)
+
+        explicit_absent = Session(
+            id="explicit-absent",
+            source="codex",
+            cwd="/inherited",
+            turns=[Turn(index=1, context_meta={"cwd_present": False}, tool_calls=[ToolCall(name="bash")])],
+        )
+        absent_axis = analyze_process_v2(explicit_absent).axes["STATE"]
+        self.assertEqual(absent_axis.metric.value, 0.0)
+
+        known_then_unknown = Session(
+            id="known-then-unknown",
+            source="codex",
+            turns=[
+                Turn(index=1, tool_calls=[ToolCall(name="bash", exit_code=0, result_metadata={"cwd": "/synthetic"})]),
+                Turn(index=2, tool_calls=[ToolCall(name="bash")]),
+            ],
+        )
+        mixed_axis = analyze_process_v2(known_then_unknown).axes["STATE"]
+        self.assertEqual(mixed_axis.observed_facts["observed_turns"], 1)
+        self.assertEqual(mixed_axis.metric.coverage, 0.5)
+
     def test_lifecycle_and_external_join_do_not_overclaim(self) -> None:
         lifecycle = Session(id="lifecycle", source="codex", task_started_count=10, task_complete_count=1)
         lifecycle_result = analyze_process_v2(lifecycle).axes["CONV"].metric
@@ -213,6 +283,15 @@ class OfflineRepairTest(unittest.TestCase):
         non_finite["facts"]["bad"] = float("nan")
         with self.assertRaises(BundleError):
             SessionBundle.from_dict(non_finite)
+        for source_ref in ("C:/Users/synthetic/session.jsonl", r"C:\Users\synthetic\session.jsonl"):
+            invalid_windows_ref = bundle.to_dict()
+            invalid_windows_ref["manifest"]["source_ref"] = source_ref
+            with self.assertRaises(BundleError):
+                SessionBundle.from_dict(invalid_windows_ref)
+            invalid_session_ref = bundle.to_dict()
+            invalid_session_ref["session"]["source_ref"] = source_ref
+            with self.assertRaises(BundleError):
+                SessionBundle.from_dict(invalid_session_ref)
 
     def test_cli_batch_keeps_statuses_formats_and_returns_nonzero_for_partial(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -279,6 +358,18 @@ class OfflineRepairTest(unittest.TestCase):
         self.assertNotIn("radar", rendered.lower())
         self.assertNotIn("grade", rendered.lower())
 
+    def test_single_process_table_has_no_legacy_diagnosis_surface(self) -> None:
+        session = Session(id="table-process", source="codex", turns=[Turn(index=1, user_input="run")])
+        report = SessionReport(
+            session=session,
+            score=score_session(session),
+            profile="process-v2",
+            process_v2=analyze_process_v2(session),
+        )
+        rendered = render_table(report, use_color=False)
+        self.assertNotIn("量化面總分", rendered)
+        self.assertIn("Process-v2 observable axes:", rendered)
+
     def test_r2_bundle_projection_is_bounded_and_keeps_typed_facts(self) -> None:
         session = Session(
             id="many-turns",
@@ -319,6 +410,93 @@ class OfflineRepairTest(unittest.TestCase):
             analyze_process_v2(capped_source).axes["SNR"].metric.denominator,
             analyze_process_v2(restored, capped).axes["SNR"].metric.denominator,
         )
+
+    def test_bounded_replay_preserves_exact_argument_identity(self) -> None:
+        prefix = "pytest " + ("synthetic_prefix_" * 80)
+        suffix = " " + ("synthetic_suffix_" * 80)
+        commands = (
+            prefix + " --case=red" + suffix,
+            prefix + " --case=green" + suffix,
+            prefix + " --case=green" + suffix,
+        )
+        session = Session(
+            id="argument-identity",
+            source="codex",
+            turns=[
+                Turn(
+                    index=index,
+                    tool_calls=[
+                        ToolCall(
+                            name="exec_command",
+                            arguments={"cmd": command},
+                            success=success,
+                            exit_code=exit_code,
+                        )
+                    ],
+                )
+                for index, (command, success, exit_code) in enumerate(
+                    zip(commands, (False, True, True), (1, 0, 0)),
+                    1,
+                )
+            ],
+        )
+        bundle = build_session_bundle(session, BundleLimits(max_events=1))
+        restored = SessionBundle.from_json(bundle.to_json()).to_session()
+        original = analyze_process_v2(session)
+        replayed = analyze_process_v2(restored)
+        self.assertEqual(
+            original.axes["REACT"].metric.to_dict(),
+            replayed.axes["REACT"].metric.to_dict(),
+        )
+        self.assertEqual(
+            original.axes["TOOL"].observed_facts["redundant_calls"],
+            replayed.axes["TOOL"].observed_facts["redundant_calls"],
+        )
+        self.assertEqual(
+            session.turns[0].tool_calls[0].argument_fingerprint,
+            restored.turns[0].tool_calls[0].argument_fingerprint,
+        )
+
+    def test_bounded_replay_does_not_relate_redacted_absolute_executables(self) -> None:
+        session = Session(
+            id="redacted-executables",
+            source="codex",
+            turns=[
+                Turn(
+                    index=1,
+                    tool_calls=[
+                        ToolCall(
+                            name="exec_command",
+                            call_id="a",
+                            arguments={"cmd": "/usr/bin/false --attempt=red"},
+                            output="failed",
+                            success=False,
+                            exit_code=1,
+                        )
+                    ],
+                ),
+                Turn(
+                    index=2,
+                    tool_calls=[
+                        ToolCall(
+                            name="exec_command",
+                            call_id="b",
+                            arguments={"cmd": "/usr/bin/true --attempt=green"},
+                            output="succeeded",
+                            success=True,
+                            exit_code=0,
+                        )
+                    ],
+                ),
+            ],
+        )
+        bundle = build_session_bundle(session, BundleLimits(max_events=1))
+        restored = SessionBundle.from_json(bundle.to_json()).to_session()
+        original = analyze_process_v2(session).axes["REACT"]
+        replayed = analyze_process_v2(restored).axes["REACT"]
+        self.assertEqual(original.metric.to_dict(), replayed.metric.to_dict())
+        self.assertEqual(original.observed_facts, replayed.observed_facts)
+        self.assertEqual(replayed.observed_facts["recovered_failures"], 0)
 
     def test_r2_projected_order_is_explicitly_unknown_and_ids_are_replay_stable(self) -> None:
         session = Session(
@@ -367,9 +545,12 @@ class OfflineRepairTest(unittest.TestCase):
         )
         direct = analyze_process_v2(session).axes["CONV"].metric
         replayed_bundle = build_session_bundle(session)
-        replayed = analyze_process_v2(session, replayed_bundle).axes["CONV"].metric
+        restored = SessionBundle.from_json(replayed_bundle.to_json()).to_session()
+        replayed = analyze_process_v2(restored).axes["CONV"].metric
+        replayed_with_bundle = analyze_process_v2(restored, replayed_bundle).axes["CONV"].metric
         self.assertEqual((direct.value, direct.status), (0.5, "observed"))
         self.assertEqual((replayed.value, replayed.status), (0.5, "observed"))
+        self.assertEqual((replayed_with_bundle.value, replayed_with_bundle.status), (0.5, "observed"))
 
 
 if __name__ == "__main__":

@@ -18,3 +18,7 @@
   aggregate narratives; preserve the explicit legacy profile.
 - [x] Repair the pre-archive policy workflow pin and make the test workflow's
   Python/pytest setup self-contained.
+- [x] Repair R3 pre-archive source/fact/evidence coverage, lifecycle and SNR
+  replay fidelity, STATE field precedence, and portable Windows ref validation.
+- [x] Repair pre-archive bounded replay executable identity preservation after
+  redaction, including regression coverage at every event boundary.

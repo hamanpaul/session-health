@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 from pathlib import Path
+import shlex
 from typing import Any, Dict, List, Optional
 
 
@@ -35,6 +37,39 @@ DEFAULT_SESSION_INPUT_LIMITS = SessionInputLimits()
 MAX_SESSION_INPUT_BYTES = DEFAULT_SESSION_INPUT_LIMITS.max_bytes
 MAX_SESSION_RECORDS = DEFAULT_SESSION_INPUT_LIMITS.max_records
 MAX_SESSION_RECORD_CHARS = DEFAULT_SESSION_INPUT_LIMITS.max_record_chars
+
+
+def argument_fingerprint(arguments: Any) -> str:
+    """Return a portable equality token without transporting arguments."""
+
+    try:
+        encoded = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        encoded = repr(arguments)
+    return hashlib.sha256(encoded.encode("utf-8", "replace")).hexdigest()
+
+
+def command_fingerprint(arguments: Any) -> str:
+    """Return a one-way identity token for a shell command executable."""
+
+    if not isinstance(arguments, dict):
+        return ""
+    command = arguments.get("command", arguments.get("cmd", ""))
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return ""
+    if not tokens:
+        return ""
+    return hashlib.sha256(tokens[0].encode("utf-8", "replace")).hexdigest()
 
 
 def read_jsonl_records(
@@ -162,10 +197,16 @@ class ToolCall:
     result_sequence: int = 0
     sequence: int = 0
     result_metadata: Dict[str, Any] = field(default_factory=dict)
+    argument_fingerprint: str = ""
+    command_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         """Keep the three-valued outcome explicit and backwards compatible."""
 
+        if not self.argument_fingerprint:
+            self.argument_fingerprint = argument_fingerprint(self.arguments)
+        if not self.command_fingerprint:
+            self.command_fingerprint = command_fingerprint(self.arguments)
         if not self.raw_call_id:
             self.raw_call_id = self.call_id
         if self.success is True:
@@ -242,6 +283,10 @@ class Session:
     # Adapter-owned ordered records.  Bundle construction uses this when it is
     # available so a later result cannot be moved ahead of an earlier claim.
     event_log: List[Dict[str, Any]] = field(default_factory=list)
+    # Typed lifecycle identity facts may outlive a bounded event projection.
+    # They are intentionally separate from event_log because replay must not
+    # invent chronology merely to retain task pairing evidence.
+    lifecycle_facts: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def turn_count(self) -> int:

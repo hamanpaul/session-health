@@ -456,9 +456,15 @@ def main() -> None:
                 else None
             )
             status = "complete" if session.turns else "failed"
-            if bundle is not None and bundle.coverage.get("status") == "truncated" and status == "complete":
+            if status != "failed" and process_result is not None and process_result.status == "failed":
+                status = "failed"
+            elif status != "failed" and bundle is not None and bundle.coverage.get("input_status") == "failed":
+                status = "failed"
+            elif status != "failed" and process_result is not None and process_result.status == "partial":
                 status = "partial"
-            if session.diagnostics and status == "complete":
+            elif status != "failed" and bundle is not None and bundle.coverage.get("input_status") == "partial":
+                status = "partial"
+            elif session.diagnostics and status == "complete":
                 status = "partial"
             processing_diagnostics.extend(session.diagnostics)
             reports.append(

@@ -363,9 +363,9 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
         lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
     if isinstance(item, SessionReport):
         lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
-        if item.diagnosis_summary is not None:
+        if item.profile == "legacy" and item.diagnosis_summary is not None:
             lines.append(f"加權診斷: {item.diagnosis_summary.summary_zh}")
-        elif item.problemmap is not None:
+        elif item.profile == "legacy" and item.problemmap is not None:
             lines.append(f"ProblemMap 主家族: {item.problemmap.atlas.get('primary_family_zh', item.problemmap.atlas.get('primary_family', '未解析'))}")
     if not isinstance(item, SessionReport) or item.profile == "legacy":
         lines.append("-" * 50)

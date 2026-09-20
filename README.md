@@ -339,6 +339,12 @@ case candidates 與 observation cutoffs；當 bundle byte/event budget 觸頂時
 找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
 join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
 
+Bundle coverage 會分開記錄 `input_status`/`input_complete`、`facts_status`/`facts_complete`
+與 `evidence_status`：raw source 讀取不完整時保留已讀 prefix facts，但 processing status
+會是 `partial` 或 `failed`；只有 evidence projection 觸頂時，不會因為可重播的 typed
+facts 被截短而誤報 raw input 不完整。STATE 只在 source 實際發出欄位時計入分母，並保留
+per-turn 明確 `false` 與 inherited cwd 的差異。
+
 Raw JSONL 讀取 budget 與 bundle budget 是兩個獨立邊界：預設 raw input 上限為 128 MiB、
 `50000` 筆 record、單筆 `1000000` 字元，可用 `--max-input-bytes`、
 `--max-input-records`、`--max-input-record-chars` 個別調整。Portable bundle 另有預設 2 MiB

@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Mapping, Optional
 
-from .parser_base import Session, ToolCall, Turn
+from .parser_base import Session, ToolCall, Turn, argument_fingerprint, command_fingerprint
 
 
 BUNDLE_SCHEMA = "session-health.session-bundle"
@@ -173,6 +173,45 @@ def _relative_source_ref(source_ref: str) -> str:
     return f"{name}#{suffix}" if marker and suffix else name
 
 
+_INPUT_PARTIAL_KINDS = {
+    "input_byte_limit_exceeded",
+    "record_limit_exceeded",
+    "oversize_record",
+    "malformed_record",
+    "non_object_record",
+    "malformed_payload",
+    "bundle_input_coverage",
+}
+
+
+def _input_coverage(session: Session) -> Dict[str, Any]:
+    """Classify source-read completeness separately from evidence projection.
+
+    Parser diagnostics can describe a complete source with ambiguous semantic
+    records (for example duplicate call IDs).  Only diagnostics that mean
+    records were not fully readable/usable affect the source-read contract.
+    """
+
+    kinds = sorted(
+        {
+            str(item.get("kind", "unknown"))
+            for item in session.diagnostics
+            if isinstance(item, Mapping)
+        }
+    )
+    if "parse_failure" in kinds:
+        status = "failed"
+    elif any(kind in _INPUT_PARTIAL_KINDS for kind in kinds):
+        status = "partial"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "complete": status == "complete",
+        "diagnostic_kinds": kinds,
+    }
+
+
 def _stable_id(*parts: Any) -> str:
     payload = "|".join(str(part) for part in parts).encode("utf-8", "replace")
     return hashlib.sha256(payload).hexdigest()[:20]
@@ -189,6 +228,63 @@ def _safe_status(call: ToolCall) -> str:
 def _observed_output_chars(turn: Turn) -> int:
     visible = sum(len(call.output or "") for call in turn.tool_calls)
     return max(int(turn.raw_tool_output_chars or 0), visible)
+
+
+_SNR_FACT_NAMES = ("total_chars", "noise_chars", "ansi_chars", "progress_chars", "duplicate_chars")
+
+
+def _snr_snapshot(turn: Turn) -> Dict[str, int]:
+    """Return stable typed SNR facts, including on a replayed projection."""
+
+    facts = turn.snr_facts
+    if facts and all(
+        isinstance(facts.get(name), int)
+        and not isinstance(facts.get(name), bool)
+        and facts.get(name, 0) >= 0
+        for name in _SNR_FACT_NAMES
+    ):
+        return {name: int(facts[name]) for name in _SNR_FACT_NAMES}
+    from .metrics.snr import analyze_snr
+
+    result = analyze_snr(turn)
+    return {
+        "total_chars": int(result.total_chars),
+        "noise_chars": int(result.noise_chars),
+        "ansi_chars": int(result.ansi_chars),
+        "progress_chars": int(result.progress_chars),
+        "duplicate_chars": int(result.duplicate_chars),
+    }
+
+
+def _redact_metric_value(value: Any, max_chars: int, counters: Dict[str, int], key: Any = "") -> Any:
+    """Redact bounded metric identity while retaining both command edges."""
+
+    if _key_name(key) in _SENSITIVE_KEYS:
+        counters["patterns"] += 1
+        return "[REDACTED]"
+    if isinstance(value, str):
+        # Redact before retaining the suffix so a secret cannot be preserved by
+        # the edge-aware truncation.
+        redacted, local = redact_text(value, max_chars=max(len(value), max_chars))
+        counters["patterns"] += local["patterns"]
+        if "absolute_paths" in local:
+            counters["absolute_paths"] = counters.get("absolute_paths", 0) + local["absolute_paths"]
+        if len(redacted) <= max_chars:
+            return redacted
+        marker = "…[TRUNCATED]…"
+        available = max(1, max_chars - len(marker))
+        head = available // 2
+        tail = available - head
+        counters["truncated_chars"] += len(redacted) - max_chars
+        return redacted[:head] + marker + redacted[-tail:]
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _redact_metric_value(item, max_chars, counters, item_key)
+            for item_key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_metric_value(item, max_chars, counters) for item in value]
+    return value
 
 
 def _safe_turn_event(event: Any, counters: Dict[str, int]) -> Dict[str, Any]:
@@ -305,8 +401,6 @@ def _canonical_session(
     # Keep the complete numeric noise facts even when the textual output below
     # is bounded.  Import locally to avoid making the parser/bundle layer
     # depend on process-v2 at module import time.
-    from .metrics.snr import analyze_snr
-
     projection: Dict[int, Dict[str, Any]] | None = None
     if events is not None:
         projection = {}
@@ -366,8 +460,8 @@ def _canonical_session(
         turn_projection = projection.get(turn.index) if projection is not None else None
         if projection is not None and turn_projection is None:
             continue
-        snr = analyze_snr(turn)
-        observed_total = max(int(turn.raw_tool_output_chars or 0), snr.total_chars)
+        snr = _snr_snapshot(turn)
+        observed_total = max(int(turn.raw_tool_output_chars or 0), snr["total_chars"])
         kinds = turn_projection["kinds"] if turn_projection is not None else {
             "user_message",
             "assistant_message",
@@ -414,6 +508,8 @@ def _canonical_session(
                 {
                     "name": call.name,
                     "arguments": arguments,
+                    "argument_fingerprint": call.argument_fingerprint or argument_fingerprint(call.arguments),
+                    "command_fingerprint": call.command_fingerprint or command_fingerprint(call.arguments),
                     "call_id": call.call_id,
                     "raw_call_id": call.raw_call_id or call.call_id,
                     "output": output,
@@ -455,10 +551,10 @@ def _canonical_session(
                 "total_context_chars": turn.total_context_chars,
                 "snr_facts": {
                     "total_chars": observed_total,
-                    "noise_chars": snr.noise_chars,
-                    "ansi_chars": snr.ansi_chars,
-                    "progress_chars": snr.progress_chars,
-                    "duplicate_chars": snr.duplicate_chars,
+                    "noise_chars": snr["noise_chars"],
+                    "ansi_chars": snr["ansi_chars"],
+                    "progress_chars": snr["progress_chars"],
+                    "duplicate_chars": snr["duplicate_chars"],
                 },
                 "diagnostics": _redact_value(turn.diagnostics, 500, counters),
             }
@@ -563,14 +659,13 @@ def _build_facts(
     session: Session,
     events: List[Dict[str, Any]],
     counters: Dict[str, int],
+    input_coverage: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     calls = [call for turn in session.turns for call in turn.tool_calls]
     known = [call for call in calls if _safe_status(call) != "unknown"]
-    from .metrics.snr import analyze_snr
-
     turn_facts: List[Dict[str, Any]] = []
     for turn in session.turns:
-        snr = analyze_snr(turn)
+        snr = _snr_snapshot(turn)
         turn_facts.append(
             {
                 "index": turn.index,
@@ -578,11 +673,11 @@ def _build_facts(
                 "tool_call_count": len(turn.tool_calls),
                 "raw_tool_output_chars": _observed_output_chars(turn),
                 "snr_facts": {
-                    "total_chars": max(_observed_output_chars(turn), snr.total_chars),
-                    "noise_chars": snr.noise_chars,
-                    "ansi_chars": snr.ansi_chars,
-                    "progress_chars": snr.progress_chars,
-                    "duplicate_chars": snr.duplicate_chars,
+                    "total_chars": max(_observed_output_chars(turn), snr["total_chars"]),
+                    "noise_chars": snr["noise_chars"],
+                    "ansi_chars": snr["ansi_chars"],
+                    "progress_chars": snr["progress_chars"],
+                    "duplicate_chars": snr["duplicate_chars"],
                 },
                 "context_fields": sorted(
                     str(key) for key, value in turn.context_meta.items() if value is True
@@ -591,6 +686,16 @@ def _build_facts(
                     str(key): _redact_value(value, 100, counters, key)
                     for key, value in turn.context_meta.items()
                     if key in {"task_ref", "session_ref", "continuity_event"}
+                },
+                "context_presence": {
+                    str(key): bool(value)
+                    for key, value in turn.context_meta.items()
+                    if re.sub(r"[^a-z0-9]", "", str(key).lower()) in {
+                        "cwdpresent",
+                        "exitcodepresent",
+                        "permissionpresent",
+                        "gitpresent",
+                    }
                 },
                 "event_types": sorted(
                     str(event.get("type", ""))
@@ -606,7 +711,9 @@ def _build_facts(
                 {
                     "turn_index": turn.index,
                     "name": call.name,
-                    "arguments": _redact_value(call.arguments, 300, counters),
+                    "arguments": _redact_metric_value(call.arguments, 1_000, counters),
+                    "argument_fingerprint": call.argument_fingerprint or argument_fingerprint(call.arguments),
+                    "command_fingerprint": call.command_fingerprint or command_fingerprint(call.arguments),
                     "call_id": call.call_id,
                     "raw_call_id": call.raw_call_id or call.call_id,
                     "status": _safe_status(call),
@@ -617,12 +724,19 @@ def _build_facts(
                 }
             )
     lifecycle_facts: List[Dict[str, Any]] = []
-    lifecycle_source = session.event_log or [
-        {"kind": "session_event", "payload": event}
-        for turn in session.turns
-        for event in turn.events
-        if isinstance(event, Mapping)
-    ]
+    if session.lifecycle_facts:
+        lifecycle_source = [
+            {"kind": "session_event", "payload": event}
+            for event in session.lifecycle_facts
+            if isinstance(event, Mapping)
+        ]
+    else:
+        lifecycle_source = session.event_log or [
+            {"kind": "session_event", "payload": event}
+            for turn in session.turns
+            for event in turn.events
+            if isinstance(event, Mapping)
+        ]
     for event in lifecycle_source:
         if not isinstance(event, Mapping) or event.get("kind") != "session_event":
             continue
@@ -673,7 +787,14 @@ def _build_facts(
             "turns": turn_facts,
             "calls": call_facts,
             "lifecycle": lifecycle_facts,
+            # ``complete`` means the typed facts are complete for the
+            # observed prefix.  It must remain true for bounded raw input so
+            # replay can retain valid facts without pretending the source was
+            # complete.
             "complete": True,
+            "scope": "observed_input",
+            "input_status": str((input_coverage or {}).get("status", "complete")),
+            "input_complete": bool((input_coverage or {}).get("complete", True)),
         },
     }
 
@@ -813,12 +934,29 @@ class SessionBundle:
             events, coverage = _build_events(session, limits, counters, event_limit=event_budget)
             evidence, cases = _build_evidence_and_cases(session, events, limits, counters)
             canonical = _canonical_session(session, counters, events=events)
-            facts = _build_facts(session, events, counters)
+            input_coverage = _input_coverage(session)
+            facts = _build_facts(session, events, counters, input_coverage)
             source_capabilities = _safe_capabilities(session.source_capabilities, counters)
             coverage["canonical_turns"] = len(canonical.get("turns", []))
             coverage["canonical_calls"] = sum(
                 len(turn.get("tool_calls", []))
                 for turn in canonical.get("turns", [])
+            )
+            evidence_status = str(coverage.get("status", "complete"))
+            coverage.update(
+                {
+                    "status": (
+                        str(input_coverage["status"])
+                        if input_coverage["status"] != "complete"
+                        else evidence_status
+                    ),
+                    "input_status": input_coverage["status"],
+                    "input_complete": input_coverage["complete"],
+                    "input_diagnostic_kinds": input_coverage["diagnostic_kinds"],
+                    "evidence_status": evidence_status,
+                    "facts_status": "complete_observed_input",
+                    "facts_complete": True,
+                }
             )
             return cls(
                 manifest={
@@ -918,6 +1056,11 @@ class SessionBundle:
                 raise BundleError("bundle metric fact turn limit exceeded")
             if not isinstance(fact_calls, list) or len(fact_calls) > limits.max_tool_calls:
                 raise BundleError("bundle metric fact tool-call limit exceeded")
+            for fact_call in fact_calls:
+                if isinstance(fact_call, Mapping) and "argument_fingerprint" in fact_call:
+                    _validate_argument_fingerprint(fact_call["argument_fingerprint"])
+                if isinstance(fact_call, Mapping) and "command_fingerprint" in fact_call:
+                    _validate_argument_fingerprint(fact_call["command_fingerprint"])
         if not isinstance(payload.get("diagnostics", []), list):
             raise BundleError("bundle diagnostics must be a list")
         manifest = payload.get("manifest", {})
@@ -985,6 +1128,8 @@ class SessionBundle:
         session_payload = payload.get("session", {})
         if not isinstance(session_payload, Mapping):
             raise BundleError("bundle session must be an object")
+        if session_payload.get("source_ref") is not None:
+            _validate_relative_ref(session_payload["source_ref"])
         turns = session_payload.get("turns", [])
         if not isinstance(turns, list) or len(turns) > limits.max_turns:
             raise BundleError("bundle turn limit exceeded")
@@ -1016,6 +1161,10 @@ class SessionBundle:
                 for call_text in ("call_id", "raw_call_id", "output", "status", "source_ref", "result_source_ref", "timestamp", "result_timestamp"):
                     if not isinstance(raw_call.get(call_text, ""), str):
                         raise BundleError(f"bundle tool call {call_text} must be a string")
+                if "argument_fingerprint" in raw_call:
+                    _validate_argument_fingerprint(raw_call["argument_fingerprint"])
+                if "command_fingerprint" in raw_call:
+                    _validate_argument_fingerprint(raw_call["command_fingerprint"])
                 success = raw_call.get("success")
                 if success is not None and not isinstance(success, bool):
                     raise BundleError("bundle tool call success must be boolean or null")
@@ -1087,6 +1236,17 @@ class SessionBundle:
             source_capabilities=dict(raw.get("source_capabilities", self.source_capabilities)) if isinstance(raw.get("source_capabilities", self.source_capabilities), Mapping) else dict(self.source_capabilities),
             event_log=list(self.events),
         )
+        input_status = str(self.coverage.get("input_status", "complete"))
+        if input_status != "complete" and not any(
+            isinstance(item, Mapping) and item.get("kind") == "bundle_input_coverage"
+            for item in session.diagnostics
+        ):
+            session.diagnostics.append(
+                {
+                    "kind": "bundle_input_coverage",
+                    "status": input_status,
+                }
+            )
         for raw_turn in raw.get("turns", []):
             turn = Turn(
                 index=int(raw_turn.get("index", len(session.turns) + 1)),
@@ -1108,6 +1268,8 @@ class SessionBundle:
                 call = ToolCall(
                     name=str(raw_call.get("name", "unknown")),
                     arguments=dict(raw_call.get("arguments", {})) if isinstance(raw_call.get("arguments", {}), Mapping) else {},
+                    argument_fingerprint=str(raw_call.get("argument_fingerprint", "")),
+                    command_fingerprint=str(raw_call.get("command_fingerprint", "")),
                     call_id=str(raw_call.get("call_id", "")),
                     raw_call_id=str(raw_call.get("raw_call_id", raw_call.get("call_id", ""))),
                     output=str(raw_call.get("output", "")),
@@ -1132,6 +1294,13 @@ class SessionBundle:
         # payloads or bypassing the portable evidence cap.
         metric_facts = self.facts.get("metric_facts", {})
         if isinstance(metric_facts, Mapping) and metric_facts.get("complete") is True:
+            raw_lifecycle_facts = metric_facts.get("lifecycle", [])
+            if isinstance(raw_lifecycle_facts, list):
+                session.lifecycle_facts = [
+                    dict(item)
+                    for item in raw_lifecycle_facts
+                    if isinstance(item, Mapping)
+                ]
             turns_by_index = {turn.index: turn for turn in session.turns}
             raw_fact_turns = metric_facts.get("turns", [])
             if isinstance(raw_fact_turns, list):
@@ -1165,6 +1334,11 @@ class SessionBundle:
                     for field_name in raw_fact.get("context_fields", []):
                         if isinstance(field_name, str):
                             turn.context_meta[field_name] = True
+                    context_presence = raw_fact.get("context_presence", {})
+                    if isinstance(context_presence, Mapping):
+                        for field_name, value in context_presence.items():
+                            if isinstance(field_name, str) and isinstance(value, bool):
+                                turn.context_meta[field_name] = value
                     context_values = raw_fact.get("context_values", {})
                     if isinstance(context_values, Mapping):
                         for field_name, value in context_values.items():
@@ -1194,12 +1368,37 @@ class SessionBundle:
                         continue
                     call_id = str(raw_fact.get("call_id", ""))
                     name = str(raw_fact.get("name", "unknown"))
-                    if any(call.call_id == call_id and call.name == name for call in turn.tool_calls):
+                    existing = next(
+                        (
+                            call
+                            for call in turn.tool_calls
+                            if call.call_id == call_id and call.name == name
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        if not existing.argument_fingerprint:
+                            existing.argument_fingerprint = str(raw_fact.get("argument_fingerprint", ""))
+                        if not existing.command_fingerprint:
+                            existing.command_fingerprint = str(raw_fact.get("command_fingerprint", ""))
+                        if not existing.arguments and isinstance(raw_fact.get("arguments", {}), Mapping):
+                            existing.arguments = dict(raw_fact["arguments"])
+                        if existing.success is None and isinstance(raw_fact.get("success"), bool):
+                            existing.success = raw_fact["success"]
+                        if existing.exit_code is None and isinstance(raw_fact.get("exit_code"), int) and not isinstance(raw_fact.get("exit_code"), bool):
+                            existing.exit_code = raw_fact["exit_code"]
+                        if existing.status == "unknown":
+                            existing.status = str(raw_fact.get("status", "unknown"))
+                        if not existing.result_metadata and isinstance(raw_fact.get("result_metadata", {}), Mapping):
+                            existing.result_metadata = dict(raw_fact["result_metadata"])
+                        existing.__post_init__()
                         continue
                     status = str(raw_fact.get("status", "unknown"))
                     call = ToolCall(
                         name=name,
                         arguments=dict(raw_fact.get("arguments", {})) if isinstance(raw_fact.get("arguments", {}), Mapping) else {},
+                        argument_fingerprint=str(raw_fact.get("argument_fingerprint", "")),
+                        command_fingerprint=str(raw_fact.get("command_fingerprint", "")),
                         call_id=call_id,
                         raw_call_id=str(raw_fact.get("raw_call_id", call_id)),
                         success=raw_fact.get("success") if isinstance(raw_fact.get("success"), bool) else None,
@@ -1240,8 +1439,21 @@ def _validate_relative_ref(value: Any) -> None:
     if not isinstance(value, str) or not value:
         raise BundleError("bundle source refs must be non-empty strings")
     normalized = value.replace("\\", "/")
-    if normalized.startswith("/") or ".." in Path(normalized.split("#", 1)[0]).parts:
+    path_part = normalized.split("#", 1)[0]
+    if (
+        normalized.startswith("/")
+        or normalized.startswith("//")
+        or re.match(r"^[A-Za-z]:/", normalized)
+        or ".." in Path(path_part).parts
+    ):
         raise BundleError("bundle source ref must be relative")
+
+
+def _validate_argument_fingerprint(value: Any) -> None:
+    if value in (None, ""):
+        return
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise BundleError("bundle argument fingerprint must be a SHA-256 hex string")
 
 
 def _validate_refs(value: Any, allowed: set[str], label: str) -> None:
