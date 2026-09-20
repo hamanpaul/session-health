@@ -502,11 +502,67 @@ def _render_process_v2_html(process_result: object | None) -> str:
 <div class="agent-analysis">
     <h2>Process-v2 observable profile</h2>
     <p>Ratios are evidence-bounded; null means the axis was not applicable or lacked an observable denominator.</p>
-    <p>The legacy composite shown in the compatibility radar remains heuristic and uncalibrated; it is not a process-v2 score.</p>
+    <p>Only observable axis evidence is shown; no aggregate score is computed.</p>
     <table><thead><tr><th>Axis</th><th>Value</th><th>Status</th><th>Observation</th></tr></thead>
     <tbody>{rows}</tbody></table>
 </div>
 """.format(rows="".join(rows))
+
+
+def _render_process_v2_document(report: SessionReport) -> str:
+    """Render a single process-v2 report without legacy score surfaces."""
+
+    score = report.score
+    sid = html.escape(score.session_id or "unknown")
+    source = html.escape(score.source or "unknown")
+    model = html.escape(score.model or "unknown")
+    diagnostics = html.escape(
+        json.dumps(report.processing_diagnostics, indent=2, ensure_ascii=False)
+    )
+    extra_sections = "".join(
+        [
+            _render_process_v2_html(report.process_v2),
+            _render_diagnosis_summary_html(report.diagnosis_summary),
+            _render_artifact_sources_html(report.artifact_sources),
+            render_agent_html_section(report.agent_analysis)
+            if report.agent_analysis is not None
+            else "",
+        ]
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Health Process-v2 Report</title>
+<style>
+body {{ font-family: sans-serif; background: #1a1a2e; color: #e8e8e8; line-height: 1.6; padding: 2rem; max-width: 1000px; margin: 0 auto; }}
+.card, .agent-analysis {{ background: #16213e; border: 1px solid #2a2a4a; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+h1, h2 {{ color: #4fc3f7; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ border-bottom: 1px solid #2a2a4a; padding: .75rem; text-align: left; vertical-align: top; }}
+th {{ color: #4fc3f7; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #0f3460; border-radius: 8px; padding: 1rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Session Health Process-v2 Report</h1>
+<p>Session: {sid} ｜ Source: {source} ｜ Model: {model} ｜ Turns: {score.turn_count}</p>
+<p>Profile: process-v2 ｜ processing_status: {html.escape(report.processing_status)}</p>
+</div>
+{extra_sections}
+<div class="card">
+<h2>Processing diagnostics</h2>
+<pre>{diagnostics}</pre>
+</div>
+</body>
+</html>
+"""
+
+
+def _format_process_value(value: object) -> str:
+    return "null" if value is None else f"{float(value):.3f}"
 
 
 def _render_batch_html(batch: BatchReport) -> str:
@@ -521,21 +577,45 @@ def _render_batch_html(batch: BatchReport) -> str:
             route = report.problemmap.global_fix_route.get("minimal_fix_zh") or report.problemmap.global_fix_route.get("minimal_fix") or json.dumps(
                 report.problemmap.global_fix_route, ensure_ascii=False
             )
+        process_axes = "—"
+        process_coverage = "—"
+        if report.process_v2 is not None:
+            process_axes = " ".join(
+                f"{axis_id}={_format_process_value(report.process_v2.axes.get(axis_id).metric.value if report.process_v2.axes.get(axis_id) else None)}"
+                for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL")
+            )
+            coverage = report.process_v2.coverage or {}
+            process_coverage = f"{coverage.get('observed_axis_count', 'unknown')}/{coverage.get('axis_count', 'unknown')}"
+        legacy_score = "—" if batch.profile != "legacy" or report.processing_status == "failed" else f"{report.score.composite:.1f}"
+        legacy_grade = "—" if batch.profile != "legacy" or report.processing_status == "failed" else report.score.grade
+        diagnostic = "; ".join(
+            str(item.get("message", item.get("kind", "")))
+            for item in report.processing_diagnostics[:3]
+            if isinstance(item, dict)
+        )
         rows.append(
             """
             <tr>
                 <td>{session_id}</td>
+                <td>{status}</td>
                 <td>{score}</td>
                 <td>{grade}</td>
                 <td>{primary}</td>
                 <td>{route}</td>
+                <td><code>{process_axes}</code></td>
+                <td>{coverage}</td>
+                <td>{diagnostic}</td>
             </tr>
             """.format(
                 session_id=html.escape(report.score.session_id or "unknown"),
-                score=html.escape(f"{report.score.composite:.1f}"),
-                grade=html.escape(report.score.grade),
+                status=html.escape(report.processing_status),
+                score=html.escape(legacy_score),
+                grade=html.escape(legacy_grade),
                 primary=html.escape(primary),
                 route=html.escape(route),
+                process_axes=html.escape(process_axes),
+                coverage=html.escape(process_coverage),
+                diagnostic=html.escape(diagnostic or "—"),
             )
         )
 
@@ -614,7 +694,7 @@ pre {{
 <body>
 <div class="card">
     <h1>⚔ Session Health Batch Report</h1>
-    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Layers: {html.escape(layers)}</p>
+    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Profile: {html.escape(batch.profile)} ｜ processing_status: {html.escape(batch.processing_status)} ｜ Layers: {html.escape(layers)}</p>
 </div>
 <div class="card">
     <h2>📋 Batch Summary</h2>
@@ -622,10 +702,14 @@ pre {{
         <thead>
             <tr>
                 <th>Session</th>
+                <th>Status</th>
                 <th>Score</th>
                 <th>Grade</th>
                 <th>主家族</th>
                 <th>最小修復動作</th>
+                <th>process-v2 axes</th>
+                <th>Coverage</th>
+                <th>Diagnostics</th>
             </tr>
         </thead>
         <tbody>
@@ -648,6 +732,8 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     """Generate a complete standalone HTML report."""
     if isinstance(item, BatchReport):
         return _render_batch_html(item)
+    if isinstance(item, SessionReport) and item.profile != "legacy":
+        return _render_process_v2_document(item)
 
     score = item.score if isinstance(item, SessionReport) else item
     axes = score.radar_axes

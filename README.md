@@ -7,6 +7,33 @@
 
 ---
 
+## Install
+
+```bash
+git clone https://github.com/hamanpaul/session-health.git
+cd session-health
+./install.sh
+```
+
+The CLI uses Python 3.8+ and the standard library. No package installation is
+required for the offline parser and `process-v2` report.
+
+## Usage
+
+```bash
+python3 eval_session.py SESSION.jsonl --offline --format json
+python3 eval_session.py --dir ./sessions --offline --format table
+```
+
+Use `--analyze` only when an explicit external agent analysis is wanted;
+offline mode never calls a model, network, or agent CLI.
+
+## Version
+
+0.1.0
+
+---
+
 ## 設計理念
 
 在 Agent CLI（如 Codex CLI、Copilot CLI）的工作流程中，每一輪送給 LLM 的 **動態 Prompt** 品質，直接決定了模型能否做出正確的判斷與行動。然而，這些 Prompt 的品質往往是隱性的——使用者難以直觀感受到「這次 session 為什麼跑偏了」或「為什麼模型一直重複同樣的錯誤」。
@@ -278,11 +305,13 @@ source ~/.bashrc
 
 ## 使用方式
 
-如果你直接給 `Session ID`、`session 目錄` 或 `sessions 目錄` 作為唯一參數，`session-health` 會自動走 **bundle 模式**：
+如果你直接給 `Session ID`、session 檔案或 sessions 目錄作為唯一參數，`session-health`
+預設走 deterministic `process-v2`，只輸出本機可觀察的 terminal 報告；HTML 與外部
+agent analysis 都必須明確選擇。`--profile legacy` 才會啟用歷史 heuristic composite。
 
-- terminal 先輸出摘要分數條
-- 同步產生 HTML 報告
-- 盡可能補上 weighted diagnosis（含 PM 欄位中文說明與 Fx 比重）與 agent analysis
+- `--format html` 或輸出 `.html` 才會產生 HTML 報告
+- `--analyze` 才會啟用外部 agent analysis
+- parse failure 會保留在 batch 報告中，並以 `partial`/`failed` 狀態與非零 exit code 表示
 
 ### 可攜式離線分析
 
@@ -387,7 +416,7 @@ session-health --dir ~/.codex/sessions/2026/02/
 
 # ── 輸出格式 ──
 
-# RPG 進度條（預設）
+# process-v2 observable axes（預設）
 session-health 019c8d32
 
 # JSON 輸出（可串接其他工具）
@@ -419,7 +448,9 @@ session-health 019c8d32 --analyze --test-agent
 
 ### 輸出範例
 
-#### 終端 RPG 進度條
+#### Legacy 終端 RPG 進度條
+
+只有明示 `--profile legacy` 時才會顯示歷史 composite/A–F radar。
 
 ```
 ╔════════════════════════════════════════════════════════╗

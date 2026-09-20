@@ -275,7 +275,11 @@ def render_diagnosis_summary_terminal(
 def render_report_terminal(report: SessionReport, use_color: bool = True) -> str:
     """Render the terminal bundle for a single session report."""
 
-    parts = [render_radar(report, use_color)]
+    parts: List[str] = []
+    if report.profile == "legacy":
+        parts.append(render_radar(report, use_color))
+    else:
+        parts.append(f"Process-v2 report: {report.session.id or 'unknown'}  status={report.processing_status}")
     diagnosis_box = render_diagnosis_summary_terminal(report.diagnosis_summary, use_color)
     if diagnosis_box:
         parts.append(diagnosis_box)
@@ -324,35 +328,67 @@ def render_table(item: SessionScore | SessionReport | BatchReport, use_color: bo
         lines.append(f"Batch: {len(item.sessions)} sessions  Target: {item.target_kind}")
         if item.profile:
             lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
-        lines.append("-" * 88)
-        lines.append(f"{'Session':24s} {'Score':>7s} {'Grade':6s} {'主家族'}")
-        lines.append("-" * 88)
+        lines.append("-" * 150)
+        lines.append(f"{'Session':20s} {'Status':9s} {'Score':>7s} {'Grade':6s} {'SNR':>6s} {'STATE':>6s} {'CTX':>6s} {'REACT':>6s} {'DEPTH':>6s} {'CONV':>6s} {'TOOL':>6s} {'Coverage':>8s}")
+        lines.append("-" * 150)
         for report in item.sessions:
-            primary = "未解析"
-            if report.problemmap is not None:
-                primary = str(report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析")))
             session_id = (report.score.session_id or "unknown")[:24]
-            lines.append(f"{session_id:24s} {report.score.composite:7.1f} {report.score.grade:6s} {primary}")
-        lines.append("-" * 88)
+            status = report.processing_status
+            score = "unknown" if status == "failed" or item.profile != "legacy" else f"{report.score.composite:.1f}"
+            grade = "unknown" if status == "failed" or item.profile != "legacy" else report.score.grade
+            values: List[str] = []
+            coverage = "unknown"
+            if report.process_v2 is not None:
+                values = [_format_process_axis(report.process_v2.axes.get(axis_id).metric.value if report.process_v2.axes.get(axis_id) else None) for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL")]
+                coverage = _format_process_coverage(report.process_v2)
+            else:
+                values = ["null"] * 7
+            lines.append(f"{session_id:20s} {status:9s} {score:>7s} {grade:6s} " + " ".join(f"{value:>6s}" for value in values) + f" {coverage:>8s}")
+        lines.append("-" * 150)
         return "\n".join(lines)
 
     score = _unwrap_score(item)
     lines = []
     lines.append(f"Session: {score.session_id}  ({score.source}, {score.model})")
-    lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
+    if isinstance(item, SessionReport) and item.profile != "legacy":
+        lines.append(f"Turns: {score.turn_count}  Legacy composite: not rendered for profile {item.profile}")
+    else:
+        lines.append(f"Turns: {score.turn_count}  Score: {score.composite:.1f}/100 ({score.grade})")
     if isinstance(item, SessionReport):
         lines.append(f"Profile: {item.profile}  Status: {item.processing_status}")
         if item.diagnosis_summary is not None:
             lines.append(f"加權診斷: {item.diagnosis_summary.summary_zh}")
         elif item.problemmap is not None:
             lines.append(f"ProblemMap 主家族: {item.problemmap.atlas.get('primary_family_zh', item.problemmap.atlas.get('primary_family', '未解析'))}")
-    lines.append("-" * 50)
-    lines.append(f"{'Dim':10s} {'Score':>6s}  {'Grade'}")
-    lines.append("-" * 50)
-    for name, val in score.radar_axes.items():
-        lines.append(f"{name:10s} {val:6.1f}  {_grade_label(val)}")
+    if not isinstance(item, SessionReport) or item.profile == "legacy":
+        lines.append("-" * 50)
+        lines.append(f"{'Dim':10s} {'Score':>6s}  {'Grade'}")
+        lines.append("-" * 50)
+        for name, val in score.radar_axes.items():
+            lines.append(f"{name:10s} {val:6.1f}  {_grade_label(val)}")
+    if isinstance(item, SessionReport) and item.process_v2 is not None:
+        lines.append("-" * 50)
+        lines.append("Process-v2 observable axes:")
+        for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+            axis = item.process_v2.axes.get(axis_id)
+            if axis is not None:
+                lines.append(f"{axis_id:10s} {_format_process_axis(axis.metric.value):>6s}  {axis.metric.status}")
+        lines.append(f"Coverage: {_format_process_coverage(item.process_v2)}")
     lines.append("-" * 50)
     return "\n".join(lines)
+
+
+def _format_process_axis(value: float | None) -> str:
+    return "null" if value is None else f"{value:.3f}"
+
+
+def _format_process_coverage(process_result: object) -> str:
+    coverage = getattr(process_result, "coverage", {}) or {}
+    observed = coverage.get("observed_axis_count")
+    total = coverage.get("axis_count")
+    if observed is None or total is None:
+        return "unknown"
+    return f"{observed}/{total}"
 
 
 def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
@@ -388,33 +424,39 @@ def render_json(item: SessionScore | SessionReport | BatchReport) -> str:
         return json.dumps(payload, indent=2, ensure_ascii=False)
 
     score = _unwrap_score(item)
+    render_legacy = not isinstance(item, SessionReport) or item.profile == "legacy"
     payload = {
         "schema_version": "report-2",
         "session_id": score.session_id,
         "source": score.source,
         "model": score.model,
         "turn_count": score.turn_count,
-        "composite": round(score.composite, 2),
-        "grade": score.grade,
-        "dimensions": {k: round(v, 2) for k, v in score.radar_axes.items()},
-        "stats": {
-            "min": round(score.composite_min, 2),
-            "max": round(score.composite_max, 2),
-            "stddev": round(score.composite_stddev, 2),
-        },
-        "legacy": {
-            "profile": "legacy",
-            "composite": round(score.composite, 2),
-            "grade": score.grade,
-            "status": "heuristic_uncalibrated",
-            "formula_dimensions": ["STATE", "SNR", "REACT", "DEPTH", "CONV"],
-            "note": "Compatibility composite; not the process-v2 score.",
-        },
         "events": {
             "compactions": score.compaction_count,
             "aborts": score.abort_count,
         },
     }
+    if render_legacy:
+        payload.update(
+            {
+                "composite": round(score.composite, 2),
+                "grade": score.grade,
+                "dimensions": {k: round(v, 2) for k, v in score.radar_axes.items()},
+                "stats": {
+                    "min": round(score.composite_min, 2),
+                    "max": round(score.composite_max, 2),
+                    "stddev": round(score.composite_stddev, 2),
+                },
+                "legacy": {
+                    "profile": "legacy",
+                    "composite": round(score.composite, 2),
+                    "grade": score.grade,
+                    "status": "heuristic_uncalibrated",
+                    "formula_dimensions": ["STATE", "SNR", "REACT", "DEPTH", "CONV"],
+                    "note": "Compatibility composite; not the process-v2 score.",
+                },
+            }
+        )
     if isinstance(item, SessionReport):
         payload.update(
             {

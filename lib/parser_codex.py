@@ -1,95 +1,74 @@
 """Codex CLI JSONL session parser.
 
-Parses session logs from ~/.codex/sessions/{YYYY}/{MM}/{session}.jsonl
-Record types: session_meta, response_item, event_msg, function_call,
-              function_call_output, reasoning, state, turn_context, compacted
+The adapter keeps source order and source-line references in ``Session.event_log``.
+Call IDs are only a pairing hint: a repeated ID is ambiguous and is never used
+to overwrite an earlier result.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-from .parser_base import Session, Turn, ToolCall
+from .parser_base import Session, ToolCall, Turn, read_jsonl_records
 
 
 def parse_codex_session(path: str | Path) -> Session:
-    """Parse a Codex CLI JSONL session file into a Session object."""
-    path = Path(path)
-    records: list[dict] = []
-    diagnostics: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line_number, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                if isinstance(record, dict):
-                    record["__source_line__"] = line_number
-                    records.append(record)
-                else:
-                    diagnostics.append({
-                        "kind": "non_object_record",
-                        "line": line_number,
-                        "status": "unknown",
-                    })
-            except json.JSONDecodeError:
-                diagnostics.append({
-                    "kind": "malformed_record",
-                    "line": line_number,
-                    "status": "unknown",
-                })
+    """Parse a bounded Codex CLI JSONL session into a normalized session."""
 
+    path = Path(path)
+    records, diagnostics = read_jsonl_records(path)
     session = Session(
         id="",
         source="codex",
         diagnostics=diagnostics,
-        parser_version="codex-2",
+        parser_version="codex-3",
         source_ref=path.name,
         source_capabilities={
             "format": "codex-jsonl",
             "supports_nested_response_items": True,
             "supports_call_result_pairing": True,
+            "supports_structured_exit_code": True,
             "outcome_states": ["success", "failed", "unknown"],
         },
     )
 
-    # --- Extract session metadata ---
-    for rec in records:
-        rtype = rec.get("type", "")
-        payload = rec.get("payload", {})
-        if rtype == "session_meta" and not isinstance(payload, dict):
+    for record in records:
+        if record.get("type") != "session_meta":
             continue
-
-        if rtype == "session_meta":
-            session.id = payload.get("id", "")
-            session.cwd = payload.get("cwd", "")
-            session.cli_version = payload.get("cli_version", "")
-            session.timestamp_start = rec.get("timestamp", "")
-            model_provider = payload.get("model_provider", "")
-            session.model = payload.get("model", model_provider)
-            session.metadata = payload
-            break
-
-    # Track last timestamp for duration
+        payload = record.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        session.id = str(payload.get("id", "") or "")
+        session.cwd = str(payload.get("cwd", "") or "")
+        session.cli_version = str(payload.get("cli_version", "") or "")
+        session.timestamp_start = str(record.get("timestamp", "") or "")
+        model_provider = payload.get("model_provider", "")
+        session.model = str(payload.get("model", model_provider) or "")
+        session.metadata = dict(payload)
+        break
     if records:
-        session.timestamp_end = records[-1].get("timestamp", "")
-
-    # --- Build turns from response_item records ---
-    # Strategy: group consecutive records into turns.
-    # A new turn starts when we see a user-role response_item.
+        session.timestamp_end = str(records[-1].get("timestamp", "") or "")
 
     turns: List[Turn] = []
     current_turn: Turn | None = None
     turn_idx = 0
-    pending_calls: dict[str, ToolCall] = {}  # call_id → ToolCall
-    pending_results: dict[str, Tuple[str, Dict[str, Any]]] = {}
-    resolved_calls: set[str] = set()
+    pending_calls: dict[str, list[ToolCall]] = {}
+    pending_results: dict[str, list[dict[str, Any]]] = {}
+    resolved_calls: set[int] = set()
+    occurrences: dict[str, int] = {}
+    ambiguous_ids: set[str] = set()
+    call_turns: dict[int, int] = {}
 
     def record_line(record: Dict[str, Any]) -> int:
         return int(record.get("__source_line__", 0) or 0)
+
+    def record_sequence(record: Dict[str, Any]) -> int:
+        return int(record.get("__record_sequence__", record_line(record)) or 0)
+
+    def source_ref(record: Dict[str, Any]) -> str:
+        return f"{path.name}#L{record_line(record)}"
 
     def current_or_new_turn(timestamp: str) -> Turn:
         nonlocal current_turn, turn_idx
@@ -105,13 +84,31 @@ def parse_codex_session(path: str | Path) -> Session:
         if current_turn is not None:
             current_turn.diagnostics.append(diagnostic)
 
+    def append_log(
+        kind: str,
+        record: Dict[str, Any],
+        payload: Dict[str, Any],
+        turn: Turn | None,
+        ref: str | None = None,
+    ) -> None:
+        session.event_log.append(
+            {
+                "sequence": record_sequence(record),
+                "kind": kind,
+                "turn_index": turn.index if turn is not None else None,
+                "timestamp": str(record.get("timestamp", "") or ""),
+                "source_ref": ref or source_ref(record),
+                "payload": payload,
+            }
+        )
+
     def decode_arguments(raw: Any, line_number: int) -> Dict[str, Any]:
         if isinstance(raw, dict):
-            return raw
+            return dict(raw)
         if isinstance(raw, str):
             try:
                 value = json.loads(raw)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 add_diagnostic("malformed_arguments", line_number)
                 return {"raw": raw}
             if isinstance(value, dict):
@@ -124,104 +121,223 @@ def parse_codex_session(path: str | Path) -> Session:
         add_diagnostic("non_object_arguments", line_number)
         return {"raw": raw}
 
-    def attach_result(call: ToolCall, output: Any, result_meta: Dict[str, Any]) -> None:
+    def result_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key in (
+            "cwd",
+            "working_directory",
+            "workingDirectory",
+            "permission",
+            "permissions",
+            "git",
+            "git_status",
+            "task_id",
+            "taskId",
+            "session_id",
+            "sessionId",
+        ):
+            if key in payload:
+                result[key] = payload[key]
+        return result
+
+    def apply_structured_context(turn: Turn, result: Dict[str, Any]) -> None:
+        if any(key in result for key in ("cwd", "working_directory", "workingDirectory")):
+            turn.context_meta["cwd_present"] = True
+        if "exit_code" in result or "exitCode" in result:
+            if isinstance(result.get("exit_code", result.get("exitCode")), int):
+                turn.context_meta["exit_code_present"] = True
+        if "permission" in result or "permissions" in result:
+            turn.context_meta["permission_present"] = True
+        if "git" in result or "git_status" in result:
+            turn.context_meta["git_present"] = True
+
+    def attach_result(
+        call: ToolCall,
+        output: Any,
+        result: Dict[str, Any],
+        record: Dict[str, Any],
+    ) -> None:
         if isinstance(output, (dict, list)):
             output = json.dumps(output, ensure_ascii=False)
         call.output = "" if output is None else str(output)
-        if isinstance(result_meta.get("exit_code"), int):
-            call.exit_code = result_meta["exit_code"]
-        success = result_meta.get("success")
+        exit_code = result.get("exit_code", result.get("exitCode"))
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            call.exit_code = exit_code
+        success = result.get("success")
         if isinstance(success, bool):
             call.success = success
         elif call.exit_code is not None:
             call.success = call.exit_code == 0
+        call.result_source_ref = source_ref(record)
+        call.result_timestamp = str(record.get("timestamp", "") or "")
+        call.result_sequence = record_sequence(record)
+        call.result_metadata = result_metadata(result)
         call.__post_init__()
-        resolved_calls.add(call.call_id)
+        resolved_calls.add(id(call))
 
-    for rec in records:
-        rtype = rec.get("type", "")
-        payload = rec.get("payload", {})
+    def ambiguous_result(raw_id: str, record: Dict[str, Any]) -> None:
+        add_diagnostic(
+            "ambiguous_call_result",
+            record_line(record),
+            call_id=raw_id,
+            source_ref=source_ref(record),
+            status="unknown",
+        )
+        for call in pending_calls.get(raw_id, []):
+            if "ambiguous_call_result" not in call.diagnostics:
+                call.diagnostics.append("ambiguous_call_result")
+
+    def attach_pending_result(raw_id: str, turn: Turn, record: Dict[str, Any]) -> None:
+        values = pending_results.get(raw_id, [])
+        unresolved = [
+            call for call in pending_calls.get(raw_id, []) if id(call) not in resolved_calls
+        ]
+        if raw_id in ambiguous_ids or len(unresolved) != 1 or len(values) != 1:
+            ambiguous_result(raw_id, record)
+            return
+        result = values.pop(0)
+        attach_result(unresolved[0], result["output"], result["meta"], result["record"])
+        if not values:
+            pending_results.pop(raw_id, None)
+        apply_structured_context(turn, result["meta"])
+
+    for record in records:
+        rtype = record.get("type", "")
+        payload = record.get("payload", {})
         if not isinstance(payload, dict):
-            add_diagnostic("malformed_payload", record_line(rec))
+            add_diagnostic("malformed_payload", record_line(record))
             continue
-        ts = rec.get("timestamp", "")
-
-        # Newer Codex records wrap tool calls/results in response_item.payload.
+        timestamp = str(record.get("timestamp", "") or "")
         nested_type = payload.get("type", "") if rtype == "response_item" else ""
         effective_type = nested_type or rtype
 
         if rtype == "response_item" and nested_type not in ("function_call", "function_call_output"):
-            role = payload.get("role", "")
-            content_parts = payload.get("content", [])
-            text = _extract_text(content_parts) if isinstance(content_parts, list) else str(content_parts)
-
+            role = str(payload.get("role", "") or "")
+            content = payload.get("content", [])
+            text = _extract_text(content) if isinstance(content, list) else str(content)
             if role == "user":
-                # Start a new turn
                 if current_turn is not None:
                     turns.append(current_turn)
                 turn_idx += 1
-                current_turn = Turn(index=turn_idx, timestamp=ts)
+                current_turn = Turn(index=turn_idx, timestamp=timestamp)
                 current_turn.user_input = text
-
+                append_log("user_message", record, {"text": text}, current_turn)
             elif role == "assistant":
-                if current_turn is None:
-                    current_turn = Turn(index=turn_idx + 1, timestamp=ts)
-                    turn_idx += 1
-                current_turn.assistant_output += text
-
+                turn = current_or_new_turn(timestamp)
+                turn.assistant_output += text
+                append_log("assistant_message", record, {"text": text}, turn)
             elif role == "developer":
-                # Developer messages contain context info (system prompt, env)
-                if current_turn is None:
-                    current_turn = Turn(index=turn_idx + 1, timestamp=ts)
-                    turn_idx += 1
-                current_turn.total_context_chars += len(text)
-                _extract_context_meta(text, current_turn)
+                turn = current_or_new_turn(timestamp)
+                turn.total_context_chars += len(text)
+                _extract_context_meta(text, turn)
+                append_log(
+                    "context_metadata",
+                    record,
+                    {"role": "developer", "fields": dict(turn.context_meta)},
+                    turn,
+                )
+            else:
+                turn = current_or_new_turn(timestamp)
+                turn.events.append({"type": effective_type or "unknown", "status": "unknown"})
+                append_log(
+                    "unknown_event",
+                    record,
+                    {"type": effective_type or "unknown", "status": "unknown"},
+                    turn,
+                )
 
         elif effective_type == "function_call":
-            call_id = payload.get("call_id", payload.get("id", ""))
-            name = payload.get("name", "")
-            args = payload.get("arguments", {})
-            turn = current_or_new_turn(ts)
-            if not call_id:
-                add_diagnostic("missing_call_id", record_line(rec))
-                call_id = f"unknown-call-{len(turn.tool_calls) + 1}"
-            if call_id in pending_calls:
-                add_diagnostic("duplicate_call_id", record_line(rec), call_id=call_id)
-                call_id = f"{call_id}#duplicate-{len(turn.tool_calls) + 1}"
-            tc = ToolCall(
-                name=str(name or "unknown"),
-                arguments=decode_arguments(args, record_line(rec)),
-                call_id=str(call_id),
-                source_ref=f"{path.name}#L{record_line(rec)}",
+            raw_id = str(payload.get("call_id", payload.get("id", "")) or "")
+            turn = current_or_new_turn(timestamp)
+            if not raw_id:
+                add_diagnostic("missing_call_id", record_line(record))
+                raw_id = f"unknown-call-{len(turn.tool_calls) + 1}"
+            occurrences[raw_id] = occurrences.get(raw_id, 0) + 1
+            if occurrences[raw_id] > 1:
+                ambiguous_ids.add(raw_id)
+                add_diagnostic("duplicate_call_id", record_line(record), call_id=raw_id)
+                call_id = f"{raw_id}#duplicate-{occurrences[raw_id]}"
+            else:
+                call_id = raw_id
+            call = ToolCall(
+                name=str(payload.get("name", "") or "unknown"),
+                arguments=decode_arguments(payload.get("arguments", {}), record_line(record)),
+                call_id=call_id,
+                raw_call_id=raw_id,
+                source_ref=source_ref(record),
+                timestamp=timestamp,
+                sequence=record_sequence(record),
             )
-            pending_calls[call_id] = tc
-            turn.tool_calls.append(tc)
-            if call_id in pending_results:
-                output, result_meta = pending_results.pop(call_id)
-                attach_result(tc, output, result_meta)
+            pending_calls.setdefault(raw_id, []).append(call)
+            call_turns[id(call)] = turn.index
+            turn.tool_calls.append(call)
+            append_log(
+                "tool_call",
+                record,
+                {
+                    "call_id": raw_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "status": call.status,
+                },
+                turn,
+                call.source_ref,
+            )
+            if raw_id in pending_results:
+                attach_pending_result(raw_id, turn, record)
 
         elif effective_type == "function_call_output":
-            call_id = payload.get("call_id", payload.get("id", ""))
+            raw_id = str(payload.get("call_id", payload.get("id", "")) or "")
             output = payload.get("output", "")
-            result_meta = {
+            meta = {
                 "success": payload.get("success"),
                 "exit_code": payload.get("exit_code", payload.get("exitCode")),
             }
-            if call_id in pending_calls:
-                attach_result(pending_calls[call_id], output, result_meta)
+            meta.update(result_metadata(payload))
+            turn = current_or_new_turn(timestamp)
+            call_bucket = pending_calls.get(raw_id, [])
+            if call_bucket:
+                expected_index = call_turns.get(id(call_bucket[0]))
+                for candidate in turns + ([current_turn] if current_turn else []):
+                    if candidate is not None and candidate.index == expected_index:
+                        turn = candidate
+                        break
+            if raw_id in pending_calls:
+                unresolved = [
+                    call for call in pending_calls[raw_id] if id(call) not in resolved_calls
+                ]
+                if raw_id in ambiguous_ids or len(unresolved) != 1:
+                    ambiguous_result(raw_id, record)
+                else:
+                    attach_result(unresolved[0], output, meta, record)
+                    apply_structured_context(turn, meta)
             else:
-                if isinstance(output, (dict, list)):
-                    output = json.dumps(output, ensure_ascii=False)
-                pending_results[call_id] = ("" if output is None else str(output), result_meta)
-            if current_turn is not None:
-                output_text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-                current_turn.raw_tool_output_chars += len(output_text or "")
+                pending_results.setdefault(raw_id, []).append(
+                    {"output": output, "meta": meta, "record": record}
+                )
+            if isinstance(output, (dict, list)):
+                output_text = json.dumps(output, ensure_ascii=False)
+            else:
+                output_text = "" if output is None else str(output)
+            turn.raw_tool_output_chars += len(output_text)
+            append_log(
+                "tool_result",
+                record,
+                {
+                    "call_id": raw_id,
+                    "output": output,
+                    "success": meta.get("success"),
+                    "exit_code": meta.get("exit_code"),
+                    "result_metadata": result_metadata(meta),
+                },
+                turn,
+                source_ref(record),
+            )
 
         elif rtype == "event_msg":
-            event_type = payload.get("type", "")
-            turn = current_or_new_turn(ts)
-            turn.events.append(payload)
-            # Track session-level counters
+            event_type = str(payload.get("type", "") or "")
+            turn = current_or_new_turn(timestamp)
+            turn.events.append(dict(payload))
             if event_type == "context_compacted":
                 session.context_compacted_count += 1
             elif event_type == "task_started":
@@ -230,36 +346,54 @@ def parse_codex_session(path: str | Path) -> Session:
                 session.task_complete_count += 1
             elif event_type == "turn_aborted":
                 session.turn_aborted_count += 1
+            _extract_lifecycle_context(payload, turn)
+            append_log("session_event", record, dict(payload), turn)
 
         elif rtype == "turn_context":
-            turn = current_or_new_turn(ts)
+            turn = current_or_new_turn(timestamp)
             ctx_text = _extract_text(payload.get("content", []))
             turn.total_context_chars += len(ctx_text)
+            append_log("context_metadata", record, {"fields": dict(turn.context_meta)}, turn)
 
-        elif rtype not in ("session_meta",):
-            turn = current_or_new_turn(ts)
-            turn.events.append({"type": effective_type or "unknown", "status": "unknown", "raw": payload})
-            add_diagnostic("unknown_record", record_line(rec), record_type=rtype)
+        elif rtype != "session_meta":
+            turn = current_or_new_turn(timestamp)
+            diagnostic_event = {"type": effective_type or "unknown", "status": "unknown"}
+            turn.events.append(diagnostic_event)
+            append_log("unknown_event", record, diagnostic_event, turn)
+            add_diagnostic("unknown_record", record_line(record), record_type=rtype)
 
-    # Don't forget the last turn
     if current_turn is not None:
         turns.append(current_turn)
-
     session.turns = turns
-    for call_id in pending_results:
-        if call_id not in pending_calls:
-            session.diagnostics.append({
-                "kind": "orphan_call_result",
-                "call_id": call_id,
-                "status": "unknown",
-            })
-    for call_id in pending_calls:
-        if call_id not in resolved_calls:
-            session.diagnostics.append({
-                "kind": "missing_call_result",
-                "call_id": call_id,
-                "status": "unknown",
-            })
+
+    for raw_id, values in pending_results.items():
+        if raw_id in ambiguous_ids:
+            for value in values:
+                ambiguous_result(raw_id, value["record"])
+        else:
+            for value in values:
+                session.diagnostics.append(
+                    {
+                        "kind": "orphan_call_result",
+                        "call_id": raw_id,
+                        "line": record_line(value["record"]),
+                        "source_ref": source_ref(value["record"]),
+                        "status": "unknown",
+                    }
+                )
+    for raw_id, calls in pending_calls.items():
+        for call in calls:
+            if id(call) not in resolved_calls:
+                session.diagnostics.append(
+                    {
+                        "kind": "missing_call_result",
+                        "call_id": call.call_id,
+                        "raw_call_id": raw_id,
+                        "line": call.source_ref,
+                        "status": "unknown",
+                    }
+                )
+    session.event_log.sort(key=lambda event: int(event.get("sequence", 0)))
     return session
 
 
@@ -278,7 +412,7 @@ def _extract_text(content_parts: list) -> str:
 
 
 def _extract_context_meta(text: str, turn: Turn) -> None:
-    """Try to extract environment context from developer messages."""
+    """Extract only typed environment-presence flags from developer text."""
     lower = text.lower()
     if "current working directory" in lower or "cwd:" in lower:
         turn.context_meta["cwd_present"] = True
@@ -288,3 +422,12 @@ def _extract_context_meta(text: str, turn: Turn) -> None:
         turn.context_meta["permission_present"] = True
     if "git" in lower and ("branch" in lower or "status" in lower or "repository" in lower):
         turn.context_meta["git_present"] = True
+
+
+def _extract_lifecycle_context(payload: Dict[str, Any], turn: Turn) -> None:
+    event_type = str(payload.get("type", "") or "")
+    ref = payload.get("task_ref", payload.get("task_id", payload.get("taskId")))
+    if ref:
+        turn.context_meta["task_ref"] = str(ref)
+    if event_type in {"task_continued", "context_restored"}:
+        turn.context_meta["continuity_event"] = event_type

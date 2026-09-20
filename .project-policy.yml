@@ -1,0 +1,29 @@
+policy_profile: flat
+policy_version: 1.0.17
+tier: shareable
+code_paths:
+  - "**/*.py"
+  - "**/*.sh"
+  - "scripts/**"
+doc_paths:
+  - README.md
+  - "docs/**"
+agent_files:
+  mode: symlink
+secret_scan:
+  allow:
+    - "docs/**"
+conventions_engine:
+  repo: hamanpaul/paulsha-conventions
+  mode: workflow
+preflight:
+  steps:
+    - name: openspec
+      kind: validation
+      argv: ["openspec", "validate", "--all"]
+      when_path_exists: openspec
+      timeout_seconds: 300
+    - name: tests
+      kind: tests
+      argv: ["python3", "-m", "pytest", "-q"]
+      timeout_seconds: 1200

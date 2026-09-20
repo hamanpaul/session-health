@@ -1,0 +1,16 @@
+name: Policy Check
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run canonical policy gate
+        uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@b281c5da5cda0b7e3c67e148c759d99304893c56 # v1.0.17
+        with:
+          policy_profile: flat
+          policy_version: "1.0.17"
+          policy_engine_ref: b281c5da5cda0b7e3c67e148c759d99304893c56

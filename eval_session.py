@@ -292,8 +292,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    explicit_format = any(flag in sys.argv[1:] for flag in ("--format", "-f"))
-    explicit_analyze = any(flag in sys.argv[1:] for flag in ("--analyze", "-a", "--test-agent"))
 
     # Auto-detect format from output filename
     if args.output and args.format == "radar":
@@ -302,10 +300,8 @@ def main() -> None:
         elif args.output.endswith(".json"):
             args.format = "json"
 
-    # One-command flow: session ID / path alone produces terminal summary + HTML bundle.
-    if args.session_target and not args.offline and not explicit_format and not explicit_analyze and not args.output:
-        args.format = "html"
-        args.analyze = True
+    # Positional input is deterministic by default.  Model analysis is an
+    # explicit opt-in via --analyze; a plain path must never launch an agent.
 
     use_color = not args.no_color and sys.stdout.isatty()
 
@@ -408,7 +404,7 @@ def main() -> None:
                     diagnosis_summary=diagnosis_summary,
                     evidence_summary=evidence_summary,
                     artifact_sources={
-                        "session_input": str(path),
+                        "session_input": path.name,
                         "source_ref": bundle.manifest.get("source_ref", path.name) if bundle else path.name,
                     },
                     sync_status="session-only",
@@ -436,7 +432,7 @@ def main() -> None:
                     score=failed_score,
                     target_kind=target_kind,
                     evidence_summary={},
-                    artifact_sources={"session_input": str(path)},
+                    artifact_sources={"session_input": path.name},
                     sync_status="session-only",
                     profile=args.profile,
                     process_v2=failed_process,
@@ -467,9 +463,10 @@ def main() -> None:
         diagnosis_summary=build_batch_diagnosis_summary(reports),
         evidence_summary={
             "session_count": len(reports),
-            "average_score": round(sum(report.score.composite for report in reports) / len(reports), 1),
-            "min_score": round(min(report.score.composite for report in reports), 1),
-            "max_score": round(max(report.score.composite for report in reports), 1),
+            "evaluated_session_count": sum(report.processing_status != "failed" for report in reports),
+            "average_score": _average_evaluated_score(reports),
+            "min_score": _extreme_evaluated_score(reports, minimum=True),
+            "max_score": _extreme_evaluated_score(reports, minimum=False),
             "primary_families": [
                 report.problemmap.atlas.get("primary_family_zh", report.problemmap.atlas.get("primary_family", "未解析"))
                 for report in reports
@@ -575,9 +572,43 @@ def main() -> None:
             print(f"✓ SessionBundle exported to: {export_target}", file=sys.stderr)
         else:
             export_target.mkdir(parents=True, exist_ok=True)
-            for report in reports:
+            used_names: set[str] = set()
+            export_manifest: List[dict] = []
+            for index, report in enumerate(reports, 1):
+                source = (report.session.source or "unknown").replace("/", "_")
                 safe_id = (report.score.session_id or "session").replace("/", "_")
-                export_bundle(report.session, export_target / f"{safe_id}.bundle.json")
+                artifact_id = str(report.bundle_manifest.get("artifact_id", ""))[:12]
+                stem = "-".join(part for part in (source, safe_id, artifact_id) if part) or f"session-{index}"
+                filename = f"{stem}.bundle.json"
+                suffix = 2
+                while filename in used_names or (export_target / filename).exists():
+                    filename = f"{stem}-{suffix}.bundle.json"
+                    suffix += 1
+                used_names.add(filename)
+                export_bundle(report.session, export_target / filename)
+                export_manifest.append(
+                    {
+                        "input": report.artifact_sources.get("session_input", "unknown"),
+                        "session_id": report.score.session_id or None,
+                        "source": report.session.source,
+                        "processing_status": report.processing_status,
+                        "artifact": filename,
+                    }
+                )
+            (export_target / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "session-health.bundle-export-manifest",
+                        "version": "1.0",
+                        "processing_status": batch_report.processing_status,
+                        "sessions": export_manifest,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             print(f"✓ SessionBundles exported to: {export_target}", file=sys.stderr)
 
     # Output
@@ -616,7 +647,9 @@ def main() -> None:
 
     # Batch summary
     if len(reports) > 1 and args.format != "json":
-        _print_batch_summary([report.score for report in reports], use_color)
+        _print_batch_summary(reports, use_color)
+
+    return 1 if any(report.processing_status != "complete" for report in reports) else 0
 
 
 def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
@@ -632,32 +665,50 @@ def _print_turn_breakdown(sc: SessionScore, use_color: bool) -> None:
         )
 
 
-def _print_batch_summary(scores: List[SessionScore], use_color: bool) -> None:
+def _average_evaluated_score(reports: List[SessionReport]) -> float | None:
+    scores = [report.score.composite for report in reports if report.processing_status != "failed"]
+    return round(sum(scores) / len(scores), 1) if scores else None
+
+
+def _extreme_evaluated_score(reports: List[SessionReport], *, minimum: bool) -> float | None:
+    scores = [report.score.composite for report in reports if report.processing_status != "failed"]
+    if not scores:
+        return None
+    value = min(scores) if minimum else max(scores)
+    return round(value, 1)
+
+
+def _print_batch_summary(reports: List[SessionReport], use_color: bool) -> None:
     """Print summary for batch evaluation."""
     import statistics
-    composites = [s.composite for s in scores]
-    avg = statistics.mean(composites)
-    med = statistics.median(composites)
+    evaluated = [report.score.composite for report in reports if report.processing_status != "failed"]
+    avg = statistics.mean(evaluated) if evaluated else None
+    med = statistics.median(evaluated) if evaluated else None
+    complete = sum(report.processing_status == "complete" for report in reports)
+    partial = sum(report.processing_status == "partial" for report in reports)
+    failed = sum(report.processing_status == "failed" for report in reports)
 
     print("=" * 52)
-    print(f"Batch Summary: {len(scores)} sessions evaluated")
-    print(f"  Mean:   {avg:.1f}")
-    print(f"  Median: {med:.1f}")
-    print(f"  Min:    {min(composites):.1f}")
-    print(f"  Max:    {max(composites):.1f}")
-    if len(composites) > 1:
-        print(f"  StdDev: {statistics.stdev(composites):.1f}")
+    print(f"Batch Summary: {len(reports)} selected; {complete} complete, {partial} partial, {failed} failed")
+    print(f"  Evaluated: {len(evaluated)}")
+    print(f"  Mean:   {'unknown' if avg is None else f'{avg:.1f}'}")
+    print(f"  Median: {'unknown' if med is None else f'{med:.1f}'}")
+    print(f"  Min:    {'unknown' if not evaluated else f'{min(evaluated):.1f}'}")
+    print(f"  Max:    {'unknown' if not evaluated else f'{max(evaluated):.1f}'}")
+    if len(evaluated) > 1:
+        print(f"  StdDev: {statistics.stdev(evaluated):.1f}")
 
-    # Grade distribution
-    grades = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-    for s in scores:
-        grades[s.grade] += 1
-    print(f"\n  Grade distribution:")
-    for g in ["A", "B", "C", "D", "F"]:
-        if grades[g] > 0:
-            bar = "█" * grades[g]
-            print(f"    {g}: {grades[g]:3d} {bar}")
+    if reports and all(report.profile == "legacy" for report in reports):
+        grades = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+        for report in reports:
+            if report.processing_status != "failed":
+                grades[report.score.grade] += 1
+        print(f"\n  Grade distribution:")
+        for g in ["A", "B", "C", "D", "F"]:
+            if grades[g] > 0:
+                bar = "█" * grades[g]
+                print(f"    {g}: {grades[g]:3d} {bar}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
