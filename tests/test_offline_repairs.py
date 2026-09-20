@@ -7,12 +7,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 
 from lib.bundle import BundleError, BundleLimits, SessionBundle, build_session_bundle
 from lib.html_report import render_html
 from lib.metrics.process_v2 import analyze_process_v2, join_external_outcome
-from lib.parser_base import Session, SessionInputLimits, ToolCall, Turn
+from lib.parser_base import Session, SessionInputLimits, ToolCall, Turn, read_jsonl_records
 from lib.parser_codex import parse_codex_session
 from lib.parser_copilot import parse_copilot_session
 from lib.radar import render_table
@@ -50,6 +51,29 @@ def _copilot_duplicate_records() -> list[dict]:
 
 
 class OfflineRepairTest(unittest.TestCase):
+    def test_oversize_record_keeps_memory_bounded_and_recovers_next_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oversize.jsonl"
+            path.write_text(
+                '{"first": 1}\n{"blob": "' + "x" * (1024 * 1024) + '"}\n{"last": 2}\n',
+                encoding="utf-8",
+            )
+            tracemalloc.start()
+            try:
+                records, diagnostics = read_jsonl_records(
+                    path, SessionInputLimits(max_bytes=2 * 1024 * 1024, max_record_chars=1024),
+                )
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+        self.assertLess(peak, 256 * 1024, "discarded 1 MiB record must not be buffered in full")
+        self.assertEqual([item["__source_line__"] for item in records], [1, 3])
+        self.assertEqual(records[1]["last"], 2)
+        self.assertEqual(diagnostics, [{
+            "kind": "oversize_record", "line": 2, "status": "partial", "max_record_chars": 1024,
+        }])
+
     def test_snr_noise_facts_survive_bounded_bundle_replay(self) -> None:
         for output in (
             "repeat\n" * 1200,

@@ -158,7 +158,7 @@ def _process_result(value: Any) -> ProcessV2Result | None:
 
 def _agent_analysis(value: Any) -> AgentAnalysis | None:
     data = _mapping(value)
-    if not data or not bool(data.get("success")):
+    if not data:
         return None
     # Routing is retained as JSON in saved reports.  The existing HTML section
     # only needs it for metadata, so leave it absent rather than reconstructing
@@ -166,7 +166,7 @@ def _agent_analysis(value: Any) -> AgentAnalysis | None:
     return AgentAnalysis(
         agent_name=str(data.get("agent_name", "saved-report")),
         raw_response=str(data.get("raw_response", "")),
-        success=True,
+        success=bool(data.get("success")),
         error=str(data.get("error", "")),
         requested_model=data.get("requested_model"),
         actual_model=data.get("actual_model"),
@@ -356,7 +356,7 @@ def load_saved_report(path: str | Path, *, input_kind: str = "auto") -> SessionR
                 "target_kind": "saved_report_directory",
                 "profile": profile,
                 "sessions": sessions,
-                "artifact_sources": {"saved_input": str(source)},
+                "artifact_sources": {"saved_input": source.name or "saved-reports"},
             },
             source_name=str(source),
         )
@@ -372,4 +372,3 @@ def load_saved_report(path: str | Path, *, input_kind: str = "auto") -> SessionR
     if input_kind == "batch" and isinstance(report, SessionReport):
         raise ValueError("input_kind=batch received a single-session JSON")
     return report
-

@@ -116,7 +116,7 @@ def read_jsonl_records(
             line_bytes = len(raw_line.encode("utf-8", "replace"))
             line_chars = len(raw_line.rstrip("\r\n"))
             oversized = line_chars > limits.max_record_chars
-            line_parts = [] if oversized else [raw_line]
+            line_parts = None if oversized else [raw_line]
             complete = raw_line.endswith(("\n", "\r"))
             over_budget = False
             while not complete:
@@ -131,7 +131,7 @@ def read_jsonl_records(
                 line_chars += len(chunk.rstrip("\r\n"))
                 oversized = line_chars > limits.max_record_chars
                 if oversized:
-                    line_parts = []
+                    line_parts = None
                 elif line_parts is not None:
                     line_parts.append(chunk)
                 complete = chunk.endswith(("\n", "\r"))
@@ -145,7 +145,7 @@ def read_jsonl_records(
                 })
                 break
             bytes_read += line_bytes
-            if oversized:
+            if line_parts is None:
                 diagnostics.append({
                     "kind": "oversize_record",
                     "line": line_number,

@@ -37,6 +37,9 @@ python3 scripts/render_saved_report.py --input FILE_OR_DIR --output report.html 
 
 `--input-kind` accepts `auto`, `single`, `batch`, or `directory`. Existing
 output files are refused unless `--force` is supplied explicitly.
+Saved projections retain failed analyzer results and their diagnostics, even
+when the HTML omits the analysis section. Directory source labels use only the
+directory name, keeping local absolute paths out of the generated metadata.
 
 Use `--analyze` only when an explicit external agent analysis is wanted;
 offline mode never calls a model, network, or agent CLI.

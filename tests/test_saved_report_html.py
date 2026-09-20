@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from lib.html_report import render_saved_html
+from lib.report_visualization import load_saved_report, report_from_saved_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,28 @@ def _process_session(session_id: str, *, missing: str | None = None) -> dict:
 
 
 class SavedReportHtmlTest(unittest.TestCase):
+    def test_failed_analyzer_projection_preserves_error_and_diagnostics(self) -> None:
+        failure = {
+            "agent_name": "fixture-analyzer",
+            "success": False,
+            "error": "fixture timeout",
+            "raw_response": "partial output",
+            "requested_model": "fixture-model",
+            "actual_model": None,
+            "diagnostics": [{"kind": "timeout", "status": "failed"}],
+            "attempts": [{"status": "failed", "error_kind": "timeout"}],
+            "native_usage": {"input_tokens": None, "output_tokens": None},
+        }
+        single = {**_legacy_session("failed-analysis"), "agent_analysis": failure}
+        batch = {"report_kind": "batch", "sessions": [single], "agent_analysis": failure}
+        for payload in (single, batch):
+            with self.subTest(kind=payload.get("report_kind", "single")):
+                report = report_from_saved_payload(payload)
+                self.assertIsNotNone(report.agent_analysis)
+                restored = report.agent_analysis.to_dict()
+                for field, value in failure.items():
+                    self.assertEqual(restored[field], value)
+
     def test_legacy_batch_has_per_session_radars_and_comparison(self) -> None:
         payload = {
             "report_kind": "batch",
@@ -140,9 +163,13 @@ class SavedReportHtmlTest(unittest.TestCase):
                 text=True,
                 check=False,
             )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(output.is_file(), run.stdout)
             rendered = output.read_text(encoding="utf-8")
+            restored = load_saved_report(input_dir, input_kind="directory")
+            self.assertEqual(restored.artifact_sources["saved_input"], "saved-sessions")
+            self.assertNotIn(str(root), rendered)
 
-        self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("HTML report saved to", run.stdout)
         self.assertIn('class="batch-heatmap"', rendered)
         self.assertIn('class="process-coverage"', rendered)
