@@ -72,6 +72,13 @@ def command_fingerprint(arguments: Any) -> str:
     return hashlib.sha256(tokens[0].encode("utf-8", "replace")).hexdigest()
 
 
+def source_ref_line(source_ref: str) -> int | None:
+    """Extract a numeric source line from a portable ``path#L<line>`` ref."""
+
+    _, marker, line = str(source_ref).rpartition("#L")
+    return int(line) if marker and line.isdigit() else None
+
+
 def read_jsonl_records(
     path: str | Path,
     limits: SessionInputLimits | None = None,
@@ -79,9 +86,11 @@ def read_jsonl_records(
     """Read a bounded JSONL input while retaining line/record provenance.
 
     The adapters deliberately stop before constructing an unbounded in-memory
-    record list.  A file that is larger than the input contract is rejected so
-    a caller can report it as a failed selected input rather than silently
-    scoring a prefix as if it were complete.
+    record list.  When a byte, record-count, or record-size limit is reached,
+    the usable records already read are returned with a diagnostic describing
+    the discarded input.  Callers can then report partial coverage (or failed
+    processing when no usable record remains) instead of scoring a prefix as
+    if the complete file had been read.
     """
 
     source = Path(path)
@@ -130,7 +139,7 @@ def read_jsonl_records(
                 diagnostics.append({
                     "kind": "input_byte_limit_exceeded",
                     "line": line_number,
-                    "status": "failed",
+                    "status": "partial",
                     "max_bytes": limits.max_bytes,
                     "bytes_read": bytes_read,
                 })
@@ -140,7 +149,7 @@ def read_jsonl_records(
                 diagnostics.append({
                     "kind": "oversize_record",
                     "line": line_number,
-                    "status": "failed",
+                    "status": "partial",
                     "max_record_chars": limits.max_record_chars,
                 })
                 continue
@@ -152,7 +161,7 @@ def read_jsonl_records(
                 diagnostics.append({
                     "kind": "record_limit_exceeded",
                     "line": line_number,
-                    "status": "failed",
+                    "status": "partial",
                     "max_records": limits.max_records,
                 })
                 break
@@ -175,6 +184,11 @@ def read_jsonl_records(
                     "line": line_number,
                     "status": "unknown",
                 })
+    input_limit_kinds = {"input_byte_limit_exceeded", "record_limit_exceeded", "oversize_record"}
+    input_limit_status = "partial" if records else "failed"
+    for diagnostic in diagnostics:
+        if diagnostic.get("kind") in input_limit_kinds:
+            diagnostic["status"] = input_limit_status
     return records, diagnostics
 
 

@@ -22,3 +22,5 @@
   replay fidelity, STATE field precedence, and portable Windows ref validation.
 - [x] Repair pre-archive bounded replay executable identity preservation after
   redaction, including regression coverage at every event boundary.
+- [x] Repair pre-archive parser diagnostic provenance and raw-input limit
+  status semantics for retained partial prefixes.
