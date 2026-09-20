@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 ROUTING_VERSION = "routing-v1"
-ROUTING_POLICY_VERSION = "deterministic-priority-v1"
+ROUTING_POLICY_VERSION = "task-evidence-v2"
 ROUTING_SPECIAL_VALUES = (
     "no_suitable_model",
     "insufficient_model_evidence",
@@ -90,6 +90,7 @@ class AnalysisRequest:
     model_override: str = ""
     inference_settings: Mapping[str, Any] = field(default_factory=dict)
     budget: RoutingBudget = field(default_factory=RoutingBudget)
+    task_profile: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("context_bytes", "output_bytes"):
@@ -103,6 +104,14 @@ class AnalysisRequest:
                     raise ValueError(f"{name} must be a finite non-negative number")
         if not isinstance(self.inference_settings, Mapping):
             raise ValueError("inference_settings must be a mapping")
+        if not isinstance(self.task_profile, Mapping):
+            raise ValueError("task_profile must be a mapping")
+        from .semantic_backend import _safe_mapping
+
+        profile = _safe_mapping(self.task_profile)
+        if len(_canonical(profile)) > 16_000:
+            raise ValueError("task_profile exceeds the 16000-byte routing limit")
+        object.__setattr__(self, "task_profile", profile)
 
     @property
     def request_id(self) -> str:
@@ -121,6 +130,7 @@ class AnalysisRequest:
             "language": self.language,
             "model_override": self.model_override or None,
             "inference_settings": dict(self.inference_settings),
+            "task_profile": dict(self.task_profile),
             "budget": {
                 "max_context_bytes": self.budget.max_context_bytes,
                 "max_output_bytes": self.budget.max_output_bytes,
@@ -157,6 +167,13 @@ class RouteDecision:
     choice_value: Optional[str] = None
     jev_status: str = "not_requested"
     jev_usage: Dict[str, Any] = field(default_factory=dict)
+    jev_requested_model: Optional[str] = None
+    jev_actual_model: Optional[str] = None
+    jev_request_id: Optional[str] = None
+    jev_response_hash: Optional[str] = None
+    jev_probabilities: Dict[str, float] = field(default_factory=dict)
+    jev_confidence: Optional[float] = None
+    abstention_reason: Optional[str] = None
     policy_version: str = ROUTING_POLICY_VERSION
     request: Dict[str, Any] = field(default_factory=dict)
     reselection_count: int = 0
@@ -187,6 +204,13 @@ class RouteDecision:
             "choice_value": self.choice_value,
             "jev_status": self.jev_status,
             "jev_usage": dict(self.jev_usage),
+            "jev_requested_model": self.jev_requested_model,
+            "jev_actual_model": self.jev_actual_model,
+            "jev_request_id": self.jev_request_id,
+            "jev_response_hash": self.jev_response_hash,
+            "jev_probabilities": dict(self.jev_probabilities),
+            "jev_confidence": self.jev_confidence,
+            "abstention_reason": self.abstention_reason,
             "policy_version": self.policy_version,
             "request": dict(self.request),
             "reselection_count": self.reselection_count,
@@ -406,20 +430,40 @@ def _choice_question(request: AnalysisRequest, candidates: Sequence[Any]) -> Any
         [candidate_id(item) for item in candidates]
         + ["no_suitable_model", "insufficient_model_evidence"]
     ))
+    criteria = {
+        candidate_id(item): {
+            "meaning": "Select this candidate if usable for the stated task.",
+            "candidate_id": candidate_id(item),
+            "name": str(_candidate_value(item, "name", candidate_id(item))),
+        }
+        for item in candidates
+    }
+    criteria.update({
+        "no_suitable_model": "Every candidate demonstrably violates a mandatory requirement.",
+        "insufficient_model_evidence": (
+            "Missing essential task definition or model suitability evidence prevents a justified provisional selection."
+        ),
+    })
     return SemanticQuestion(
         question_id=f"route:{request.request_id}",
         axis_id="ROUTE",
         prompt=(
-            "Choose exactly one concrete analyzer candidate for this bounded request. "
-            "Use only candidates whose hard constraints are satisfied; return no_suitable_model "
-            "when none is suitable. Candidate cards contain executor, route, model and settings."
+            "Select a usable analyzer for the task in state.data.routing.task_profile, "
+            "or the request purpose if absent. Use supplied facts; model names alone are not "
+            "measured capability evidence. Respect availability and hard constraints. "
+            "Unknown comparative quality alone does not disqualify a ready general text analyzer "
+            "for a provisional run. Prefer demonstrated task fit. If usable options are tied, "
+            "prefer lower numeric priority; do not abstain merely because several can work. "
+            "Use insufficient_model_evidence when essential task or suitability evidence is missing. "
+            "Use no_suitable_model only when supplied evidence shows all options fail a required "
+            "constraint. Do not claim this provisional selection proves which model is objectively best."
         ),
         answer_type="choice",
         case_id="routing",
         state_path="state.data.routing",
         choices=options,
         group_version=ROUTING_VERSION,
-        metadata={"request_id": request.request_id, "policy_version": ROUTING_POLICY_VERSION},
+        metadata={"request_id": request.request_id, "policy_version": ROUTING_POLICY_VERSION, "criteria": criteria},
     )
 
 
@@ -550,6 +594,7 @@ def choose_model(
     decision.eligibility = ledger
     decision.eligible_candidate_ids = [candidate_id(item) for item in accepted]
     if not accepted:
+        decision.abstention_reason = "no_eligible_candidate"
         decision.diagnostics.append({"kind": "no_eligible_candidate", "status": "insufficient"})
         return decision
 
@@ -573,6 +618,7 @@ def choose_model(
             data={
                 "routing": {
                     "request": actual_request.to_dict(),
+                    "task_profile": dict(actual_request.task_profile),
                     "candidates": [_candidate_card(item) for item in accepted],
                 }
             },
@@ -580,10 +626,18 @@ def choose_model(
         )
         response = backend.evaluate(state, [question], budget=selected_budget)
         decision.jev_status = str(getattr(response, "status", "unknown"))
+        metadata = getattr(response, "metadata", {})
+        decision.jev_requested_model = metadata.get("requested_model") or getattr(backend, "model", None)
+        decision.jev_actual_model = metadata.get("actual_model")
+        decision.jev_request_id = metadata.get("request_id")
+        decision.jev_response_hash = metadata.get("response_hash")
         usage = getattr(response, "usage", None)
         if usage is not None and hasattr(usage, "to_dict"):
             decision.jev_usage = usage.to_dict()
         answer = getattr(response, "answers", {}).get(question.question_id)
+        answer_metadata = getattr(answer, "metadata", {})
+        decision.jev_probabilities = dict(answer_metadata.get("probabilities", {}))
+        decision.jev_confidence = answer_metadata.get("confidence")
         value = getattr(answer, "value", None)
         decision.choice_value = value if isinstance(value, str) else None
         selected = next(
@@ -602,12 +656,25 @@ def choose_model(
         if selected is not None:
             decision.status = "selected"
             decision.routing_source = "jev"
+            # Confidence is distribution concentration, not task quality. Keep
+            # low-confidence selections; resolve only exact probability ties.
+            selected_probability = decision.jev_probabilities.get(candidate_id(selected))
+            tied = [
+                item for item in accepted
+                if selected_probability is not None
+                and decision.jev_probabilities.get(candidate_id(item)) == selected_probability
+            ]
+            if len(tied) > 1:
+                selected = tied[0]  # already ordered by priority then identity
+                decision.routing_source = "deterministic_tiebreak"
+                decision.diagnostics.append({"kind": "equal_choice_probability", "policy": "priority_then_identity"})
             decision.candidate = selected
             decision.candidate_id = candidate_id(selected)
             return decision
         if value in ROUTING_SPECIAL_VALUES:
+            decision.abstention_reason = value
             decision.routing_source = "jev"
-            decision.diagnostics.append({"kind": "jev_abstention", "status": "insufficient", "value": value})
+            decision.diagnostics.append({"kind": "jev_abstention", "status": "abstained", "value": value})
             if value in {"no_suitable_model", "insufficient_model_evidence", "none", "insufficient"}:
                 decision.status = "no_suitable_model"
                 return decision
@@ -626,9 +693,8 @@ def choose_model(
         decision.jev_status = "failed"
         decision.diagnostics.append({"kind": "jev_routing_exception", "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:300]})
 
-    # A Jev outage or abstention must not make routing nondeterministic.  The
-    # fallback is explicit in the report and is still limited to hard-eligible
-    # candidates.
+    # An outage or missing answer uses an explicit, hard-eligible fallback.
+    # Explicit model abstention returned above remains an abstention.
     selected = accepted[0]
     decision.status = "selected"
     decision.routing_source = "deterministic_fallback"

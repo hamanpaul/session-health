@@ -102,6 +102,28 @@ exhaustion, Jev abstention, or another routing failure produces a partial
 comparison with no agreement value rather than being counted as baseline
 agreement.
 
+Routing uses a bounded task profile (single/batch scope, session count, seven
+axes, evidence handling, and output requirements), rather than only prompt
+size. Candidate `capability_evidence` keeps advertised descriptions and
+route-specific observations separate from measured quality. The default catalog
+also reads visible entries from the local Codex model cache when available;
+newly discovered models remain `unknown` until their route is confirmed. Cache
+token capacities are not used as byte limits.
+
+The `task-evidence-v2` routing policy asks for a usable provisional analyzer,
+not an unmeasured global quality winner. Every Choice option has a definition.
+`abstention_reason` distinguishes missing evidence from known unsuitability,
+while the legacy failure status remains `no_suitable_model`. Explicit abstention
+does not silently trigger fallback; transport failure or a missing answer can
+use the existing hard-eligible fallback. Exact candidate probability ties use
+priority then identity and are labeled `deterministic_tiebreak`.
+
+Routing JSON retains `jev_requested_model`, `jev_actual_model`, request and
+response hashes, `jev_probabilities`, `jev_confidence`, and native `jev_usage`.
+Unknown served identity or usage stays null. Confidence describes the Choice
+distribution; it is not a calibrated quality score and low confidence alone
+does not block a valid selection. See [the routing experiment and contract](docs/jev-routing-evidence.md).
+
 To make a concrete operator candidate eligible for automatic routing, pass a
 JSON catalog with explicit executor/provider/route/model/settings cards. This
 is data, not a shell template; only the built-in bounded adapters are accepted:
