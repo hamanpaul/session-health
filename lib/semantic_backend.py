@@ -2,9 +2,12 @@
 
 The semantic layer is deliberately independent from the offline metrics.  It
 accepts an already bounded state snapshot and typed questions, then returns
-typed judgments plus request-level provenance and usage.  The HTTP adapter is
-standard-library only so importing or running the offline CLI never requires a
-model SDK or a network connection.
+typed judgments plus request-level provenance and usage.  A backend instance
+keeps an aggregate ledger for its request/attempt/byte caps, while each
+response receives an immutable ledger snapshot for only that ``evaluate``
+call; the report layer merges those snapshots within one session.  The HTTP
+adapter is standard-library only so importing or running the offline CLI never
+requires a model SDK or a network connection.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import math
 import os
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -27,6 +31,8 @@ JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_JEV_MODEL = "jev-latest"
 CHOICE_SPECIAL_VALUES = ("none", "insufficient", "mixed")
 SUPPORTED_PRIMITIVES = ("choice", "noul", "score")
+BUDGET_SCOPE = "backend_instance_aggregate"
+SCORE_PRECISION_POLICY = "reported_decimal_half_unit"
 
 
 @dataclass(frozen=True)
@@ -545,6 +551,17 @@ class SemanticLedger:
             return
         self.attempts.append(attempt)
 
+    def extend(self, other: "SemanticLedger") -> None:
+        """Merge immutable attempt records without double-counting identities."""
+
+        for attempt in other.attempts:
+            self.add(attempt)
+
+    def snapshot(self, start: int = 0) -> "SemanticLedger":
+        """Copy a bounded slice so later backend calls cannot mutate a report."""
+
+        return SemanticLedger(attempts=list(self.attempts[max(0, start):]))
+
     @property
     def request_count(self) -> int:
         return len({attempt.request_instance_id or attempt.request_id for attempt in self.attempts})
@@ -692,6 +709,61 @@ def _validate_confidence(question: SemanticQuestion, raw: Mapping[str, Any]) -> 
     return confidence
 
 
+def _reported_decimal_places(value: Any) -> int:
+    """Return decimal places visible in a finite JSON number."""
+
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return 0
+    exponent = decimal_value.as_tuple().exponent
+    return max(0, -int(exponent)) if isinstance(exponent, int) else 0
+
+
+def _reported_rounding_error(value: Any) -> float:
+    """Bound half of the last reported decimal unit; integers are exact."""
+
+    places = _reported_decimal_places(value)
+    return 0.5 * (10.0 ** -places) if places else 0.0
+
+
+def _score_consistency(
+    raw_score: Any,
+    raw_probabilities: Mapping[Any, Any],
+    probabilities: Mapping[str, float],
+    level_count: int,
+) -> Dict[str, Any]:
+    """Return a bounded finite-precision consistency record for native Score.
+
+    The provider's numeric fields are retained as reported.  This local policy
+    treats visible decimal digits as rounded output and allows the sum of the
+    score's half-unit error and each probability's weighted half-unit error;
+    it is an interoperability bound, not a claim about provider internals.
+    """
+
+    weighted = sum(float(index) * probabilities[str(index)] for index in range(level_count))
+    tolerance = _reported_rounding_error(raw_score)
+    for index in range(level_count):
+        raw_probability = raw_probabilities.get(str(index), raw_probabilities.get(index))
+        tolerance += float(index) * _reported_rounding_error(raw_probability)
+    tolerance += 1e-9
+    numeric_score = float(raw_score)
+    delta = abs(numeric_score - weighted)
+    return {
+        "weighted_value": weighted,
+        "absolute_delta": delta,
+        "tolerance": tolerance,
+        "policy": SCORE_PRECISION_POLICY,
+        "score_decimal_places": _reported_decimal_places(raw_score),
+        "probability_decimal_places": {
+            str(index): _reported_decimal_places(
+                raw_probabilities.get(str(index), raw_probabilities.get(index))
+            )
+            for index in range(level_count)
+        },
+    }
+
+
 def _native_metadata(
     question: SemanticQuestion,
     raw: Mapping[str, Any],
@@ -743,8 +815,13 @@ def _native_metadata(
             raise SemanticValidationError(
                 f"Score value for {question.question_id} must be in [0, {int(maximum)}]"
             )
-        expected_score = sum(float(index) * probabilities[str(index)] for index in range(len(question.score_levels)))
-        if not math.isclose(score, expected_score, rel_tol=1e-5, abs_tol=1e-4):
+        consistency = _score_consistency(
+            raw.get("score"),
+            raw.get("probabilities", {}),
+            probabilities,
+            len(question.score_levels),
+        )
+        if consistency["absolute_delta"] > consistency["tolerance"]:
             raise SemanticValidationError(
                 f"Score value for {question.question_id} must equal its probability-weighted value"
             )
@@ -754,6 +831,7 @@ def _native_metadata(
                 "legend": {key: str(value) for key, value in expected_legend.items()},
                 "probabilities": probabilities,
                 "confidence": confidence,
+                "score_consistency": consistency,
             }
         )
     else:
@@ -1025,6 +1103,7 @@ class GenericSemanticBackend:
         budget: Optional[SemanticBudget] = None,
     ) -> SemanticResponse:
         budget = budget or SemanticBudget()
+        ledger_start = len(self.ledger.attempts)
         normalized_state = state.to_dict() if isinstance(state, SemanticState) else _safe_mapping(state)
         normalized_questions = [question.to_dict() for question in questions]
         if len(normalized_questions) > budget.max_questions:
@@ -1073,8 +1152,8 @@ class GenericSemanticBackend:
                 answers=answers,
                 diagnostics=diagnostics,
                 metadata={"backend": self.capabilities.backend, "model": self.capabilities.model or "mock"},
-                usage=self.ledger.usage(),
-                ledger=self.ledger,
+                usage=self.ledger.snapshot(ledger_start).usage(),
+                ledger=self.ledger.snapshot(ledger_start),
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
@@ -1098,7 +1177,8 @@ class GenericSemanticBackend:
             return SemanticResponse(
                 status="failed",
                 diagnostics=[{"kind": "backend_validation", "status": "failed", "message": str(exc)}],
-                ledger=self.ledger,
+                usage=self.ledger.snapshot(ledger_start).usage(),
+                ledger=self.ledger.snapshot(ledger_start),
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
@@ -1119,7 +1199,8 @@ class GenericSemanticBackend:
             return SemanticResponse(
                 status="failed",
                 diagnostics=[{"kind": "backend_exception", "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:300]}],
-                ledger=self.ledger,
+                usage=self.ledger.snapshot(ledger_start).usage(),
+                ledger=self.ledger.snapshot(ledger_start),
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
@@ -1209,7 +1290,7 @@ class UnavailableSemanticBackend:
                 }
             ],
             metadata={"live_status": "deferred", "reason": self.reason},
-            ledger=self.ledger,
+            ledger=self.ledger.snapshot(),
             provenance={"semantic_version": SEMANTIC_VERSION, "usage_scope": "request_attempt_deduplicated"},
         )
 
@@ -1305,6 +1386,7 @@ class JevHTTPBackend:
         budget: Optional[SemanticBudget] = None,
     ) -> SemanticResponse:
         budget = budget or SemanticBudget()
+        ledger_start = len(self.ledger.attempts)
         normalized_state = state.to_dict() if isinstance(state, SemanticState) else _safe_mapping(state)
         if len(questions) > budget.max_questions:
             raise SemanticBudgetError("question budget exceeded")
@@ -1340,7 +1422,7 @@ class JevHTTPBackend:
                 status="deferred",
                 diagnostics=[{"kind": "missing_api_key", "status": "deferred"}],
                 metadata={"live_status": "deferred"},
-                ledger=self.ledger,
+                ledger=self.ledger.snapshot(ledger_start),
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
@@ -1394,8 +1476,8 @@ class JevHTTPBackend:
                         answers=answers,
                         diagnostics=diagnostics,
                         metadata={"live_status": "complete", "http_status": status_code, "model": response_payload.get("model", self.model)},
-                        usage=self.ledger.usage(),
-                        ledger=self.ledger,
+                        usage=self.ledger.snapshot(ledger_start).usage(),
+                        ledger=self.ledger.snapshot(ledger_start),
                         provenance={
                             "semantic_version": SEMANTIC_VERSION,
                             "request_id": request_id,
@@ -1443,8 +1525,8 @@ class JevHTTPBackend:
                             status="deferred",
                             diagnostics=diagnostics,
                             metadata={"live_status": "deferred", "http_status": status_code},
-                            usage=self.ledger.usage(),
-                            ledger=self.ledger,
+                            usage=self.ledger.snapshot(ledger_start).usage(),
+                            ledger=self.ledger.snapshot(ledger_start),
                             provenance={
                                 "semantic_version": SEMANTIC_VERSION,
                                 "request_id": request_id,
@@ -1461,8 +1543,8 @@ class JevHTTPBackend:
                     status="failed",
                     diagnostics=diagnostics,
                     metadata={"live_status": "failed", "http_status": status_code},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except HTTPError as exc:
@@ -1512,8 +1594,8 @@ class JevHTTPBackend:
                             status="deferred",
                             diagnostics=diagnostics,
                             metadata={"live_status": "deferred", "http_status": status_code},
-                            usage=self.ledger.usage(),
-                            ledger=self.ledger,
+                            usage=self.ledger.snapshot(ledger_start).usage(),
+                            ledger=self.ledger.snapshot(ledger_start),
                             provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                         )
                     delay = retry_after if retry_after is not None else min(2.0 ** (attempt_number - 1), budget.retry_after_cap_seconds)
@@ -1523,8 +1605,8 @@ class JevHTTPBackend:
                     status="failed",
                     diagnostics=diagnostics,
                     metadata={"live_status": "failed", "http_status": status_code},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except SemanticResponseError as exc:
@@ -1555,8 +1637,8 @@ class JevHTTPBackend:
                     status="unknown",
                     diagnostics=diagnostics,
                     metadata={"live_status": "unknown"},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except TimeoutError:
@@ -1578,8 +1660,8 @@ class JevHTTPBackend:
                     status="unknown",
                     diagnostics=[{"kind": "timeout", "status": "unknown", "retry": "not_retried"}],
                     metadata={"live_status": "unknown"},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except URLError as exc:
@@ -1599,8 +1681,8 @@ class JevHTTPBackend:
                     status="failed",
                     diagnostics=[{"kind": "transport_error", "status": "failed", "message": str(exc)[:200]}],
                     metadata={"live_status": "failed"},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except (SemanticBudgetError, SemanticValidationError, PermissionError) as exc:
@@ -1608,11 +1690,16 @@ class JevHTTPBackend:
                     status="failed" if not isinstance(exc, PermissionError) else "deferred",
                     diagnostics=[{"kind": "request_rejected", "status": "failed", "message": str(exc)}],
                     metadata={"live_status": "deferred" if isinstance(exc, PermissionError) else "failed"},
-                    usage=self.ledger.usage(),
-                    ledger=self.ledger,
+                    usage=self.ledger.snapshot(ledger_start).usage(),
+                    ledger=self.ledger.snapshot(ledger_start),
                     provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
-        return SemanticResponse(status="failed", diagnostics=diagnostics, usage=self.ledger.usage(), ledger=self.ledger)
+        return SemanticResponse(
+            status="failed",
+            diagnostics=diagnostics,
+            usage=self.ledger.snapshot(ledger_start).usage(),
+            ledger=self.ledger.snapshot(ledger_start),
+        )
 
 
 # Compatibility aliases used by callers that spell the adapter differently.

@@ -17,3 +17,11 @@ terminal, and HTML reports; deterministic offline facts and legacy
 compatibility fields remain available. A missing `TYPESAFE_API_KEY` is reported
 as live deferred, and synthetic mock validation is not presented as live/API or
 human-label proof.
+
+Pre-archive repair now keeps native Score answers whose weighted value differs
+within a bound derived from the response's visible decimal precision, retaining
+the reported score/distribution and a consistency diagnostic while still
+rejecting gross contradictions. Reused backends expose per-session ledger and
+usage snapshots; aggregate request, attempt, and byte budgets remain bounded at
+backend-instance scope. Offline parser diagnostic provenance is also aligned
+with the accepted prerequisite repair.

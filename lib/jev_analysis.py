@@ -29,6 +29,7 @@ from .semantic_backend import (
     SemanticState,
     SemanticUsage,
     UnavailableSemanticBackend,
+    BUDGET_SCOPE,
     DEFAULT_JEV_MODEL,
     build_default_backend,
     stable_hash,
@@ -88,13 +89,6 @@ def _capabilities(backend: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
-
-
-def _response_ledger(response: Optional[SemanticResponse], backend: Any) -> SemanticLedger:
-    if response is not None and isinstance(response.ledger, SemanticLedger):
-        return response.ledger
-    ledger = getattr(backend, "ledger", None)
-    return ledger if isinstance(ledger, SemanticLedger) else SemanticLedger()
 
 
 def _usable_answer(answer: SemanticAnswer) -> bool:
@@ -232,6 +226,7 @@ def run_semantic_batch(
     raw_judgments: List[Dict[str, Any]] = []
     stages: List[Dict[str, Any]] = []
     latest_response: Optional[SemanticResponse] = None
+    report_ledger = SemanticLedger()
     selected_case_count = len(cases)
     original_case_count = max(selected_case_count, int(source_case_count or selected_case_count))
     excluded_case_count = max(0, original_case_count - selected_case_count)
@@ -302,6 +297,8 @@ def run_semantic_batch(
                 overall_status = "partial"
                 break
             _append_response(latest_response, answers, diagnostics, raw_judgments)
+            if isinstance(latest_response.ledger, SemanticLedger):
+                report_ledger.extend(latest_response.ledger)
             requests_used += 1
             request_bytes_used += batch.estimated_bytes
             stage_record["batch_count"] += 1
@@ -316,7 +313,7 @@ def run_semantic_batch(
         if overall_status in {"deferred", "unknown"}:
             break
 
-    ledger = _response_ledger(latest_response, backend)
+    ledger = report_ledger
     if not latest_response and isinstance(backend, UnavailableSemanticBackend):
         overall_status = "deferred"
     if latest_response is not None and latest_response.status == "deferred":
@@ -341,6 +338,8 @@ def run_semantic_batch(
             "selected_case_count": selected_case_count,
             "excluded_case_count": excluded_case_count,
             "usage_scope": "request_attempt_deduplicated",
+            "ledger_scope": "single_session_evaluation",
+            "budget_scope": BUDGET_SCOPE,
         }
     )
     state_summary: Dict[str, Any] = {

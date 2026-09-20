@@ -12,6 +12,10 @@ record-size budgets with honest partial coverage. Portable replay retains
 typed full-output SNR facts while keeping evidence text bounded, so direct and
 export/import analysis agree.
 
+Raw-input limit diagnostics now distinguish a retained usable prefix
+(`partial`) from an input with no usable records (`failed`), and parser
+diagnostics keep numeric line and source-reference fields consistent.
+
 Process-v2 now reports projected chronology as unknown, uses direct lifecycle
 identity evidence consistently, and keeps default terminal/table/HTML output
 free of legacy composite narratives. Bundle evidence can shrink to its byte or

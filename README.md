@@ -53,7 +53,13 @@ is `jev-latest`, independent of the source session's logged model. Native
 Choice/Score probability data, Score legends, and confidence are retained only
 when provided by Jev. If a semantic case cap samples the source bundle, JSON
 coverage reports source, selected, excluded, and sampling counts instead of
-claiming complete coverage.
+claiming complete coverage. Native Score consistency validation retains the
+provider's score and distribution and allows only a bounded discrepancy derived
+from the visible decimal precision; this is a local interoperability policy,
+not a claim about undocumented provider arithmetic. When a backend is reused
+for a batch, each session report snapshots only its own request/attempt usage,
+while request, attempt, and byte caps remain aggregate at backend-instance
+scope and are disclosed in provenance.
 
 ## Version
 

@@ -210,6 +210,46 @@ class JevSemanticRegressionTest(unittest.TestCase):
         self.assertEqual(result.answers["s0"].value, 1.6)
         self.assertEqual(result.answers["s0"].legend["2"], "continuous")
 
+    def test_native_score_preserves_recorded_finite_precision_response(self):
+        question = SemanticQuestion(
+            question_id="score-precision",
+            axis_id="CONV",
+            prompt="Evaluate the recorded delivery claim.",
+            answer_type="score",
+            score_levels=("unsupported", "partially_supported", "supported"),
+            case_id="case-1",
+        )
+        raw = {
+            "question_id": question.question_id,
+            "type": "score",
+            "score": 0.07,
+            "confidence": 0.89,
+            "legend": {
+                "0": "unsupported",
+                "1": "partially_supported",
+                "2": "supported",
+            },
+            "probabilities": {"0": 0.97, "1": 0.0, "2": 0.03},
+        }
+
+        answer = validate_answer(question, raw)
+
+        self.assertEqual(answer.value, 0.07)
+        self.assertEqual(answer.probabilities, {"0": 0.97, "1": 0.0, "2": 0.03})
+        self.assertAlmostEqual(answer.metadata["score_consistency"]["weighted_value"], 0.06)
+        self.assertAlmostEqual(answer.metadata["score_consistency"]["absolute_delta"], 0.01)
+        self.assertGreater(answer.metadata["score_consistency"]["tolerance"], 0.01)
+
+        with self.assertRaises(SemanticValidationError):
+            validate_answer(
+                question,
+                {
+                    **raw,
+                    "score": 0.90,
+                    "probabilities": {"0": 1.0, "1": 0.0, "2": 0.0},
+                },
+            )
+
     def test_identical_wire_calls_count_independent_requests_and_invalid_json_counts_attempt(self):
         question = SemanticQuestion(
             question_id="q",
@@ -226,14 +266,75 @@ class JevSemanticRegressionTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"}, clear=False):
             backend = JevHTTPBackend(opener=opener)
-            backend.evaluate({"state_id": "s", "data": {"bounded": True}}, [question], budget=SemanticBudget(max_requests=2, max_attempts=2, max_retries=0))
+            first = backend.evaluate({"state_id": "s", "data": {"bounded": True}}, [question], budget=SemanticBudget(max_requests=2, max_attempts=2, max_retries=0))
             second = backend.evaluate({"state_id": "s", "data": {"bounded": True}}, [question], budget=SemanticBudget(max_requests=2, max_attempts=2, max_retries=0))
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(second.ledger.request_count, 2)
-        self.assertEqual(second.ledger.attempt_count, 2)
-        self.assertEqual(second.usage.to_dict()["total_tokens"], 12)
-        self.assertNotEqual(second.ledger.attempts[0].attempt_id, second.ledger.attempts[1].attempt_id)
+        self.assertEqual(first.ledger.request_count, 1)
+        self.assertEqual(first.ledger.attempt_count, 1)
+        self.assertEqual(first.usage.to_dict()["total_tokens"], 6)
+        self.assertEqual(second.ledger.request_count, 1)
+        self.assertEqual(second.ledger.attempt_count, 1)
+        self.assertEqual(second.usage.to_dict()["total_tokens"], 6)
+        self.assertEqual(backend.ledger.request_count, 2)
+        self.assertEqual(backend.ledger.attempt_count, 2)
+        self.assertEqual(backend.ledger.usage().to_dict()["total_tokens"], 12)
+        self.assertNotEqual(first.ledger.attempts[0].attempt_id, second.ledger.attempts[0].attempt_id)
+
+    def test_reused_backend_scopes_two_session_reports_and_keeps_aggregate_caps(self):
+        question = SemanticQuestion(
+            question_id="q",
+            axis_id="STATE",
+            prompt="state sufficiency",
+            answer_type="noul",
+            case_id="case-1",
+        )
+
+        class SessionResponse:
+            status = 200
+            headers = {}
+
+            def __init__(self, state_id):
+                self.state_id = state_id
+
+            def read(self, limit=-1):
+                return json.dumps(
+                    {
+                        "model": "jev-1.13.0",
+                        "answers": {"q": {"type": "noul", "noul": 0.75}},
+                        "usage": {"input_tokens": len(self.state_id), "output_tokens": 2, "total_tokens": len(self.state_id) + 2},
+                    }
+                ).encode("utf-8")
+
+        states = []
+
+        def opener(request, timeout):
+            payload = json.loads(request.data)
+            state_id = payload["state"]["state_id"]
+            states.append(state_id)
+            return SessionResponse(state_id)
+
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"}, clear=False):
+            backend = JevHTTPBackend(opener=opener)
+            first = backend.evaluate(
+                {"state_id": "session-a", "data": {}},
+                [question],
+                budget=SemanticBudget(max_requests=4, max_attempts=4, max_retries=0),
+            )
+            second = backend.evaluate(
+                {"state_id": "session-b", "data": {}},
+                [question],
+                budget=SemanticBudget(max_requests=4, max_attempts=4, max_retries=0),
+            )
+
+        self.assertEqual(states, ["session-a", "session-b"])
+        self.assertNotEqual(first.ledger.attempts[0].request_id, second.ledger.attempts[0].request_id)
+        self.assertEqual(first.usage.to_dict()["total_tokens"], len("session-a") + 2)
+        self.assertEqual(second.usage.to_dict()["total_tokens"], len("session-b") + 2)
+        self.assertEqual(first.ledger.attempt_count, 1)
+        self.assertEqual(second.ledger.attempt_count, 1)
+        self.assertEqual(backend.ledger.attempt_count, 2)
+        self.assertEqual(backend.ledger.usage().to_dict()["total_tokens"], len("session-a") + len("session-b") + 4)
 
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-key"}, clear=False):
             invalid = JevHTTPBackend(opener=lambda request, timeout: _Response(b"not-json")).evaluate(
@@ -323,6 +424,42 @@ class JevSemanticRegressionTest(unittest.TestCase):
         self.assertEqual(result.state["offline_coverage"], bundle.coverage)
         self.assertIn("stage1_judgments", calls[1]["data"])
         self.assertTrue(calls[1]["data"]["stage1_judgments"])
+
+    def test_shared_semantic_backend_keeps_session_ledgers_independent(self):
+        def handler(state, questions):
+            answers = {}
+            for question in questions:
+                if question["answer_type"] == "choice":
+                    value = question["choices"][0]
+                elif question["answer_type"] == "noul":
+                    value = 0.8
+                else:
+                    value = question["score_levels"][-1]
+                answers[question["question_id"]] = {
+                    "question_id": question["question_id"],
+                    "type": question["type"],
+                    "value": value,
+                }
+            return {"answers": answers, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+
+        backend = MockSemanticBackend(handler=handler)
+        budget = SemanticBudget(max_requests=8, max_attempts=8)
+        first = evaluate_session_semantic(self._session(), backend=backend, budget=budget)
+        second_session = Session(
+            id="semantic-fixture-second",
+            source="codex",
+            turns=[Turn(index=1, user_input="second", assistant_output="second")],
+        )
+        second = evaluate_session_semantic(second_session, backend=backend, budget=budget)
+
+        self.assertEqual(first.ledger["attempt_count"], 2)
+        self.assertEqual(second.ledger["attempt_count"], 2)
+        self.assertEqual(first.usage["total_tokens"], 30)
+        self.assertEqual(second.usage["total_tokens"], 30)
+        self.assertEqual(backend.ledger.attempt_count, 4)
+        self.assertEqual(backend.ledger.usage().to_dict()["total_tokens"], 60)
+        self.assertEqual(first.provenance["ledger_scope"], "single_session_evaluation")
+        self.assertEqual(first.provenance["budget_scope"], "backend_instance_aggregate")
 
     def test_429_retries_with_retry_after_but_401_and_timeout_do_not(self):
         question = SemanticQuestion(
