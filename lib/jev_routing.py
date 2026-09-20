@@ -204,6 +204,7 @@ class RoutingPilotResult:
     baseline_selected_count: int = 0
     agreement_count: int = 0
     denominator: int = 0
+    valid_case_count: int = 0
     agreement: Optional[float] = None
     label_status: str = "synthetic_expectations_only"
     quality_authority: Optional[str] = None
@@ -218,6 +219,7 @@ class RoutingPilotResult:
             "baseline_selected_count": self.baseline_selected_count,
             "agreement_count": self.agreement_count,
             "denominator": self.denominator,
+            "valid_case_count": self.valid_case_count,
             "agreement": self.agreement,
             "label_status": self.label_status,
             "quality_authority": self.quality_authority,
@@ -438,6 +440,53 @@ def _candidate_card(candidate: Any) -> Dict[str, Any]:
     }
 
 
+def _backend_counter(backend: Any, name: str) -> int:
+    ledger = getattr(backend, "ledger", None)
+    value = getattr(ledger, name, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _routing_budget_for_backend(backend: Any, additional_requests: int = 1) -> Any:
+    """Build a bounded budget for routing calls without resetting backend usage.
+
+    Semantic budgets are aggregate limits on a backend instance.  A routing
+    helper may therefore receive a backend that has already served a semantic
+    stage.  If the caller did not provide that stage's budget, permit only the
+    explicitly requested number of additional routing calls and account for
+    the existing ledger entries instead of passing a fresh ``max_requests=1``
+    budget that turns the second call into a spurious fallback.
+    """
+
+    from .semantic_backend import SemanticBudget
+
+    aggregate_budget = getattr(backend, "aggregate_budget", None)
+    if aggregate_budget is not None:
+        return aggregate_budget
+
+    additional = max(1, int(additional_requests or 1))
+    prior_requests = _backend_counter(backend, "request_count")
+    prior_attempts = _backend_counter(backend, "attempt_count")
+    prior_bytes = getattr(backend, "_request_bytes", 0)
+    if not isinstance(prior_bytes, int) or isinstance(prior_bytes, bool) or prior_bytes < 0:
+        prior_bytes = 0
+    max_requests = prior_requests + additional
+    max_attempts = max(prior_attempts + additional, max_requests)
+    return SemanticBudget(
+        max_requests=max_requests,
+        max_attempts=max_attempts,
+        max_questions=1,
+        max_cases=1,
+        max_total_bytes=max(1_000_000, prior_bytes + 256_000 * additional),
+        max_retries=0,
+    )
+
+
+def _routing_budget(backend: Any, budget: Any) -> Any:
+    if budget is not None:
+        return budget
+    return _routing_budget_for_backend(backend)
+
+
 def choose_model(
     candidates: Sequence[Any] | AnalysisRequest,
     request: Optional[AnalysisRequest] | Sequence[Any] = None,
@@ -518,7 +567,7 @@ def choose_model(
     try:
         from .semantic_backend import SemanticBudget, SemanticState
 
-        selected_budget = budget or SemanticBudget(max_requests=1, max_attempts=1, max_questions=1, max_cases=1, max_retries=0)
+        selected_budget = _routing_budget(backend, budget)
         state = SemanticState(
             state_id=f"routing-{actual_request.request_id}",
             data={
@@ -600,13 +649,43 @@ def routing_vs_baseline(
     *,
     backend: Any = None,
     allow_unknown: bool = False,
+    budget: Any = None,
 ) -> RoutingPilotResult:
-    """Compare routed selection with deterministic priority on synthetic cases."""
+    """Compare Jev routing with deterministic priority on bounded synthetic cases.
+
+    A backend is required for a meaningful comparison.  Budget exhaustion,
+    Jev abstention, and a missing backend remain invalid comparison cases and
+    cannot be counted as agreement with the deterministic baseline.
+    """
 
     request_list = [requests] if isinstance(requests, AnalysisRequest) else list(requests)
     result = RoutingPilotResult(denominator=len(request_list))
+    pilot_budget = None
+    if backend is not None:
+        pilot_budget = budget if budget is not None else _routing_budget_for_backend(backend, len(request_list))
     for index, request in enumerate(request_list, 1):
-        routed = choose_model(candidates, request, backend=backend, allow_unknown=allow_unknown, use_jev=backend is not None)
+        if backend is None:
+            routed = RouteDecision(
+                status="not_applicable",
+                routing_source="none",
+                request=request.to_dict(),
+                diagnostics=[
+                    {
+                        "kind": "semantic_backend_required",
+                        "status": "not_applicable",
+                        "message": "routing comparison requires a semantic backend",
+                    }
+                ],
+            )
+        else:
+            routed = choose_model(
+                candidates,
+                request,
+                backend=backend,
+                budget=pilot_budget,
+                allow_unknown=allow_unknown,
+                use_jev=True,
+            )
         baseline = choose_model(candidates, request, allow_unknown=allow_unknown, use_jev=False)
         routed_id = candidate_id(routed.candidate) if routed.candidate is not None else None
         baseline_id = candidate_id(baseline.candidate) if baseline.candidate is not None else None
@@ -614,7 +693,29 @@ def routing_vs_baseline(
             result.routed_selected_count += 1
         if baseline.candidate is not None:
             result.baseline_selected_count += 1
-        if routed_id is not None and routed_id == baseline_id:
+        valid = (
+            backend is not None
+            and routed.status == "selected"
+            and routed.routing_source == "jev"
+            and routed_id is not None
+            and baseline_id is not None
+        )
+        case_agreement: Optional[bool] = None
+        if valid:
+            result.valid_case_count += 1
+            case_agreement = routed_id == baseline_id
+        else:
+            result.diagnostics.append(
+                {
+                    "kind": "routing_comparison_incomplete",
+                    "status": "partial" if backend is not None else "not_applicable",
+                    "case": index,
+                    "routing_source": routed.routing_source,
+                    "routing_status": routed.status,
+                    "routing_diagnostics": list(routed.diagnostics),
+                }
+            )
+        if case_agreement:
             result.agreement_count += 1
         result.cases.append(
             {
@@ -622,13 +723,22 @@ def routing_vs_baseline(
                 "request_id": request.request_id,
                 "routed": routed.to_dict(),
                 "baseline": baseline.to_dict(),
-                "agreement": routed_id is not None and routed_id == baseline_id,
+                "agreement": case_agreement,
+                "comparison_status": "valid" if valid else "invalid",
             }
         )
     if not request_list:
         return result
-    result.agreement = result.agreement_count / result.denominator
-    result.status = "complete" if result.baseline_selected_count == result.denominator else "partial"
+    if (
+        result.valid_case_count == result.denominator
+        and result.baseline_selected_count == result.denominator
+        and result.routed_selected_count == result.denominator
+    ):
+        result.agreement = result.agreement_count / result.denominator
+        result.status = "complete"
+    else:
+        result.agreement = None
+        result.status = "partial" if backend is not None else "not_applicable"
     if result.routed_selected_count < result.denominator:
         result.diagnostics.append({"kind": "routed_selection_incomplete", "status": "partial"})
     result.diagnostics.append(

@@ -6,4 +6,5 @@
 - [x] Run the selected analyzer through bounded argv/stdin adapters and record requested/actual model/settings plus native usage without fabricating unknown tokens.
 - [x] Batch-check generated claims/recommendations against frozen original evidence with Jev, preserving contradictions, abstentions, and at most one repair.
 - [x] Complete whole-batch status, renderer/CLI integration, legacy regression, synthetic E2E, routing-vs-baseline pilot, and documentation.
+- [x] Repair the routing-vs-baseline pilot's aggregate budget/error handling, add meaningful multi-case Jev-vs-baseline regressions, isolate failed catalog entries per analyzer invocation, and align the installed agy stdin adapter with native usage capture.
 - [ ] Complete adversarial review and root integrated verification for this slice.

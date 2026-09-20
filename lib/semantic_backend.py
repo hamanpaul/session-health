@@ -1094,6 +1094,7 @@ class GenericSemanticBackend:
         self.ledger = SemanticLedger()
         self._request_bytes = 0
         self._invocation_count = 0
+        self.aggregate_budget: Optional[SemanticBudget] = None
 
     def evaluate(
         self,
@@ -1103,6 +1104,8 @@ class GenericSemanticBackend:
         budget: Optional[SemanticBudget] = None,
     ) -> SemanticResponse:
         budget = budget or SemanticBudget()
+        if self.aggregate_budget is None:
+            self.aggregate_budget = budget
         ledger_start = len(self.ledger.attempts)
         normalized_state = state.to_dict() if isinstance(state, SemanticState) else _safe_mapping(state)
         normalized_questions = [question.to_dict() for question in questions]
@@ -1323,6 +1326,7 @@ class JevHTTPBackend:
         self.ledger = SemanticLedger()
         self._request_bytes = 0
         self._invocation_count = 0
+        self.aggregate_budget: Optional[SemanticBudget] = None
 
     def _request(self, payload: Mapping[str, Any], budget: SemanticBudget) -> TransportResult:
         key = os.environ.get("TYPESAFE_API_KEY")
@@ -1386,6 +1390,8 @@ class JevHTTPBackend:
         budget: Optional[SemanticBudget] = None,
     ) -> SemanticResponse:
         budget = budget or SemanticBudget()
+        if self.aggregate_budget is None:
+            self.aggregate_budget = budget
         ledger_start = len(self.ledger.attempts)
         normalized_state = state.to_dict() if isinstance(state, SemanticState) else _safe_mapping(state)
         if len(questions) > budget.max_questions:

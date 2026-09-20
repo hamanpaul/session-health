@@ -82,7 +82,11 @@ frozen evidence snapshot; contradictions and insufficient evidence remain
 visible and repair is limited to one round. A routing or analyzer failure keeps
 the deterministic process-v2 report and marks the second-stage status partial.
 The standard-library `routing_vs_baseline` pilot reports selection agreement
-only; it intentionally carries no quality authority or calibration claim.
+only; it intentionally carries no quality authority or calibration claim. A
+semantic backend and meaningful multi-case fixture are required. Budget
+exhaustion, Jev abstention, or another routing failure produces a partial
+comparison with no agreement value rather than being counted as baseline
+agreement.
 
 ## Version
 
@@ -602,7 +606,7 @@ executor/model candidates（實際可用性仍需 operator entry 或 explicit ov
 |------|-------|------|
 | 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 -c model_reasoning_effort=high exec -` |
 | 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p -` |
-| 3 | agy (Gemini 3.8 Flash High) | `agy --model gemini-3.8-flash-high --effort high --input -` |
+| 3 | agy (Gemini 3.8 Flash High) | `agy --model gemini-3.8-flash-high --effort high --input-format text --output-format json --print -` |
 | 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p -` |
 
 分析結果包含：

@@ -193,7 +193,22 @@ def _build_copilot_sonnet_cmd(_prompt: str) -> List[str]:
 
 
 def _build_agy_cmd(_prompt: str) -> List[str]:
-    return ["agy", "--model", "gemini-3.8-flash-high", "--effort", "high", "--input", "-"]
+    # agy reads the bounded prompt from stdin when the print prompt is ``-``.
+    # Keep JSON output so native usage remains available when the provider
+    # reports it; the parser accepts its ``response`` field below.
+    return [
+        "agy",
+        "--model",
+        "gemini-3.8-flash-high",
+        "--effort",
+        "high",
+        "--input-format",
+        "text",
+        "--output-format",
+        "json",
+        "--print",
+        "-",
+    ]
 
 
 def _build_gemini_cmd(_prompt: str) -> List[str]:
@@ -373,7 +388,10 @@ def _parse_structured_output(output: str) -> Tuple[str, Dict[str, Any], Optional
     if not isinstance(payload, Mapping):
         return output, {}, None, {}, SemanticUsage().to_dict()
     structured = _redact_value(dict(payload))
-    text = payload.get("text", payload.get("analysis", payload.get("output", "")))
+    text = payload.get(
+        "text",
+        payload.get("response", payload.get("analysis", payload.get("output", ""))),
+    )
     if not isinstance(text, str):
         text = output
     text = _redact_text(text)
@@ -449,6 +467,7 @@ def call_agent(
     test_mode: bool = False,
     *,
     routing_backend: Any = None,
+    routing_budget: Any = None,
     backend: Any = None,
     model_override: str = "",
     request: Optional[AnalysisRequest] = None,
@@ -460,7 +479,8 @@ def call_agent(
 
     if max_retries < 0:
         raise ValueError("max_retries must be non-negative")
-    candidates = [TEST_AGENT.clone()] if test_mode else list(agent_chain or AGENT_CHAIN)
+    source_chain = [TEST_AGENT] if test_mode else (agent_chain if agent_chain is not None else AGENT_CHAIN)
+    candidates = [item.clone() for item in source_chain]
     explicit_chain = agent_chain is not None or test_mode
     chosen_backend = routing_backend if routing_backend is not None else backend
     effective_request = request or AnalysisRequest(
@@ -490,7 +510,7 @@ def call_agent(
     last: Optional[AgentAnalysis] = None
     max_rounds = min(max_retries, effective_request.budget.max_reselections) + 1
     for round_index in range(max_rounds):
-        decision = choose_model(candidates, effective_request, backend=chosen_backend, explicit_override=effective_request.model_override, allow_unknown=explicit_chain, use_jev=jev_enabled, exclude=excluded)
+        decision = choose_model(candidates, effective_request, backend=chosen_backend, budget=routing_budget, explicit_override=effective_request.model_override, allow_unknown=explicit_chain, use_jev=jev_enabled, exclude=excluded)
         decision.reselection_count = round_index
         if decision.candidate is None:
             return AgentAnalysis(success=False, error="no suitable analyzer model", requested_model=effective_request.model_override or None, routing=decision, attempts=attempts, diagnostics=decision.diagnostics)

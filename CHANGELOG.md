@@ -11,6 +11,10 @@
   evidence-frozen Jev post-checks that preserve contradictions/abstentions and
   allow at most one repair round. Routing and post-check metadata are additive
   in JSON, terminal, and HTML reports.
+- Repaired routing pilot aggregate-budget accounting and invalid-case reporting,
+  isolated failed analyzer catalog entries per invocation, and aligned the agy
+  stdin adapter with its installed `--print -` contract while retaining native
+  usage capture.
 - Added explicit `--jev` semantic reporting with bounded typed Choice/Noul/Score
   batches, seven versioned axis question groups, shared redacted state,
   request-level provenance/usage accounting, and deferred status when live Jev
