@@ -66,6 +66,7 @@ def _available_agy() -> AgentConfig:
 class Stage2WiringTest(unittest.TestCase):
     def test_single_prompt_contains_independent_stage2_layers_and_redacts(self):
         score = score_session(_session())
+        private_ref = "/".join(("", "home", "synthetic-user", "private.jsonl"))
         bundle = {
             "manifest": {"schema": "session-health.session-bundle", "source_ref": "fixture.jsonl#L1"},
             "facts": {"metric_facts": {"system": "system-secret", "api_key": "do-not-send"}},
@@ -73,7 +74,7 @@ class Stage2WiringTest(unittest.TestCase):
                 {
                     "kind": "system_message",
                     "payload": {"text": "system-secret"},
-                    "source_ref": "/home/paul/private.jsonl#L2",
+                    "source_ref": private_ref + "#L2",
                 },
                 {
                     "kind": "tool_result",
@@ -139,7 +140,7 @@ class Stage2WiringTest(unittest.TestCase):
         self.assertIn("emitted_fields", prompt)
         self.assertNotIn("system-secret", prompt)
         self.assertNotIn("do-not-send", prompt)
-        self.assertNotIn("/home/paul/private.jsonl", prompt)
+        self.assertNotIn(private_ref, prompt)
         self.assertIn('"observations"', prompt)
         self.assertIn('"recommendations"', prompt)
 
