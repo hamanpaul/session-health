@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import os
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -145,12 +148,68 @@ class JevRoutingRegressionTest(unittest.TestCase):
                 "--output-format",
                 "json",
                 "--print",
-                "-",
             ],
         )
+        self.assertNotIn("secret-free prompt", seen["argv"])
         self.assertEqual(seen["input"], "secret-free prompt")
         self.assertEqual(result.raw_response, "bounded result")
         self.assertEqual(result.native_usage["total_tokens"], 7)
+
+    def test_agy_adapter_delivers_prompt_to_real_subprocess_stdin(self):
+        candidate = AgentConfig(
+            "agy/gemini-3.8-flash-high",
+            _build_agy_cmd,
+            executor="agy",
+            provider="google",
+            route="agy.prompt",
+            model_id="gemini-3.8-flash-high",
+            inference_settings={"effort": "high", "stdin": True},
+            availability={
+                "status": "available",
+                "provenance": "operator",
+                "checked_at": "2026-09-20T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+        prompt = "bounded prompt marker\nsecond line"
+        expected_argv = [
+            "--model",
+            "gemini-3.8-flash-high",
+            "--effort",
+            "high",
+            "--input-format",
+            "text",
+            "--output-format",
+            "json",
+            "--print",
+        ]
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake_agy = Path(tempdir) / "agy"
+            fake_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import sys\n"
+                "prompt = sys.stdin.read()\n"
+                "print(json.dumps({\n"
+                "    'response': prompt,\n"
+                "    'model': 'fake-actual',\n"
+                "    'usage': {'input_tokens': 4, 'output_tokens': 3, 'total_tokens': 7},\n"
+                "    'argv': sys.argv[1:],\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
+            path = os.pathsep.join([tempdir, os.environ.get("PATH", "")])
+            with patch.dict(os.environ, {"PATH": path}):
+                result = call_agent(prompt, agent_chain=[candidate], max_retries=0)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.raw_response, prompt)
+        self.assertEqual(result.actual_model, "fake-actual")
+        self.assertEqual(result.native_usage["total_tokens"], 7)
+        self.assertEqual(result.structured_output["response"], prompt)
+        self.assertEqual(result.structured_output["argv"], expected_argv)
 
     def test_failed_execution_does_not_mutate_catalog_across_invocations(self):
         candidate = self._candidate("fixture/model", 1)

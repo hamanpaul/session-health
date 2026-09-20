@@ -193,7 +193,9 @@ def _build_copilot_sonnet_cmd(_prompt: str) -> List[str]:
 
 
 def _build_agy_cmd(_prompt: str) -> List[str]:
-    # agy reads the bounded prompt from stdin when the print prompt is ``-``.
+    # With text input format, agy reads the bounded prompt from stdin.  Do not
+    # append a positional prompt (including ``-``): the installed CLI ignores
+    # command-line prompts when ``--input-format text`` is selected.
     # Keep JSON output so native usage remains available when the provider
     # reports it; the parser accepts its ``response`` field below.
     return [
@@ -207,7 +209,6 @@ def _build_agy_cmd(_prompt: str) -> List[str]:
         "--output-format",
         "json",
         "--print",
-        "-",
     ]
 
 
