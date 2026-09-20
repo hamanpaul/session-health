@@ -177,6 +177,15 @@ def stable_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def _bounded_identity(value: Any, *, limit: int = 256) -> Optional[str]:
+    """Keep provider identities portable without inventing missing values."""
+
+    if not isinstance(value, str):
+        return None
+    sanitized = re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
+    return sanitized[:limit] or None
+
+
 @dataclass(frozen=True)
 class SemanticBudget:
     """All limits used by one semantic run.
@@ -1311,7 +1320,7 @@ class JevHTTPBackend:
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.endpoint = endpoint
-        self.model = str(model).strip() or DEFAULT_JEV_MODEL
+        self.model = _bounded_identity(model) or DEFAULT_JEV_MODEL
         self._opener = opener or urlopen
         self._sleep = sleep_fn or time.sleep
         self._clock = clock or time.monotonic
@@ -1464,6 +1473,7 @@ class JevHTTPBackend:
                         validation = [{"kind": "invalid_response", "status": "failed", "message": str(exc)}]
                     diagnostics.extend(validation)
                     attempt_status = "complete" if not validation else "partial"
+                    actual_model = _bounded_identity(response_payload.get("model"))
                     self.ledger.add(
                         RequestAttempt(
                             request_id=request_id,
@@ -1481,7 +1491,15 @@ class JevHTTPBackend:
                         status="complete" if len(answers) == len(questions) and not validation else "partial",
                         answers=answers,
                         diagnostics=diagnostics,
-                        metadata={"live_status": "complete", "http_status": status_code, "model": response_payload.get("model", self.model)},
+                        metadata={
+                            "live_status": "complete",
+                            "http_status": status_code,
+                            "model": actual_model,
+                            "requested_model": self.model,
+                            "actual_model": actual_model,
+                            "request_id": request_id,
+                            "response_hash": response_hash,
+                        },
                         usage=self.ledger.snapshot(ledger_start).usage(),
                         ledger=self.ledger.snapshot(ledger_start),
                         provenance={
