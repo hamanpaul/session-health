@@ -13,8 +13,8 @@
   in JSON, terminal, and HTML reports.
 - Repaired routing pilot aggregate-budget accounting and invalid-case reporting,
   isolated failed analyzer catalog entries per invocation, and aligned the agy
-  stdin adapter with the installed `--input-format text` contract (without a
-  positional `-`) while retaining native usage capture.
+  adapter with the installed `--print <prompt>` argv contract while retaining
+  the native JSON response/usage capture.
 - Added explicit `--jev` semantic reporting with bounded typed Choice/Noul/Score
   batches, seven versioned axis question groups, shared redacted state,
   request-level provenance/usage accounting, and deferred status when live Jev

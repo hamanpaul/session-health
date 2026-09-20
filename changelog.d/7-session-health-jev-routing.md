@@ -23,8 +23,9 @@ budgets across all cases. Budget failures and Jev abstentions remain partial
 and are not counted as baseline agreement; a missing semantic backend is
 reported as not applicable. Analyzer catalog entries are cloned per invocation
 so execution failures cannot mutate the shared catalog. The agy adapter uses
-the installed `--input-format text` stdin contract (without a positional `-`)
-and JSON output for native usage when the provider reports it.
+the installed `--print <prompt>` argv contract and JSON output for native
+usage when the provider reports it. The stdin-only `stream-json` mode is not
+used because it requires a different stream-json output envelope.
 
 Synthetic routing/post-check fixtures are not live executor, API, or human-label
 proof; live availability and quality remain explicitly provisional.

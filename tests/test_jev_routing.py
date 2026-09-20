@@ -99,7 +99,7 @@ class JevRoutingRegressionTest(unittest.TestCase):
         self.assertEqual(result.actual_model, "fixture-actual")
         self.assertIsNone(result.native_usage["total_tokens"])
 
-    def test_agy_adapter_uses_supported_print_stdin_contract_and_native_usage(self):
+    def test_agy_adapter_uses_supported_print_argv_contract_and_native_usage(self):
         candidate = AgentConfig(
             "agy/gemini-3.8-flash-high",
             _build_agy_cmd,
@@ -107,7 +107,7 @@ class JevRoutingRegressionTest(unittest.TestCase):
             provider="google",
             route="agy.prompt",
             model_id="gemini-3.8-flash-high",
-            inference_settings={"effort": "high", "stdin": True},
+            inference_settings={"effort": "high", "prompt_transport": "argv"},
             availability={
                 "status": "available",
                 "provenance": "operator",
@@ -143,19 +143,17 @@ class JevRoutingRegressionTest(unittest.TestCase):
                 "gemini-3.8-flash-high",
                 "--effort",
                 "high",
-                "--input-format",
-                "text",
                 "--output-format",
                 "json",
                 "--print",
+                "secret-free prompt",
             ],
         )
-        self.assertNotIn("secret-free prompt", seen["argv"])
-        self.assertEqual(seen["input"], "secret-free prompt")
+        self.assertEqual(seen["input"], "")
         self.assertEqual(result.raw_response, "bounded result")
         self.assertEqual(result.native_usage["total_tokens"], 7)
 
-    def test_agy_adapter_delivers_prompt_to_real_subprocess_stdin(self):
+    def test_agy_adapter_delivers_prompt_to_real_subprocess_argv(self):
         candidate = AgentConfig(
             "agy/gemini-3.8-flash-high",
             _build_agy_cmd,
@@ -163,7 +161,7 @@ class JevRoutingRegressionTest(unittest.TestCase):
             provider="google",
             route="agy.prompt",
             model_id="gemini-3.8-flash-high",
-            inference_settings={"effort": "high", "stdin": True},
+            inference_settings={"effort": "high", "prompt_transport": "argv"},
             availability={
                 "status": "available",
                 "provenance": "operator",
@@ -177,11 +175,10 @@ class JevRoutingRegressionTest(unittest.TestCase):
             "gemini-3.8-flash-high",
             "--effort",
             "high",
-            "--input-format",
-            "text",
             "--output-format",
             "json",
             "--print",
+            prompt,
         ]
 
         with tempfile.TemporaryDirectory() as tempdir:
@@ -190,12 +187,14 @@ class JevRoutingRegressionTest(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json\n"
                 "import sys\n"
-                "prompt = sys.stdin.read()\n"
+                "argv = sys.argv[1:]\n"
+                "prompt = argv[argv.index('--print') + 1]\n"
                 "print(json.dumps({\n"
                 "    'response': prompt,\n"
                 "    'model': 'fake-actual',\n"
                 "    'usage': {'input_tokens': 4, 'output_tokens': 3, 'total_tokens': 7},\n"
-                "    'argv': sys.argv[1:],\n"
+                "    'argv': argv,\n"
+                "    'stdin': sys.stdin.read(),\n"
                 "}))\n",
                 encoding="utf-8",
             )
@@ -210,6 +209,7 @@ class JevRoutingRegressionTest(unittest.TestCase):
         self.assertEqual(result.native_usage["total_tokens"], 7)
         self.assertEqual(result.structured_output["response"], prompt)
         self.assertEqual(result.structured_output["argv"], expected_argv)
+        self.assertEqual(result.structured_output["stdin"], "")
 
     def test_failed_execution_does_not_mutate_catalog_across_invocations(self):
         candidate = self._candidate("fixture/model", 1)

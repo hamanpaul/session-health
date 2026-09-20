@@ -606,7 +606,7 @@ executor/model candidates（實際可用性仍需 operator entry 或 explicit ov
 |------|-------|------|
 | 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 -c model_reasoning_effort=high exec -` |
 | 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p -` |
-| 3 | agy (Gemini 3.8 Flash High) | `agy --model gemini-3.8-flash-high --effort high --input-format text --output-format json --print` |
+| 3 | agy (Gemini 3.8 Flash High) | `agy --model gemini-3.8-flash-high --effort high --output-format json --print <bounded-prompt>` |
 | 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p -` |
 
 分析結果包含：
@@ -614,8 +614,9 @@ executor/model candidates（實際可用性仍需 operator entry 或 explicit ov
 - **低分維度改善建議** — 針對 <70 分的維度給出具體建議
 - **最重要的改善行動** — 單一最有效的改善步驟
 
-分析 prompt 由 stdin 傳入，並受 context/output/timeout 上限約束；agy 的 text print
-mode 不附帶命令列 prompt（`-` 會被忽略）。不使用 `--yolo`。使用 `--test-agent`
+分析 prompt 由各 executor 的 bounded argv/stdin adapter 傳入，並受
+context/output/timeout 上限約束；agy 的 print mode 使用單一 `--print <prompt>`
+參數並保留 JSON response/usage envelope。不使用 `--yolo`。使用 `--test-agent`
 強制使用 copilot/gpt-5-mini 進行測試。
 
 ---

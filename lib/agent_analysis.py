@@ -3,8 +3,9 @@
 The legacy ``call_agent`` entry point remains available, but its production
 path now routes concrete executor/provider/route/model/settings cards.  CLI
 presence is only read-only discovery evidence; it is never reported as account
-availability.  Analyzer prompts are sent through stdin and never placed in
-argv, while requested and provider-reported actual identities stay separate.
+availability.  Analyzer prompts use bounded executor-specific argv/stdin
+adapters, while requested and provider-reported actual identities stay
+separate.
 """
 
 from __future__ import annotations
@@ -192,23 +193,21 @@ def _build_copilot_sonnet_cmd(_prompt: str) -> List[str]:
     return ["copilot", "-s", "--model", "claude-sonnet-4.6", "-p", "-"]
 
 
-def _build_agy_cmd(_prompt: str) -> List[str]:
-    # With text input format, agy reads the bounded prompt from stdin.  Do not
-    # append a positional prompt (including ``-``): the installed CLI ignores
-    # command-line prompts when ``--input-format text`` is selected.
-    # Keep JSON output so native usage remains available when the provider
-    # reports it; the parser accepts its ``response`` field below.
+def _build_agy_cmd(prompt: str) -> List[str]:
+    # The installed agy print mode requires a string argument for ``--print``.
+    # Its stdin-only ``stream-json`` mode requires a matching stream-json
+    # output envelope, so keep text print mode and pass the bounded prompt as
+    # one argv value.  JSON preserves the native response/usage envelope.
     return [
         "agy",
         "--model",
         "gemini-3.8-flash-high",
         "--effort",
         "high",
-        "--input-format",
-        "text",
         "--output-format",
         "json",
         "--print",
+        prompt,
     ]
 
 
@@ -226,7 +225,7 @@ def _catalog_seed() -> List[AgentConfig]:
     return [
         AgentConfig("codex/gpt-5.4", _build_codex_cmd, timeout=180, executor="codex", provider="openai", route="codex.exec", model_id="gpt-5.4", inference_settings={"effort": "high", "stdin": True}, priority=10),
         AgentConfig("copilot/sonnet-4.6", _build_copilot_sonnet_cmd, timeout=150, executor="copilot", provider="github", route="copilot.prompt", model_id="claude-sonnet-4.6", inference_settings={"stdin": True}, priority=20),
-        AgentConfig("agy/gemini-3.8-flash-high", _build_agy_cmd, timeout=150, executor="agy", provider="google", route="agy.prompt", model_id="gemini-3.8-flash-high", inference_settings={"effort": "high", "stdin": True}, priority=30),
+        AgentConfig("agy/gemini-3.8-flash-high", _build_agy_cmd, timeout=150, executor="agy", provider="google", route="agy.prompt", model_id="gemini-3.8-flash-high", inference_settings={"effort": "high", "prompt_transport": "argv"}, priority=30),
         AgentConfig("copilot/gpt-5-mini", _build_copilot_mini_cmd, timeout=90, executor="copilot", provider="github", route="copilot.prompt", model_id="gpt-5-mini", inference_settings={"stdin": True}, priority=40),
     ]
 
@@ -426,12 +425,14 @@ def _execute_candidate(prompt: str, candidate: AgentConfig, request: AnalysisReq
     if len(prompt.encode("utf-8")) > request.budget.max_context_bytes:
         return AgentAnalysis(agent_name=candidate.name, success=False, error="analysis input exceeds routing context budget", requested_model=candidate.model_id, requested_settings=dict(candidate.inference_settings), diagnostics=[{"kind": "input_budget_exceeded", "status": "failed"}])
     try:
-        argv = candidate.build_cmd("")
+        argv = candidate.build_cmd(prompt)
         if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) for arg in argv):
             raise ValueError("candidate command adapter must return a string argv list")
+        prompt_transport = str(candidate.inference_settings.get("prompt_transport", "stdin"))
+        adapter_input = prompt if prompt_transport == "stdin" else ""
         result = subprocess.run(
             argv,
-            input=prompt,
+            input=adapter_input,
             capture_output=True,
             text=True,
             timeout=min(candidate.timeout, int(request.budget.max_latency_seconds)),
