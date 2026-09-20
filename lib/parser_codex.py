@@ -154,7 +154,8 @@ def parse_codex_session(
         if any(key in result for key in ("cwd", "working_directory", "workingDirectory")):
             turn.context_meta["cwd_present"] = True
         if "exit_code" in result or "exitCode" in result:
-            if isinstance(result.get("exit_code", result.get("exitCode")), int):
+            exit_code = result.get("exit_code", result.get("exitCode"))
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 turn.context_meta["exit_code_present"] = True
         if "permission" in result or "permissions" in result:
             turn.context_meta["permission_present"] = True

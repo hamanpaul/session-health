@@ -152,7 +152,8 @@ def parse_copilot_session(
         if any(key in result for key in ("cwd", "working_directory", "workingDirectory")):
             turn.context_meta["cwd_present"] = True
         if "exit_code" in result or "exitCode" in result:
-            if isinstance(result.get("exit_code", result.get("exitCode")), int):
+            exit_code = result.get("exit_code", result.get("exitCode"))
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 turn.context_meta["exit_code_present"] = True
         if "permission" in result or "permissions" in result:
             turn.context_meta["permission_present"] = True
@@ -422,7 +423,8 @@ def _extract_copilot_context(
     if any(key in result_metadata for key in ("cwd", "working_directory", "workingDirectory")):
         turn.context_meta["cwd_present"] = True
     if "exitCode" in result_metadata or "exit_code" in result_metadata:
-        if isinstance(result_metadata.get("exitCode", result_metadata.get("exit_code")), int):
+        exit_code = result_metadata.get("exitCode", result_metadata.get("exit_code"))
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             turn.context_meta["exit_code_present"] = True
     if "permission" in result_metadata or "permissions" in result_metadata:
         turn.context_meta["permission_present"] = True
