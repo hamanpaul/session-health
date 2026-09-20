@@ -46,6 +46,15 @@ marks Jev as `live_status: deferred`; this is not a live/API validation. Mock
 backends are only synthetic regression fixtures, and their results are labeled
 as mock rather than live.
 
+The native adapter sends the official Jev request shape: an ID-keyed
+`questions` map using lowercase `choice`, `noul`, and `score` types with
+`instructions` and primitive-specific `criteria`; the default evaluator model
+is `jev-latest`, independent of the source session's logged model. Native
+Choice/Score probability data, Score legends, and confidence are retained only
+when provided by Jev. If a semantic case cap samples the source bundle, JSON
+coverage reports source, selected, excluded, and sampling counts instead of
+claiming complete coverage.
+
 ## Version
 
 0.1.0

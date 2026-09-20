@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 
 SEMANTIC_VERSION = "semantic-v1"
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+DEFAULT_JEV_MODEL = "jev-latest"
 CHOICE_SPECIAL_VALUES = ("none", "insufficient", "mixed")
 SUPPORTED_PRIMITIVES = ("choice", "noul", "score")
 
@@ -79,8 +80,11 @@ class Score:
         if self.levels:
             if isinstance(value, str) and value in self.levels:
                 return value
-            if _is_int(value) and 0 <= value < len(self.levels):
-                return value
+            if isinstance(value, bool):
+                raise SemanticValidationError("Score value cannot be bool")
+            numeric = _finite_number(value, "Score value")
+            if 0.0 <= numeric <= len(self.levels) - 1:
+                return numeric
             raise SemanticValidationError("Score value is outside ordered levels")
         result = _finite_number(value, "Score value")
         if self.minimum is not None and result < self.minimum:
@@ -110,6 +114,23 @@ class SemanticValidationError(SemanticError):
 
 class SemanticBudgetError(SemanticError):
     """Raised when a semantic request cannot fit a declared budget."""
+
+
+class SemanticResponseError(SemanticError):
+    """Raised when a wire response cannot be decoded after the request ran."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_kind: str = "invalid_response",
+        status_code: Optional[int] = None,
+        response_hash: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.status_code = status_code
+        self.response_hash = response_hash
 
 
 def _is_int(value: Any) -> bool:
@@ -289,8 +310,20 @@ class SemanticQuestion:
             raise ValueError("question stage must be positive")
         if answer_type == "choice" and not self.choices:
             raise ValueError("Choice questions require a closed choice set")
+        if answer_type == "choice":
+            if any(not isinstance(option, str) or not option for option in self.choices):
+                raise ValueError("Choice options must be non-empty strings")
+            if len(set(self.choices)) != len(self.choices):
+                raise ValueError("Choice options must be unique")
         if answer_type == "score" and not self.score_levels and self.score_min is None and self.score_max is None:
             raise ValueError("Score questions require ordered levels or a numeric range")
+        if self.score_levels:
+            if len(self.score_levels) < 2 or len(self.score_levels) > 10:
+                raise ValueError("Score questions require between 2 and 10 ordered levels")
+            if any(not isinstance(level, str) or not level for level in self.score_levels):
+                raise ValueError("Score levels must be non-empty strings")
+            if len(set(self.score_levels)) != len(self.score_levels):
+                raise ValueError("Score levels must be unique")
 
     @property
     def type(self) -> str:
@@ -358,8 +391,23 @@ class SemanticAnswer:
     def score(self) -> Any:
         return self.value if self.primitive == "score" else None
 
+    @property
+    def confidence(self) -> Optional[float]:
+        value = self.metadata.get("confidence")
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    @property
+    def probabilities(self) -> Optional[Dict[str, float]]:
+        value = self.metadata.get("probabilities")
+        return dict(value) if isinstance(value, Mapping) else None
+
+    @property
+    def legend(self) -> Optional[Dict[str, str]]:
+        value = self.metadata.get("legend")
+        return dict(value) if isinstance(value, Mapping) else None
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "question_id": self.question_id,
             "primitive": self.primitive,
             "value": self.value,
@@ -369,6 +417,13 @@ class SemanticAnswer:
             "rationale_ref": self.rationale_ref,
             "metadata": dict(self.metadata),
         }
+        # These fields are emitted only when the native provider returned
+        # them.  Mock/generic answers therefore do not acquire invented
+        # confidence or distribution values.
+        for name in ("confidence", "probabilities", "legend"):
+            if name in self.metadata:
+                payload[name] = self.metadata[name]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -460,6 +515,7 @@ class RequestAttempt:
     elapsed_ms: Optional[int] = None
     usage: SemanticUsage = field(default_factory=SemanticUsage)
     response_hash: str = ""
+    request_instance_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -474,12 +530,13 @@ class RequestAttempt:
             "elapsed_ms": self.elapsed_ms,
             "usage": self.usage.to_dict(),
             "response_hash": self.response_hash,
+            "request_instance_id": self.request_instance_id,
         }
 
 
 @dataclass
 class SemanticLedger:
-    """Request/attempt ledger with attempt-id de-duplication."""
+    """Request/attempt ledger with invocation and attempt identities."""
 
     attempts: List[RequestAttempt] = field(default_factory=list)
 
@@ -490,7 +547,7 @@ class SemanticLedger:
 
     @property
     def request_count(self) -> int:
-        return len({attempt.request_id for attempt in self.attempts})
+        return len({attempt.request_instance_id or attempt.request_id for attempt in self.attempts})
 
     @property
     def attempt_count(self) -> int:
@@ -560,21 +617,154 @@ def _primitive_name(value: Any) -> str:
 
 
 def _answer_value(raw: Mapping[str, Any], primitive: str) -> Any:
-    if "value" in raw:
-        return raw["value"]
-    if "answer" in raw:
-        return raw["answer"]
     if primitive == "choice":
-        return raw.get("choice")
-    if primitive == "noul":
-        for key in ("p_yes", "probability", "probability_yes", "pYes"):
+        for key in ("choice", "value", "answer"):
             if key in raw:
                 return raw[key]
-        return None
-    for key in ("score", "level", "value"):
-        if key in raw:
-            return raw[key]
+    if primitive == "noul":
+        for key in ("noul", "value", "p_yes", "probability", "probability_yes", "pYes", "answer"):
+            if key in raw:
+                return raw[key]
+    else:
+        for key in ("score", "value", "answer", "level"):
+            if key in raw:
+                return raw[key]
     return None
+
+
+def _native_answer_fields(raw: Mapping[str, Any], primitive: str) -> bool:
+    """Return whether ``raw`` uses the native Jev answer representation."""
+
+    native_value = {
+        "choice": "choice",
+        "noul": "noul",
+        "score": "score",
+    }[primitive]
+    return native_value in raw or any(
+        name in raw for name in ("probabilities", "legend", "confidence")
+    )
+
+
+def _validate_probability_map(
+    question: SemanticQuestion,
+    raw: Mapping[str, Any],
+    expected_keys: Sequence[str],
+) -> Dict[str, float]:
+    probabilities = raw.get("probabilities")
+    if not isinstance(probabilities, Mapping):
+        raise SemanticValidationError(
+            f"probabilities for {question.question_id} must cover every option"
+        )
+    expected = [str(key) for key in expected_keys]
+    actual = [str(key) for key in probabilities.keys()]
+    if set(actual) != set(expected) or len(actual) != len(expected):
+        raise SemanticValidationError(
+            f"probabilities for {question.question_id} must cover exactly {expected}"
+        )
+    normalized: Dict[str, float] = {}
+    for key in expected:
+        if key not in probabilities:
+            raise SemanticValidationError(
+                f"probabilities for {question.question_id} are missing {key}"
+            )
+        normalized[key] = _finite_number(
+            probabilities[key], f"probability for {question.question_id}:{key}"
+        )
+        if normalized[key] < 0.0 or normalized[key] > 1.0:
+            raise SemanticValidationError(
+                f"probability for {question.question_id}:{key} must be in [0, 1]"
+            )
+    if not math.isclose(sum(normalized.values()), 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise SemanticValidationError(
+            f"probabilities for {question.question_id} must sum to 1"
+        )
+    return normalized
+
+
+def _validate_confidence(question: SemanticQuestion, raw: Mapping[str, Any]) -> float:
+    if "confidence" not in raw:
+        raise SemanticValidationError(f"confidence is required for {question.question_id}")
+    confidence = _finite_number(raw["confidence"], f"confidence for {question.question_id}")
+    if confidence < 0.0 or confidence > 1.0:
+        raise SemanticValidationError(
+            f"confidence for {question.question_id} must be in [0, 1]"
+        )
+    return confidence
+
+
+def _native_metadata(
+    question: SemanticQuestion,
+    raw: Mapping[str, Any],
+    primitive: str,
+) -> Dict[str, Any]:
+    """Validate and retain native provider metadata without deriving it."""
+
+    if not _native_answer_fields(raw, primitive):
+        return {}
+    metadata: Dict[str, Any] = {}
+    if primitive == "choice":
+        probabilities = _validate_probability_map(question, raw, question.choices)
+        confidence = _validate_confidence(question, raw)
+        selected = raw.get("choice")
+        if not isinstance(selected, str) or selected not in probabilities:
+            raise SemanticValidationError(
+                f"choice for {question.question_id} must be covered by probabilities"
+            )
+        max_probability = max(probabilities.values())
+        if not math.isclose(
+            probabilities[str(selected)], max_probability, rel_tol=1e-6, abs_tol=1e-6
+        ):
+            raise SemanticValidationError(
+                f"choice for {question.question_id} must be a highest-probability option"
+            )
+        metadata.update({"probabilities": probabilities, "confidence": confidence})
+    elif primitive == "score":
+        if not question.score_levels or not 2 <= len(question.score_levels) <= 10:
+            raise SemanticValidationError(
+                f"native Jev Score requires 2-10 ordered levels for {question.question_id}"
+            )
+        legend = raw.get("legend")
+        if not isinstance(legend, Mapping):
+            raise SemanticValidationError(f"legend is required for {question.question_id}")
+        expected_legend = {str(index): level for index, level in enumerate(question.score_levels)}
+        actual_legend = {str(key): value for key, value in legend.items()}
+        if actual_legend != expected_legend:
+            raise SemanticValidationError(
+                f"legend for {question.question_id} must match ordered score levels"
+            )
+        probabilities = _validate_probability_map(
+            question,
+            raw,
+            [str(index) for index in range(len(question.score_levels))],
+        )
+        score = _finite_number(raw.get("score"), f"Score value for {question.question_id}")
+        maximum = float(len(question.score_levels) - 1)
+        if score < 0.0 or score > maximum:
+            raise SemanticValidationError(
+                f"Score value for {question.question_id} must be in [0, {int(maximum)}]"
+            )
+        expected_score = sum(float(index) * probabilities[str(index)] for index in range(len(question.score_levels)))
+        if not math.isclose(score, expected_score, rel_tol=1e-5, abs_tol=1e-4):
+            raise SemanticValidationError(
+                f"Score value for {question.question_id} must equal its probability-weighted value"
+            )
+        confidence = _validate_confidence(question, raw)
+        metadata.update(
+            {
+                "legend": {key: str(value) for key, value in expected_legend.items()},
+                "probabilities": probabilities,
+                "confidence": confidence,
+            }
+        )
+    else:
+        # Jev Noul has one native scalar and no distribution or confidence
+        # field.  Extra probability/confidence data is not interpreted as a
+        # different primitive.
+        if "probabilities" in raw or "legend" in raw or "confidence" in raw:
+            raise SemanticValidationError(
+                f"Noul answer for {question.question_id} has unsupported native metadata"
+            )
+    return metadata
 
 
 def validate_answer(question: SemanticQuestion, raw: Any) -> SemanticAnswer:
@@ -615,7 +805,14 @@ def validate_answer(question: SemanticQuestion, raw: Any) -> SemanticAnswer:
         if value < 0.0 or value > 1.0:
             raise SemanticValidationError(f"Noul probability out of range for {question.question_id}")
     else:
-        if question.score_levels:
+        if _native_answer_fields(raw, primitive):
+            value = _finite_number(value, f"Score value for {question.question_id}")
+            maximum = float(len(question.score_levels) - 1)
+            if value < 0.0 or value > maximum:
+                raise SemanticValidationError(
+                    f"Score value for {question.question_id} is outside ordered levels"
+                )
+        elif question.score_levels:
             if isinstance(value, bool):
                 raise SemanticValidationError(f"Score value for {question.question_id} cannot be bool")
             if isinstance(value, str):
@@ -633,6 +830,10 @@ def validate_answer(question: SemanticQuestion, raw: Any) -> SemanticAnswer:
             if question.score_max is not None and value > question.score_max:
                 raise SemanticValidationError(f"Score above range for {question.question_id}")
 
+    metadata = _native_metadata(question, raw, primitive)
+    provider_metadata = raw.get("metadata", {})
+    if isinstance(provider_metadata, Mapping):
+        metadata["provider_metadata"] = dict(provider_metadata)
     evidence_refs = raw.get("evidence_refs", [])
     if not isinstance(evidence_refs, list) or any(not isinstance(item, str) for item in evidence_refs):
         raise SemanticValidationError(f"evidence_refs for {question.question_id} must be a string list")
@@ -644,7 +845,7 @@ def validate_answer(question: SemanticQuestion, raw: Any) -> SemanticAnswer:
         status="observed",
         evidence_refs=tuple(evidence_refs[:20]),
         rationale_ref=str(raw.get("rationale_ref", "")) if isinstance(raw.get("rationale_ref", ""), str) else "",
-        metadata={"provider_metadata": dict(raw.get("metadata", {}))} if isinstance(raw.get("metadata", {}), Mapping) else {},
+        metadata=metadata,
     )
 
 
@@ -751,6 +952,51 @@ def _safe_mapping(value: Any, depth: int = 0) -> Any:
     return str(value)[:1_000]
 
 
+def _native_question_payload(question: SemanticQuestion) -> Dict[str, Any]:
+    """Translate an internal question to the official Jev wire contract."""
+
+    primitive = question.primitive
+    payload: Dict[str, Any] = {
+        "type": primitive,
+        "instructions": question.prompt,
+    }
+    supplied_criteria = question.metadata.get("criteria") if isinstance(question.metadata, Mapping) else None
+    if primitive == "choice":
+        if isinstance(supplied_criteria, Mapping):
+            criteria = {option: supplied_criteria.get(option) for option in question.choices}
+        else:
+            criteria = {option: None for option in question.choices}
+        payload["criteria"] = criteria
+    elif primitive == "noul":
+        if isinstance(supplied_criteria, Mapping):
+            criteria = {
+                "true": supplied_criteria.get("true"),
+                "false": supplied_criteria.get("false"),
+            }
+        else:
+            criteria = {
+                "true": question.prompt,
+                "false": f"The evidence does not support: {question.prompt}",
+            }
+        payload["criteria"] = criteria
+    else:
+        if not 2 <= len(question.score_levels) <= 10:
+            raise SemanticValidationError(
+                f"native Jev Score requires 2-10 ordered levels for {question.question_id}"
+            )
+        payload["criteria"] = list(question.score_levels)
+    return payload
+
+
+def _native_questions_payload(questions: Sequence[SemanticQuestion]) -> Dict[str, Dict[str, Any]]:
+    payload: Dict[str, Dict[str, Any]] = {}
+    for question in questions:
+        if question.question_id in payload:
+            raise SemanticValidationError(f"duplicate native question id: {question.question_id}")
+        payload[question.question_id] = _native_question_payload(question)
+    return payload
+
+
 class GenericSemanticBackend:
     """A backend facade that validates typed answers from a supplied caller.
 
@@ -769,6 +1015,7 @@ class GenericSemanticBackend:
         self.capabilities = capabilities or SemanticCapabilities(backend="generic", model=model)
         self.ledger = SemanticLedger()
         self._request_bytes = 0
+        self._invocation_count = 0
 
     def evaluate(
         self,
@@ -799,6 +1046,8 @@ class GenericSemanticBackend:
             raise SemanticBudgetError("question/request byte budget exceeded")
         self._request_bytes += request_bytes
         request_id = stable_hash({"state": normalized_state, "questions": normalized_questions})
+        self._invocation_count += 1
+        request_instance_id = f"{request_id}:{self._invocation_count}"
         try:
             payload = self.handler(normalized_state, normalized_questions)
             if not isinstance(payload, Mapping):
@@ -811,11 +1060,12 @@ class GenericSemanticBackend:
                 diagnostics = [{"kind": "invalid_response", "status": "failed", "message": str(exc)[:300]}]
             attempt = RequestAttempt(
                 request_id=request_id,
-                attempt_id=f"{request_id}:1",
+                attempt_id=f"{request_instance_id}:1",
                 attempt_number=1,
                 status="complete" if not diagnostics else "partial",
                 usage=usage,
                 response_hash=stable_hash(payload),
+                request_instance_id=request_instance_id,
             )
             self.ledger.add(attempt)
             return SemanticResponse(
@@ -828,24 +1078,53 @@ class GenericSemanticBackend:
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
+                    "request_instance_id": request_instance_id,
                     "state_hash": stable_hash(normalized_state),
                     "questions_hash": stable_hash(normalized_questions),
                     "usage_scope": "request_attempt_deduplicated",
                 },
             )
         except SemanticError as exc:
+            self.ledger.add(
+                RequestAttempt(
+                    request_id=request_id,
+                    attempt_id=f"{request_instance_id}:1",
+                    attempt_number=1,
+                    status="unknown",
+                    error_kind="backend_validation",
+                    request_instance_id=request_instance_id,
+                )
+            )
             return SemanticResponse(
                 status="failed",
                 diagnostics=[{"kind": "backend_validation", "status": "failed", "message": str(exc)}],
                 ledger=self.ledger,
-                provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id},
+                provenance={
+                    "semantic_version": SEMANTIC_VERSION,
+                    "request_id": request_id,
+                    "request_instance_id": request_instance_id,
+                },
             )
         except Exception as exc:
+            self.ledger.add(
+                RequestAttempt(
+                    request_id=request_id,
+                    attempt_id=f"{request_instance_id}:1",
+                    attempt_number=1,
+                    status="unknown",
+                    error_kind="backend_exception",
+                    request_instance_id=request_instance_id,
+                )
+            )
             return SemanticResponse(
                 status="failed",
                 diagnostics=[{"kind": "backend_exception", "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:300]}],
                 ledger=self.ledger,
-                provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id},
+                provenance={
+                    "semantic_version": SEMANTIC_VERSION,
+                    "request_id": request_id,
+                    "request_instance_id": request_instance_id,
+                },
             )
 
 
@@ -942,13 +1221,13 @@ class JevHTTPBackend:
         self,
         *,
         endpoint: str = JEV_ENDPOINT,
-        model: str = "",
+        model: str = DEFAULT_JEV_MODEL,
         opener: Optional[Callable[..., Any]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.endpoint = endpoint
-        self.model = model
+        self.model = str(model).strip() or DEFAULT_JEV_MODEL
         self._opener = opener or urlopen
         self._sleep = sleep_fn or time.sleep
         self._clock = clock or time.monotonic
@@ -958,10 +1237,11 @@ class JevHTTPBackend:
             primitives={name: "native" for name in SUPPORTED_PRIMITIVES},
             native_probability=True,
             endpoint=endpoint,
-            model=model,
+            model=self.model,
         )
         self.ledger = SemanticLedger()
         self._request_bytes = 0
+        self._invocation_count = 0
 
     def _request(self, payload: Mapping[str, Any], budget: SemanticBudget) -> TransportResult:
         key = os.environ.get("TYPESAFE_API_KEY")
@@ -980,20 +1260,41 @@ class JevHTTPBackend:
         )
         response = self._opener(request, timeout=budget.timeout_seconds)
         status_code = int(getattr(response, "status", getattr(response, "code", 200)))
-        headers = {str(key): str(value) for key, value in getattr(response, "headers", {}).items()} if getattr(response, "headers", None) is not None else {}
+        response_headers = getattr(response, "headers", None)
+        headers = (
+            {str(header_key): str(header_value) for header_key, header_value in response_headers.items()}
+            if response_headers is not None
+            else {}
+        )
         body = response.read(budget.max_response_bytes + 1)
+        if not isinstance(body, bytes):
+            body = str(body).encode("utf-8", "replace")
         if len(body) > budget.max_response_bytes:
-            raise SemanticBudgetError("semantic response byte budget exceeded")
-        if isinstance(body, bytes):
-            text = body.decode("utf-8", "replace")
-        else:
-            text = str(body)
+            raise SemanticResponseError(
+                "semantic response byte budget exceeded",
+                error_kind="response_budget",
+                status_code=status_code,
+                response_hash=hashlib.sha256(body[:4096]).hexdigest(),
+            )
+        text = body.decode("utf-8", "replace")
         try:
             decoded = json.loads(text) if text else {}
         except (json.JSONDecodeError, ValueError) as exc:
-            raise SemanticValidationError(f"semantic response is not JSON: {exc}") from exc
+            if 200 <= status_code < 300:
+                raise SemanticResponseError(
+                    f"semantic response is not JSON: {exc}",
+                    status_code=status_code,
+                    response_hash=hashlib.sha256(body).hexdigest(),
+                ) from exc
+            decoded = {}
         if not isinstance(decoded, Mapping):
-            raise SemanticValidationError("semantic response JSON must be an object")
+            if 200 <= status_code < 300:
+                raise SemanticResponseError(
+                    "semantic response JSON must be an object",
+                    status_code=status_code,
+                    response_hash=hashlib.sha256(body).hexdigest(),
+                )
+            decoded = {}
         return TransportResult(status_code=status_code, payload=decoded, headers=headers, raw_bytes=len(body))
 
     def evaluate(
@@ -1010,13 +1311,15 @@ class JevHTTPBackend:
         state_bytes = len(canonical_json(normalized_state))
         if state_bytes > budget.max_state_bytes:
             raise SemanticBudgetError("state byte budget exceeded")
-        question_payload = [question.to_dict() for question in questions]
+        question_payload = _native_questions_payload(questions)
         question_bytes = len(canonical_json(question_payload))
-        if any(len(canonical_json(question)) > budget.max_question_bytes for question in question_payload):
+        if any(
+            len(canonical_json(question)) > budget.max_question_bytes
+            for question in question_payload.values()
+        ):
             raise SemanticBudgetError("single question byte budget exceeded")
         payload: Dict[str, Any] = {
-            "version": SEMANTIC_VERSION,
-            "model": self.model or None,
+            "model": self.model,
             "state": normalized_state,
             "questions": question_payload,
         }
@@ -1041,6 +1344,7 @@ class JevHTTPBackend:
                 provenance={
                     "semantic_version": SEMANTIC_VERSION,
                     "request_id": request_id,
+                    "requested_model": self.model,
                     "state_hash": stable_hash(normalized_state),
                     "questions_hash": stable_hash(question_payload),
                     "request_bytes": request_bytes,
@@ -1050,10 +1354,12 @@ class JevHTTPBackend:
                 },
             )
 
+        self._invocation_count += 1
+        request_instance_id = f"{request_id}:{self._invocation_count}"
         diagnostics: List[Dict[str, Any]] = []
         max_attempts = min(budget.max_retries + 1, budget.max_attempts - self.ledger.attempt_count)
         for attempt_number in range(1, max_attempts + 1):
-            attempt_id = f"{request_id}:{attempt_number}"
+            attempt_id = f"{request_instance_id}:{attempt_number}"
             started = self._clock()
             retryable = False
             try:
@@ -1080,18 +1386,21 @@ class JevHTTPBackend:
                             usage=usage,
                             elapsed_ms=max(0, int((self._clock() - started) * 1000)),
                             response_hash=response_hash,
+                            request_instance_id=request_instance_id,
                         )
                     )
                     return SemanticResponse(
                         status="complete" if len(answers) == len(questions) and not validation else "partial",
                         answers=answers,
                         diagnostics=diagnostics,
-                        metadata={"live_status": "complete", "http_status": status_code, "model": response_payload.get("model", self.model or None)},
+                        metadata={"live_status": "complete", "http_status": status_code, "model": response_payload.get("model", self.model)},
                         usage=self.ledger.usage(),
                         ledger=self.ledger,
                         provenance={
                             "semantic_version": SEMANTIC_VERSION,
                             "request_id": request_id,
+                            "request_instance_id": request_instance_id,
+                            "requested_model": self.model,
                             "state_hash": stable_hash(normalized_state),
                             "questions_hash": stable_hash(question_payload),
                             "request_bytes": request_bytes,
@@ -1116,9 +1425,34 @@ class JevHTTPBackend:
                         elapsed_ms=max(0, int((self._clock() - started) * 1000)),
                         usage=usage,
                         response_hash=response_hash,
+                        request_instance_id=request_instance_id,
                     )
                 )
                 if retryable and attempt_number < max_attempts:
+                    if retry_after is not None and retry_after > budget.retry_after_cap_seconds:
+                        diagnostics.append(
+                            {
+                                "kind": "retry_deferred",
+                                "status": "deferred",
+                                "http_status": status_code,
+                                "retry_after_seconds": retry_after,
+                                "local_wait_cap_seconds": budget.retry_after_cap_seconds,
+                            }
+                        )
+                        return SemanticResponse(
+                            status="deferred",
+                            diagnostics=diagnostics,
+                            metadata={"live_status": "deferred", "http_status": status_code},
+                            usage=self.ledger.usage(),
+                            ledger=self.ledger,
+                            provenance={
+                                "semantic_version": SEMANTIC_VERSION,
+                                "request_id": request_id,
+                                "request_instance_id": request_instance_id,
+                                "requested_model": self.model,
+                                "usage_scope": "request_attempt_deduplicated",
+                            },
+                        )
                     delay = retry_after if retry_after is not None else min(2.0 ** (attempt_number - 1), budget.retry_after_cap_seconds)
                     delay = min(max(0.0, delay), budget.retry_after_cap_seconds)
                     self._sleep(delay)
@@ -1129,7 +1463,7 @@ class JevHTTPBackend:
                     metadata={"live_status": "failed", "http_status": status_code},
                     usage=self.ledger.usage(),
                     ledger=self.ledger,
-                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "usage_scope": "request_attempt_deduplicated"},
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except HTTPError as exc:
                 status_code = int(exc.code)
@@ -1159,10 +1493,29 @@ class JevHTTPBackend:
                         elapsed_ms=max(0, int((self._clock() - started) * 1000)),
                         usage=usage,
                         response_hash=response_hash,
+                        request_instance_id=request_instance_id,
                     )
                 )
                 diagnostics.append({"kind": "http_error", "status": "failed", "http_status": status_code})
                 if retryable and attempt_number < max_attempts:
+                    if retry_after is not None and retry_after > budget.retry_after_cap_seconds:
+                        diagnostics.append(
+                            {
+                                "kind": "retry_deferred",
+                                "status": "deferred",
+                                "http_status": status_code,
+                                "retry_after_seconds": retry_after,
+                                "local_wait_cap_seconds": budget.retry_after_cap_seconds,
+                            }
+                        )
+                        return SemanticResponse(
+                            status="deferred",
+                            diagnostics=diagnostics,
+                            metadata={"live_status": "deferred", "http_status": status_code},
+                            usage=self.ledger.usage(),
+                            ledger=self.ledger,
+                            provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
+                        )
                     delay = retry_after if retry_after is not None else min(2.0 ** (attempt_number - 1), budget.retry_after_cap_seconds)
                     self._sleep(min(max(0.0, delay), budget.retry_after_cap_seconds))
                     continue
@@ -1172,7 +1525,39 @@ class JevHTTPBackend:
                     metadata={"live_status": "failed", "http_status": status_code},
                     usage=self.ledger.usage(),
                     ledger=self.ledger,
-                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "usage_scope": "request_attempt_deduplicated"},
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
+                )
+            except SemanticResponseError as exc:
+                self.ledger.add(
+                    RequestAttempt(
+                        request_id=request_id,
+                        attempt_id=attempt_id,
+                        attempt_number=attempt_number,
+                        status="unknown",
+                        http_status=exc.status_code,
+                        retryable=False,
+                        error_kind=exc.error_kind,
+                        elapsed_ms=max(0, int((self._clock() - started) * 1000)),
+                        response_hash=exc.response_hash,
+                        request_instance_id=request_instance_id,
+                    )
+                )
+                diagnostics.append(
+                    {
+                        "kind": "invalid_response",
+                        "status": "unknown",
+                        "error_kind": exc.error_kind,
+                        "http_status": exc.status_code,
+                        "message": str(exc)[:300],
+                    }
+                )
+                return SemanticResponse(
+                    status="unknown",
+                    diagnostics=diagnostics,
+                    metadata={"live_status": "unknown"},
+                    usage=self.ledger.usage(),
+                    ledger=self.ledger,
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except TimeoutError:
                 # Timeout is deliberately classified as unknown: the provider
@@ -1186,6 +1571,7 @@ class JevHTTPBackend:
                         retryable=False,
                         error_kind="timeout",
                         elapsed_ms=max(0, int((self._clock() - started) * 1000)),
+                        request_instance_id=request_instance_id,
                     )
                 )
                 return SemanticResponse(
@@ -1194,7 +1580,7 @@ class JevHTTPBackend:
                     metadata={"live_status": "unknown"},
                     usage=self.ledger.usage(),
                     ledger=self.ledger,
-                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "usage_scope": "request_attempt_deduplicated"},
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except URLError as exc:
                 self.ledger.add(
@@ -1206,6 +1592,7 @@ class JevHTTPBackend:
                         retryable=False,
                         error_kind="url_error",
                         elapsed_ms=max(0, int((self._clock() - started) * 1000)),
+                        request_instance_id=request_instance_id,
                     )
                 )
                 return SemanticResponse(
@@ -1214,7 +1601,7 @@ class JevHTTPBackend:
                     metadata={"live_status": "failed"},
                     usage=self.ledger.usage(),
                     ledger=self.ledger,
-                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "usage_scope": "request_attempt_deduplicated"},
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
             except (SemanticBudgetError, SemanticValidationError, PermissionError) as exc:
                 return SemanticResponse(
@@ -1223,7 +1610,7 @@ class JevHTTPBackend:
                     metadata={"live_status": "deferred" if isinstance(exc, PermissionError) else "failed"},
                     usage=self.ledger.usage(),
                     ledger=self.ledger,
-                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "usage_scope": "request_attempt_deduplicated"},
+                    provenance={"semantic_version": SEMANTIC_VERSION, "request_id": request_id, "request_instance_id": request_instance_id, "requested_model": self.model, "usage_scope": "request_attempt_deduplicated"},
                 )
         return SemanticResponse(status="failed", diagnostics=diagnostics, usage=self.ledger.usage(), ledger=self.ledger)
 
@@ -1243,4 +1630,7 @@ def build_default_backend(*, offline: bool = False, endpoint: Optional[str] = No
         return UnavailableSemanticBackend("semantic evaluation disabled by offline mode", offline=True)
     if not os.environ.get("TYPESAFE_API_KEY"):
         return UnavailableSemanticBackend()
-    return JevHTTPBackend(endpoint=endpoint or JEV_ENDPOINT, model=model)
+    return JevHTTPBackend(
+        endpoint=endpoint or JEV_ENDPOINT,
+        model=str(model).strip() or DEFAULT_JEV_MODEL,
+    )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .bundle import BundleLimits, SessionBundle, build_session_bundle
+from .bundle import SessionBundle, build_session_bundle
 from .jev_questions import (
     AXIS_IDS,
     SemanticBatch,
@@ -29,6 +29,7 @@ from .semantic_backend import (
     SemanticState,
     SemanticUsage,
     UnavailableSemanticBackend,
+    DEFAULT_JEV_MODEL,
     build_default_backend,
     stable_hash,
 )
@@ -129,11 +130,33 @@ def _append_response(
         raw_judgments.append(answer.to_dict())
 
 
+def _stage_state(
+    state: SemanticState,
+    answers: Mapping[str, SemanticAnswer],
+) -> SemanticState:
+    """Return a stage-2 state that retains stage-1 judgments explicitly."""
+
+    data = dict(state.data)
+    data["stage1_judgments"] = {
+        question_id: answer.to_dict()
+        for question_id, answer in answers.items()
+    }
+    return SemanticState(
+        state_id=state.state_id,
+        data=data,
+        evidence_refs=state.evidence_refs,
+        case_ids=state.case_ids,
+        version=state.version,
+    )
+
+
 def _coverage(
     cases: Sequence[SemanticCase],
     questions: Sequence[SemanticQuestion],
     answers: Mapping[str, SemanticAnswer],
     diagnostics: Sequence[Mapping[str, Any]],
+    *,
+    source_case_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     axis_coverage: Dict[str, Dict[str, Any]] = {}
     for axis_id in AXIS_IDS:
@@ -157,15 +180,31 @@ def _coverage(
         if question.question_id in answers and _usable_answer(answers[question.question_id])
     }
     missing = sum(1 for item in diagnostics if item.get("kind") in {"missing_answer", "dependent_stage_skipped"})
+    selected_case_count = len(cases)
+    original_case_count = max(selected_case_count, int(source_case_count or selected_case_count))
+    excluded_case_count = max(0, original_case_count - selected_case_count)
+    sampling_coverage = (
+        selected_case_count / original_case_count if original_case_count else None
+    )
+    question_coverage = (len(answers) / len(questions)) if questions else None
+    semantic_coverage = question_coverage
+    if sampling_coverage is not None and semantic_coverage is not None:
+        semantic_coverage = min(semantic_coverage, sampling_coverage)
     return {
-        "case_count": len(cases),
+        "case_count": selected_case_count,
+        "source_case_count": original_case_count,
+        "selected_case_count": selected_case_count,
+        "excluded_case_count": excluded_case_count,
         "evaluated_case_count": len(evaluated_cases),
         "question_count": len(questions),
         "answered_question_count": len(answers),
         "missing_or_skipped_count": missing,
         "axis_count": len(AXIS_IDS),
         "axes": axis_coverage,
-        "semantic_coverage": (len(answers) / len(questions)) if questions else None,
+        "question_coverage": question_coverage,
+        "sampling_coverage": sampling_coverage,
+        "semantic_coverage": semantic_coverage,
+        "coverage_status": "partial" if excluded_case_count or (question_coverage is not None and question_coverage < 1.0) else "complete",
         "label_status": "synthetic_expectations_only",
         "human_label_status": "pending_root_confirmation",
     }
@@ -178,6 +217,9 @@ def run_semantic_batch(
     backend: Any,
     *,
     budget: Optional[SemanticBudget] = None,
+    source_case_count: Optional[int] = None,
+    source_bundle_identity: Optional[Mapping[str, Any]] = None,
+    offline_coverage: Optional[Mapping[str, Any]] = None,
 ) -> SemanticEvaluation:
     """Run independent questions first, then at most the bounded dependent stage."""
 
@@ -190,9 +232,24 @@ def run_semantic_batch(
     raw_judgments: List[Dict[str, Any]] = []
     stages: List[Dict[str, Any]] = []
     latest_response: Optional[SemanticResponse] = None
-    overall_status = "complete"
+    selected_case_count = len(cases)
+    original_case_count = max(selected_case_count, int(source_case_count or selected_case_count))
+    excluded_case_count = max(0, original_case_count - selected_case_count)
+    overall_status = "partial" if excluded_case_count else "complete"
+    if excluded_case_count:
+        diagnostics.append(
+            {
+                "kind": "case_sampling",
+                "status": "partial",
+                "source_case_count": original_case_count,
+                "selected_case_count": selected_case_count,
+                "excluded_case_count": excluded_case_count,
+                "sampling_coverage": selected_case_count / original_case_count if original_case_count else None,
+            }
+        )
     requests_used = 0
     request_bytes_used = 0
+    stage_state_hashes: Dict[str, str] = {}
     for stage in range(1, budget.max_stages + 1):
         ready, skipped = _stage_questions(selected_questions, stage, answers)
         if stage == 1:
@@ -216,7 +273,9 @@ def run_semantic_batch(
                 continue
             break
         try:
-            batches = build_semantic_batches(state, ready, budget)
+            stage_state = _stage_state(state, answers) if stage > 1 else state
+            stage_state_hashes[str(stage)] = stage_state.snapshot_hash
+            batches = build_semantic_batches(stage_state, ready, budget)
         except SemanticBudgetError as exc:
             diagnostics.append({"kind": "batch_budget_exceeded", "status": "failed", "stage": stage, "message": str(exc)})
             overall_status = "partial"
@@ -237,7 +296,7 @@ def run_semantic_batch(
                 overall_status = "partial"
                 break
             try:
-                latest_response = backend.evaluate(state, batch.questions, budget=budget)
+                latest_response = backend.evaluate(stage_state, batch.questions, budget=budget)
             except SemanticBudgetError as exc:
                 diagnostics.append({"kind": "request_budget_exceeded", "status": "failed", "stage": stage, "message": str(exc)})
                 overall_status = "partial"
@@ -278,21 +337,40 @@ def run_semantic_batch(
             "questions_hash": stable_hash([question.to_dict() for question in selected_questions]),
             "rubric_hash": stable_hash(sorted({question.group_version for question in selected_questions})),
             "requested_model": _capabilities(backend).get("model") or None,
+            "source_case_count": original_case_count,
+            "selected_case_count": selected_case_count,
+            "excluded_case_count": excluded_case_count,
             "usage_scope": "request_attempt_deduplicated",
         }
     )
+    state_summary: Dict[str, Any] = {
+        "state_id": state.state_id,
+        "snapshot_hash": state.snapshot_hash,
+        "case_ids": list(state.case_ids),
+        "stage_state_hashes": stage_state_hashes,
+    }
+    if source_bundle_identity:
+        state_summary["source_bundle"] = dict(source_bundle_identity)
+    if offline_coverage:
+        state_summary["offline_coverage"] = dict(offline_coverage)
     return SemanticEvaluation(
         status=overall_status,
         live_status=str(metadata.get("live_status", live_status)),
         backend=str(_capabilities(backend).get("backend", type(backend).__name__)),
         capabilities=_capabilities(backend),
-        state={"state_id": state.state_id, "snapshot_hash": state.snapshot_hash, "case_ids": list(state.case_ids)},
+        state=state_summary,
         cases=[case.to_dict() for case in cases],
         questions=[question.to_dict() for question in selected_questions],
         answers={question_id: answer.to_dict() for question_id, answer in answers.items()},
         raw_judgments=raw_judgments,
         stages=stages,
-        coverage=_coverage(cases, selected_questions, answers, diagnostics),
+        coverage=_coverage(
+            cases,
+            selected_questions,
+            answers,
+            diagnostics,
+            source_case_count=original_case_count,
+        ),
         diagnostics=diagnostics,
         usage=ledger.usage().to_dict(),
         ledger=ledger.to_dict(),
@@ -312,13 +390,31 @@ def evaluate_session_semantic(
 
     budget = budget or SemanticBudget()
     if bundle is None:
-        bundle = build_session_bundle(session, limits=BundleLimits(max_cases=budget.max_cases))
+        # Preserve the source candidate count before applying the semantic
+        # sampling cap; the cap belongs to Jev, not to the offline bundle.
+        bundle = build_session_bundle(session)
+    source_case_count = len(bundle.cases) if bundle is not None and bundle.cases else len(session.turns)
+    source_bundle_identity: Dict[str, Any] = {}
+    if bundle is not None and isinstance(bundle.manifest, Mapping):
+        for key in ("schema", "version", "artifact_id", "source_ref", "session_id"):
+            if key in bundle.manifest:
+                source_bundle_identity[key] = bundle.manifest[key]
+    offline_coverage = dict(bundle.coverage) if bundle is not None else {}
     cases = build_semantic_cases(session, bundle, max_cases=budget.max_cases)
     state = build_semantic_state(session, bundle, cases, max_cases=budget.max_cases)
     questions = build_semantic_questions(cases, include_dependent=True)
     if backend is None:
-        backend = build_default_backend(offline=offline, model=session.model or "")
-    return run_semantic_batch(state, cases, questions, backend, budget=budget)
+        backend = build_default_backend(offline=offline, model=DEFAULT_JEV_MODEL)
+    return run_semantic_batch(
+        state,
+        cases,
+        questions,
+        backend,
+        budget=budget,
+        source_case_count=source_case_count,
+        source_bundle_identity=source_bundle_identity,
+        offline_coverage=offline_coverage,
+    )
 
 
 def render_semantic_terminal(result: Optional[SemanticEvaluation], *, use_color: bool = True) -> str:

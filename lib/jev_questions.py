@@ -238,6 +238,11 @@ def build_semantic_state(
     facts = bundle.facts if bundle is not None else {}
     # Only send bounded facts needed to interpret the cases.  In particular,
     # do not forward session metadata, raw source paths, or parser payloads.
+    bundle_identity: Dict[str, Any] = {}
+    if bundle is not None and isinstance(bundle.manifest, Mapping):
+        for key in ("schema", "version", "artifact_id", "source_ref", "session_id"):
+            if key in bundle.manifest:
+                bundle_identity[key] = bundle.manifest[key]
     state_data = {
         "session": {
             "source": session.source,
@@ -245,9 +250,15 @@ def build_semantic_state(
             "parser_version": session.parser_version,
             "turn_count": len(session.turns),
         },
+        "bundle": bundle_identity,
         "coverage": _clip(coverage, 2_000),
         "facts": _clip(facts, 4_000),
-        "cases": [_clip(case.to_dict(), 4_000) for case in selected],
+        # A keyed object makes each question's case path resolvable without
+        # relying on an unstable list index.
+        "cases": {
+            case.case_id: _clip(case.to_dict(), 4_000)
+            for case in selected
+        },
     }
     state_id = stable_hash({"source": session.source, "session_id": session.id, "cases": [case.case_id for case in selected]})[:24]
     refs = tuple(ref for case in selected for ref in case.evidence_refs)
@@ -265,7 +276,7 @@ def _question_for_case(axis_id: str, case: SemanticCase, *, stage: int = 1, depe
     question_id = f"{case.case_id}:{axis_id.lower()}:{group['version']}{stage_suffix}"
     applicability = case.applicability if case.applicability in {"applicable", "not_applicable", "insufficient", "unknown"} else "unknown"
     prompt = (
-        f"Case {case.case_id} at state path state.cases.{case.case_id}. "
+        f"Case {case.case_id} at state path state.data.cases.{case.case_id}. "
         f"Observation cutoff={case.observation_cutoff or 'unknown'}; evidence refs={','.join(case.evidence_refs) or 'none'}. "
         f"{group['prompt']} Use only the shared bounded state and this case; if evidence is insufficient, abstain."
     )
@@ -275,7 +286,7 @@ def _question_for_case(axis_id: str, case: SemanticCase, *, stage: int = 1, depe
         prompt=prompt,
         answer_type=group["answer_type"],
         case_id=case.case_id,
-        state_path=f"state.cases.{case.case_id}",
+        state_path=f"state.data.cases.{case.case_id}",
         choices=tuple(group.get("choices", ())),
         score_levels=tuple(group.get("score_levels", ())),
         applicability=applicability,
@@ -309,13 +320,13 @@ def build_semantic_questions(
                     question_id=f"{case.case_id}:cross-axis:semantic-v1",
                     axis_id="CONV",
                     prompt=(
-                        f"Case {case.case_id} at state path state.cases.{case.case_id}: after considering the independent "
+                        f"Case {case.case_id} at state path state.data.cases.{case.case_id}: after considering the independent "
                         "axis judgments for this same case, is the delivery claim supported without overclaiming? "
                         "Abstain when those judgments are missing or contradictory."
                     ),
                     answer_type="choice",
                     case_id=case.case_id,
-                    state_path=f"state.cases.{case.case_id}",
+                    state_path=f"state.data.cases.{case.case_id}",
                     choices=("supported", "overclaimed", "unresolved"),
                     applicability=case.applicability,
                     evidence_refs=case.evidence_refs,
