@@ -1,0 +1,28 @@
+version: 1
+work_items:
+  session-health-jev:
+    title: 'session-health-jev'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/session-health#4'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/session-health-jev/todo.md'
+    excludes: []
+  session-health-jev-offline:
+    title: 'session-health-jev-offline'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/session-health#5'
+    excludes: []
+  session-health-jev-semantic:
+    title: 'session-health-jev-semantic'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/session-health#6'
+    excludes: []
+  session-health-jev-routing:
+    title: 'session-health-jev-routing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/session-health#7'
+    excludes: []

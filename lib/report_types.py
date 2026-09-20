@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from .agent_analysis import AgentAnalysis
 from .parser_base import Session
 from .scorer import SessionScore
+from .metrics.process_v2 import ProcessV2Result
 
 
 @dataclass
@@ -70,6 +71,22 @@ class SessionReport:
     artifact_sources: Dict[str, str] = field(default_factory=dict)
     analysis_layers: List[str] = field(default_factory=list)
     sync_status: str = "session-only"
+    profile: str = "legacy"
+    process_v2: Optional[ProcessV2Result] = None
+    # Retained in-memory for the stage-2 frozen evidence boundary; renderers
+    # expose only the portable manifest, never this internal object directly.
+    portable_bundle: Optional[Any] = None
+    bundle_manifest: Dict[str, Any] = field(default_factory=dict)
+    processing_status: str = "complete"
+    processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    analysis_status: str = "not_requested"
+    analysis_coverage: Dict[str, Any] = field(default_factory=dict)
+    # Stage-2 routing and evidence post-check are additive to offline facts.
+    routing: Optional[Any] = None
+    postcheck: Optional[Any] = None
+    # Optional Jev semantic layer.  It is additive and never replaces the
+    # offline process-v2 facts or the legacy score.
+    semantic: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -80,6 +97,14 @@ class SessionReport:
                 self.analysis_layers.append("diagnosis")
             if self.agent_analysis is not None and self.agent_analysis.success:
                 self.analysis_layers.append("agent")
+            if self.process_v2 is not None:
+                self.analysis_layers.append("process-v2")
+            if self.semantic is not None:
+                self.analysis_layers.append("semantic")
+            if self.routing is not None:
+                self.analysis_layers.append("routing")
+            if self.postcheck is not None:
+                self.analysis_layers.append("postcheck")
 
     @property
     def report_kind(self) -> str:
@@ -100,6 +125,14 @@ class BatchReport:
     artifact_sources: Dict[str, str] = field(default_factory=dict)
     analysis_layers: List[str] = field(default_factory=list)
     sync_status: str = "session-only"
+    profile: str = "legacy"
+    processing_status: str = "complete"
+    processing_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    analysis_status: str = "not_requested"
+    analysis_coverage: Dict[str, Any] = field(default_factory=dict)
+    routing: Optional[Any] = None
+    postcheck: Optional[Any] = None
+    semantic: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not self.analysis_layers:
@@ -110,6 +143,14 @@ class BatchReport:
                 layers.add("diagnosis")
             if self.agent_analysis is not None and self.agent_analysis.success:
                 layers.add("agent")
+            if self.profile == "process-v2":
+                layers.add("process-v2")
+            if self.semantic is not None:
+                layers.add("semantic")
+            if self.routing is not None:
+                layers.add("routing")
+            if self.postcheck is not None:
+                layers.add("postcheck")
             self.analysis_layers = sorted(layers)
 
     @property

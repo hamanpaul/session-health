@@ -7,6 +7,158 @@
 
 ---
 
+## Install
+
+```bash
+git clone https://github.com/hamanpaul/session-health.git
+cd session-health
+./install.sh
+```
+
+The CLI uses Python 3.8+ and the standard library. No package installation is
+required for the offline parser and `process-v2` report.
+
+## Usage
+
+```bash
+python3 eval_session.py SESSION.jsonl --offline --format json
+python3 eval_session.py --dir ./sessions --offline --format table
+python3 eval_session.py SESSION.jsonl --jev --format json
+python3 eval_session.py --list-models
+python3 eval_session.py --list-models --model-catalog-file ./model-catalog.json
+python3 eval_session.py SESSION.jsonl --analyze --jev --model codex/gpt-5.4 --format json
+```
+
+To render a saved single, batch, or directory report as HTML, use:
+
+```bash
+python3 scripts/render_saved_report.py --input FILE_OR_DIR --output report.html --input-kind auto
+```
+
+`--input-kind` accepts `auto`, `single`, `batch`, or `directory`. Existing
+output files are refused unless `--force` is supplied explicitly.
+Saved projections retain failed analyzer results and their diagnostics, even
+when the HTML omits the analysis section. Directory source labels use only the
+directory name, keeping local absolute paths out of the generated metadata.
+
+Use `--analyze` only when an explicit external agent analysis is wanted;
+offline mode never calls a model, network, or agent CLI.
+
+### Optional Jev semantic judgments
+
+`--jev` adds a bounded semantic layer on top of the portable offline facts. It
+uses one shared, redacted state snapshot for versioned SNR/STATE/CTX/REACT/
+DEPTH/CONV/TOOL questions, preserves typed Choice/Noul/Score answers, and
+records request attempts and provider-reported usage. It does not enable
+`--analyze` or any generative report automatically. Request, case, question,
+attempt, timeout, and conservative UTF-8 byte budgets can be lowered with the
+`--jev-max-*` and `--jev-timeout` options.
+
+The HTTP adapter reads `TYPESAFE_API_KEY` only from the process environment and
+never writes it to reports, bundles, argv, or diagnostics. Without a key (or
+with `--offline`) the report keeps the deterministic process-v2 result and
+marks Jev as `live_status: deferred`; this is not a live/API validation. Mock
+backends are only synthetic regression fixtures, and their results are labeled
+as mock rather than live.
+
+The native adapter sends the official Jev request shape: an ID-keyed
+`questions` map using lowercase `choice`, `noul`, and `score` types with
+`instructions` and primitive-specific `criteria`; the default evaluator model
+is `jev-latest`, independent of the source session's logged model. Native
+Choice/Score probability data, Score legends, and confidence are retained only
+when provided by Jev. If a semantic case cap samples the source bundle, JSON
+coverage reports source, selected, excluded, and sampling counts instead of
+claiming complete coverage. Native Score consistency validation retains the
+provider's score and distribution and allows only a bounded discrepancy derived
+from the visible decimal precision; this is a local interoperability policy,
+not a claim about undocumented provider arithmetic. When a backend is reused
+for a batch, each session report snapshots only its own request/attempt usage,
+while request, attempt, and byte caps remain aggregate at backend-instance
+scope and are disclosed in provenance.
+
+Structured `exitCode` metadata counts as present only when its JSON value is an
+integer; JSON booleans remain unknown. Batch tables truncate session IDs to the
+declared 20-character column so long IDs do not shift later fields.
+
+### Stage-2 analyzer routing
+
+`--list-models` (also `--model-catalog`) prints concrete executor/provider/route/
+model/settings cards. Read-only executable discovery reports a present CLI as
+`unknown` account availability; it never infers login, quota, or model access.
+Operator availability entries and an explicit `--model` override are separate
+from discovery. The supported executor identities are Codex, Copilot, and agy;
+agy is not treated as a Gemini CLI alias. The historical Gemini CLI remains
+available only through the explicit `LEGACY_AGENT_CHAIN` compatibility path.
+
+`--analyze` sends a bounded prompt through an argv/stdin adapter. Reports keep
+requested versus provider-reported actual model/settings separate, and missing
+native usage remains `null`. A failed execution may trigger at most one
+reselection among hard-eligible candidates. With `--jev`, Jev Choice selects a
+concrete card and Jev post-checks structured claims/recommendations against a
+frozen evidence snapshot; contradictions and insufficient evidence remain
+visible and repair is limited to one round. A routing or analyzer failure keeps
+the deterministic process-v2 report and marks the second-stage status partial.
+The standard-library `routing_vs_baseline` pilot reports selection agreement
+only; it intentionally carries no quality authority or calibration claim. A
+semantic backend and meaningful multi-case fixture are required. Budget
+exhaustion, Jev abstention, or another routing failure produces a partial
+comparison with no agreement value rather than being counted as baseline
+agreement.
+
+Routing uses a bounded task profile (single/batch scope, session count, seven
+axes, evidence handling, and output requirements), rather than only prompt
+size. Candidate `capability_evidence` keeps advertised descriptions and
+route-specific observations separate from measured quality. The default catalog
+also reads visible entries from the local Codex model cache when available;
+newly discovered models remain `unknown` until their route is confirmed. Cache
+token capacities are not used as byte limits.
+
+The `task-evidence-v2` routing policy asks for a usable provisional analyzer,
+not an unmeasured global quality winner. Every Choice option has a definition.
+`abstention_reason` distinguishes missing evidence from known unsuitability,
+while the legacy failure status remains `no_suitable_model`. Explicit abstention
+does not silently trigger fallback; transport failure or a missing answer can
+use the existing hard-eligible fallback. Exact candidate probability ties use
+priority then identity and are labeled `deterministic_tiebreak`.
+
+Routing JSON retains `jev_requested_model`, `jev_actual_model`, request and
+response hashes, `jev_probabilities`, `jev_confidence`, and native `jev_usage`.
+Unknown served identity or usage stays null. Confidence describes the Choice
+distribution; it is not a calibrated quality score and low confidence alone
+does not block a valid selection. See [the routing experiment and contract](docs/jev-routing-evidence.md).
+
+To make a concrete operator candidate eligible for automatic routing, pass a
+JSON catalog with explicit executor/provider/route/model/settings cards. This
+is data, not a shell template; only the built-in bounded adapters are accepted:
+
+```json
+[
+  {
+    "name": "codex/gpt-5.6-luna",
+    "executor": "codex",
+    "provider": "openai",
+    "route": "codex.exec",
+    "model_id": "gpt-5.6-luna",
+    "inference_settings": {"effort": "max", "stdin": true},
+    "status": "available",
+    "priority": 1
+  }
+]
+```
+
+Use `--model-catalog-file CATALOG.json` with `--analyze`; `--list-models`
+prints the resulting cards without selecting or invoking an analyzer. Omit
+`status` only when the operator intentionally wants the card to retain
+`unknown` access; installed CLI presence alone remains read-only discovery and
+does not make a seed card eligible. The AGY adapter continues to use its
+proven `--print <prompt>` argv transport.
+
+## Version
+
+0.1.0
+
+---
+
 ## 設計理念
 
 在 Agent CLI（如 Codex CLI、Copilot CLI）的工作流程中，每一輪送給 LLM 的 **動態 Prompt** 品質，直接決定了模型能否做出正確的判斷與行動。然而，這些 Prompt 的品質往往是隱性的——使用者難以直觀感受到「這次 session 為什麼跑偏了」或「為什麼模型一直重複同樣的錯誤」。
@@ -43,7 +195,9 @@ session-health/
 │   ├── scorer.py                # 複合計分引擎（7 維度聚合）
 │   ├── radar.py                 # 終端渲染器（quant + weighted diagnosis + agent）
 │   ├── html_report.py           # HTML 報告產生器（single/batch report bundle）
-│   ├── agent_analysis.py        # AI Agent 分析模組（外部 CLI 呼叫）
+│   ├── agent_analysis.py        # bounded analyzer adapters/catalog/routing entrypoint
+│   ├── jev_routing.py           # hard eligibility, Jev Choice, fallback/reselection
+│   ├── postcheck.py             # frozen-evidence claim/recommendation checks
 │   └── metrics/
 │       ├── snr.py               # SNR   信噪比
 │       ├── state.py             # STATE 狀態完整度
@@ -278,20 +432,82 @@ source ~/.bashrc
 
 ## 使用方式
 
-如果你直接給 `Session ID`、`session 目錄` 或 `sessions 目錄` 作為唯一參數，`session-health` 會自動走 **bundle 模式**：
+如果你直接給 `Session ID`、session 檔案或 sessions 目錄作為唯一參數，`session-health`
+預設走 deterministic `process-v2`，只輸出本機可觀察的 terminal 報告；HTML 與外部
+agent analysis 都必須明確選擇。`--profile legacy` 才會啟用歷史 heuristic composite。
 
-- terminal 先輸出摘要分數條
-- 同步產生 HTML 報告
-- 盡可能補上 weighted diagnosis（含 PM 欄位中文說明與 Fx 比重）與 agent analysis
+- `--format html` 或輸出 `.html` 才會產生 HTML 報告
+- `--analyze` 才會啟用外部 agent analysis
+- parse failure 會保留在 batch 報告中；`partial` 回傳 exit code 2，`failed` 回傳 exit code 1
+
+### 可攜式離線分析
+
+`--offline` 會在所有入口關閉 Agent/model/network 呼叫，只使用本機 parser、可攜式
+`SessionBundle` 與 deterministic `process-v2` 七軸觀察。新 profile 的比例一定帶
+`numerator`、`denominator`、`excluded_count` 與 `status`；沒有適用分母時使用 `null`，
+不把缺證據補成 0、100 或成功。既有 heuristic composite 與 A–F 欄位仍保留，必要時可
+用 `--profile legacy` 明示舊 profile。
+
+```bash
+# 產生單一 session 的離線 JSON（不會呼叫任何 analyzer）
+session-health session.jsonl --offline --format json
+
+# 匯出可跨機 replay 的 bounded bundle，再從 bundle 產生同一份離線分析
+session-health session.jsonl --offline --export-bundle session.bundle.json
+session-health --import-bundle session.bundle.json --offline --format html --output report.html
+
+# 批次輸出會保留每一筆成功、partial 或 failed 狀態
+session-health --dir ./fixtures --offline --format json
+```
+
+Bundle 只保留 bounded canonical events/facts、相對 source refs、redacted evidence、
+case candidates 與 observation cutoffs；當 bundle byte/event budget 觸頂時，證據 projection
+會縮減並明示 `partial`，完整的 typed numeric facts 仍分開保存；redaction 是有限的 heuristic 偵測，不能宣稱
+找出所有 secret。外部 outcome fixture 必須以明確相同的 `session_id` 或 `task_id` 才會
+join，且只呈現外部 verdict 與出處，不把它升格成內部 correctness proof。
+
+Bundle coverage 會分開記錄 `input_status`/`input_complete`、`facts_status`/`facts_complete`
+與 `evidence_status`：raw source 讀取不完整時保留已讀 prefix facts，但 processing status
+會是 `partial` 或 `failed`；只有 evidence projection 觸頂時，不會因為可重播的 typed
+facts 被截短而誤報 raw input 不完整。STATE 只在 source 實際發出欄位時計入分母，並保留
+per-turn 明確 `false` 與 inherited cwd 的差異。
+
+Raw JSONL 讀取 budget 與 bundle budget 是兩個獨立邊界：預設 raw input 上限為 128 MiB、
+`50000` 筆 record、單筆 `1000000` 字元，可用 `--max-input-bytes`、
+`--max-input-records`、`--max-input-record-chars` 個別調整。Portable bundle 另有預設 2 MiB
+與 10000 events 上限，可用 `--max-bundle-bytes`、`--max-bundle-events` 調整；超過 bundle
+budget 時保留 bounded prefix 並標成 `partial`。超過 raw budget 時保留已讀
+prefix 並標成 `partial`/`failed`；不會把較小的 portable bundle 上限誤當成 raw session
+上限。Bundle 的文字 evidence 仍會 bounded，但 SNR 所需的完整 numeric noise facts 會
+一併保存，因此直接解析與 export/import replay 的可觀察統計一致。
+
+這個 slice 的驗證是 Linux 本機標準庫與 portable fixtures 的離線驗證；它不等同於
+live API/model、真實 agent CLI、Windows/macOS 或平台 correctness 驗證。那些執行環境與
+語意校準保留給後續切片，缺少資料時報告會保留 `unknown`、`not_applicable` 或
+`failed` 狀態。
 
 ### 完整 Help
 
 ```
 usage: eval_session [-h] [--dir DIR] [--latest N]
+                    [--import-bundle FILE]
                     [--source {auto,codex,copilot}]
+                    [--max-input-bytes N] [--max-input-records N]
+                    [--max-input-record-chars N]
+                    [--max-bundle-bytes N] [--max-bundle-events N]
                     [--format {radar,table,json,html}]
                     [--no-color] [--output FILE] [--verbose]
-                    [--analyze] [--test-agent]
+                    [--analyze] [--jev] [--jev-model MODEL]
+                    [--jev-endpoint URL] [--jev-max-requests N]
+                    [--jev-max-attempts N] [--jev-max-questions N]
+                    [--jev-max-cases N] [--jev-timeout SECONDS]
+                    [--test-agent]
+                    [--analyze-model MODEL]
+                    [--analyze-max-output-bytes N]
+                    [--list-models]
+                    [--model-catalog-file FILE]
+                    [--offline] [--profile {legacy,process-v2}]
+                    [--export-bundle FILE_OR_DIR] [--outcome-file FILE]
                     [SESSION_OR_PATH]
 
 Agent CLI Session 動態 Prompt 品質量化評估
@@ -306,13 +522,38 @@ options:
   --latest N, -l N           評估最近 N 個 session
   --source, -s {auto,codex,copilot}
                              指定 session 來源格式（預設：auto 自動偵測）
+  --max-input-bytes N        raw JSONL 讀取上限（預設：128 MiB，超限保留 partial prefix）
+  --max-input-records N      raw JSONL record 上限（預設：50000）
+  --max-input-record-chars N 單筆 raw JSONL 字元上限（預設：1000000）
+  --max-bundle-bytes N      portable bundle byte budget（預設：2000000）
+  --max-bundle-events N     portable bundle event budget（預設：10000）
   --format, -f {radar,table,json,html}
                              輸出格式（預設：radar）
   --no-color                 停用 ANSI 色彩
   --output FILE, -o FILE     輸出至檔案（副檔名 .html/.json 自動偵測格式）
   --verbose, -v              顯示每輪詳細分數
-  --analyze, -a              啟用 AI Agent 分析（僅限單一 session）
+  --analyze, -a              啟用 bounded AI Agent 分析（single/batch）
+  --jev                       啟用有界 Jev typed semantic judgments，不會自動分析
+  --jev-model MODEL           記錄明示的 Jev evaluator model identity
+  --jev-endpoint URL          覆寫 Jev endpoint
+  --jev-max-requests N        Jev request budget（預設：8）
+  --jev-max-attempts N        Jev attempt budget（預設：12）
+  --jev-max-questions N       每個 Jev request 的 question budget（預設：64）
+  --jev-max-cases N           semantic case budget（預設：32）
+  --jev-timeout SECONDS       Jev request timeout（預設：30）
   --test-agent               使用測試用 agent（copilot/gpt-5-mini）
+  --analyze-model MODEL      明示 analyzer candidate/model override
+  --analyze-max-output-bytes N
+                             analyzer stdout 保留上限（預設：128000）
+  --list-models, --model-catalog
+                             唯讀顯示 executor/model catalog 與 availability provenance
+  --model-catalog-file FILE  explicit operator model cards (JSON)
+  --offline                  關閉 model/network，只做本機 deterministic 分析
+  --profile {legacy,process-v2}
+                             選擇舊 heuristic 或新版可觀察七軸 profile
+  --import-bundle FILE       匯入 portable SessionBundle JSON
+  --export-bundle FILE_OR_DIR 匯出 portable SessionBundle
+  --outcome-file FILE        以 exact session/task identity 匯入外部 outcome fixture
 ```
 
 ### 使用範例
@@ -348,7 +589,7 @@ session-health --dir ~/.codex/sessions/2026/02/
 
 # ── 輸出格式 ──
 
-# RPG 進度條（預設）
+# process-v2 observable axes（預設）
 session-health 019c8d32
 
 # JSON 輸出（可串接其他工具）
@@ -359,6 +600,12 @@ session-health 019c8d32 -f table
 
 # 產生 HTML 報告（同時顯示終端摘要）
 session-health 019c8d32 -o report.html
+
+# 明確離線 process-v2（positional auto-analyze 也會被停用）
+session-health 019c8d32 --offline --format json
+
+# 明示 legacy 相容 profile
+session-health 019c8d32 --offline --profile legacy --format json
 
 # 顯示每輪詳細分數
 session-health 019c8d32 -v
@@ -374,7 +621,9 @@ session-health 019c8d32 --analyze --test-agent
 
 ### 輸出範例
 
-#### 終端 RPG 進度條
+#### Legacy 終端 RPG 進度條
+
+只有明示 `--profile legacy` 時才會顯示歷史 composite/A–F radar。
 
 ```
 ╔════════════════════════════════════════════════════════╗
@@ -420,21 +669,27 @@ session-health 019c8d32 --analyze --test-agent
 
 ## AI Agent 分析
 
-使用 `--analyze` (`-a`) 啟用 AI 分析功能。工具會依序嘗試以下 Agent CLI：
+使用 `--analyze` (`-a`) 啟用第二階段 AI 分析。工具會依序路由以下 concrete
+executor/model candidates（實際可用性仍需 operator entry 或 explicit override）：
 
 | 順位 | Agent | 命令 |
 |------|-------|------|
-| 1 | Codex (GPT-5.4) | `codex -c model=gpt-5.4 exec "prompt"` |
-| 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p "prompt" --yolo` |
-| 3 | Gemini (3 Pro) | `gemini -m gemini-3-pro-preview -p "prompt"` |
-| 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p "prompt" --yolo` |
+| 1 | Codex (GPT-5.4) | `codex --sandbox read-only --ask-for-approval never -c model=gpt-5.4 -c model_reasoning_effort=high exec --skip-git-repo-check --json -` |
+| 2 | Copilot (Sonnet 4.6) | `copilot -s --model claude-sonnet-4.6 -p -` |
+| 3 | agy (Gemini 3.8 Flash High) | `agy --mode plan --sandbox --model gemini-3.8-flash-high --effort high --output-format json --print <bounded-prompt>` |
+| 4 | Copilot (GPT-5 Mini) | `copilot -s --model gpt-5-mini -p -` |
 
 分析結果包含：
 - **整體評估** — 2-3 句話概述 session 的 prompt 品質
 - **低分維度改善建議** — 針對 <70 分的維度給出具體建議
 - **最重要的改善行動** — 單一最有效的改善步驟
 
-使用 `--test-agent` 強制使用 copilot/gpt-5-mini 進行測試。
+分析 prompt 由各 executor 的 bounded argv/stdin adapter 傳入，並受
+context/output/timeout 上限約束；Codex 使用 stdin、`--skip-git-repo-check` 與
+native `--json` JSONL event stream，agy 的 print mode 使用單一 `--print <prompt>`
+參數並保留 JSON response/usage envelope。兩者都固定 report-only 的
+read-only/plan sandbox，不使用 `--yolo` 或危險的全域工具權限。使用
+`--test-agent` 強制使用 copilot/gpt-5-mini 進行測試。
 
 ---
 

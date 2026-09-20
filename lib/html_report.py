@@ -14,7 +14,9 @@ import math
 from typing import Dict, List, Tuple
 
 from .agent_analysis import render_agent_html_section
+from .jev_analysis import render_semantic_html
 from .report_types import BatchReport, DiagnosisSummary, ProblemMapDiagnosis, SessionReport
+from .report_visualization import load_saved_report
 from .scorer import SessionScore
 
 # ── Dimension metadata ──
@@ -479,6 +481,435 @@ def _render_artifact_sources_html(sources: Dict[str, str]) -> str:
 """
 
 
+def _render_stage2_html(routing: object | None, postcheck: object | None) -> str:
+    """Render stage-2 metadata even when the analyzer was deferred/failed."""
+
+    if routing is None and postcheck is None:
+        return ""
+    payload = {
+        "routing": routing.to_dict() if hasattr(routing, "to_dict") else routing,
+        "postcheck": postcheck.to_dict() if hasattr(postcheck, "to_dict") else postcheck,
+    }
+    return f"""
+<div class="agent-analysis">
+    <h2>Stage-2 routing and evidence post-check</h2>
+    <pre>{html.escape(json.dumps(payload, indent=2, ensure_ascii=False))}</pre>
+</div>
+"""
+
+
+def _process_axis_values(process_result: object | None) -> tuple[Dict[str, float | None], Dict[str, str]]:
+    """Return only explicitly observed process-v2 ratios for charting.
+
+    A process-v2 value is an evidence ratio, not a calibrated quality score.
+    Non-observed and out-of-range values remain missing so chart geometry never
+    turns an unknown axis into a visual zero.
+    """
+
+    values: Dict[str, float | None] = {}
+    statuses: Dict[str, str] = {}
+    axes = getattr(process_result, "axes", {}) if process_result is not None else {}
+    for axis_id in DIM_ORDER:
+        axis = axes.get(axis_id) if isinstance(axes, dict) else None
+        metric = getattr(axis, "metric", None)
+        status = str(getattr(metric, "status", "missing")) if metric is not None else "missing"
+        raw_value = getattr(metric, "value", None) if metric is not None else None
+        value = None
+        if status == "observed" and isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            if math.isfinite(float(raw_value)) and 0.0 <= float(raw_value) <= 1.0:
+                value = float(raw_value)
+        values[axis_id] = value
+        statuses[axis_id] = status
+    return values, statuses
+
+
+def _build_process_radar_svg(values: Dict[str, float | None]) -> str | None:
+    """Build a seven-axis observed-ratio radar only when all axes are valid."""
+
+    if any(values.get(axis_id) is None for axis_id in DIM_ORDER):
+        return None
+    cx, cy, radius = 220, 205, 150
+    points_by_scale = []
+    for scale in (0.2, 0.4, 0.6, 0.8, 1.0):
+        points = []
+        for index in range(len(DIM_ORDER)):
+            angle = math.radians(-90 + index * 360.0 / len(DIM_ORDER))
+            points.append(
+                f"{cx + radius * scale * math.cos(angle):.1f},{cy + radius * scale * math.sin(angle):.1f}"
+            )
+        points_by_scale.append(f'<polygon points="{" ".join(points)}" class="process-grid"/>')
+    axis_lines = []
+    labels = []
+    data_points = []
+    for index, axis_id in enumerate(DIM_ORDER):
+        angle = math.radians(-90 + index * 360.0 / len(DIM_ORDER))
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        axis_meta = DIM_META[axis_id]
+        axis_lines.append(f'<line x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" class="process-axis"/>')
+        label_x = cx + (radius + 28) * math.cos(angle)
+        label_y = cy + (radius + 28) * math.sin(angle)
+        anchor = "middle"
+        normalized = (-90 + index * 360.0 / len(DIM_ORDER)) % 360
+        if 45 < normalized < 135:
+            anchor = "start"
+        elif 225 < normalized < 315:
+            anchor = "end"
+        value = float(values[axis_id] or 0.0)
+        labels.append(
+            f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" class="process-label">'
+            f'{html.escape(axis_id)} {value * 100:.1f}%</text>'
+        )
+        data_points.append(f"{cx + radius * value * math.cos(angle):.1f},{cy + radius * value * math.sin(angle):.1f}")
+    polygon = f'<polygon points="{" ".join(data_points)}" class="process-data"/>'
+    return (
+        '<svg class="process-polar" viewBox="0 0 440 410" role="img" '
+        'aria-label="Process-v2 observed ratio profile; not a quality score">'
+        '<title>Process-v2 observed ratio profile; not a quality score</title>'
+        + "".join(points_by_scale + axis_lines)
+        + polygon
+        + "".join(
+            f'<circle cx="{point.split(",")[0]}" cy="{point.split(",")[1]}" r="4" fill="{DIM_META[axis_id]["color"]}"/>'
+            for axis_id, point in zip(DIM_ORDER, data_points)
+        )
+        + "".join(labels)
+        + "</svg>"
+    )
+
+
+def _build_process_evidence_bars_svg(values: Dict[str, float | None], statuses: Dict[str, str]) -> str:
+    """Build a null-preserving evidence bar view for process-v2 axes."""
+
+    width = 610
+    bar_x = 174
+    bar_width = 330
+    row_height = 42
+    height = 42 + row_height * len(DIM_ORDER)
+    rows = []
+    for index, axis_id in enumerate(DIM_ORDER):
+        y = 30 + index * row_height
+        value = values.get(axis_id)
+        label = f"{value * 100:.1f}%" if value is not None else "null"
+        status = html.escape(statuses.get(axis_id, "missing"))
+        fill = ""
+        if value is not None:
+            fill = (
+                f'<rect x="{bar_x}" y="{y - 13}" width="{bar_width * value:.1f}" height="18" '
+                f'fill="{DIM_META[axis_id]["color"]}" rx="3"/>'
+            )
+        missing_class = " process-missing" if value is None else ""
+        rows.append(
+            f'<g class="process-row{missing_class}" data-axis="{html.escape(axis_id)}" data-status="{status}">'
+            f'<text x="10" y="{y}" class="process-axis-name">{html.escape(axis_id)}</text>'
+            f'<rect x="{bar_x}" y="{y - 13}" width="{bar_width}" height="18" class="process-track"/>'
+            f'{fill}<text x="{bar_x + bar_width + 12}" y="{y}" class="process-value">{label}</text>'
+            f'<text x="{bar_x + bar_width + 76}" y="{y}" class="process-status">{status}</text>'
+            "</g>"
+        )
+    return (
+        f'<svg class="process-bars" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Process-v2 observable ratios with null-preserving evidence bars">'
+        '<title>Process-v2 observable ratios; null axes remain missing</title>'
+        '<text x="10" y="16" class="process-chart-note">observable ratio (0–1), per-axis denominator</text>'
+        + "".join(rows)
+        + "</svg>"
+    )
+
+
+def _render_process_visualization(process_result: object | None, *, compact: bool = False) -> str:
+    """Render process-v2 bars and a radar only when all seven ratios are observed."""
+
+    if process_result is None:
+        return ""
+    values, statuses = _process_axis_values(process_result)
+    observed = sum(value is not None for value in values.values())
+    total = len(DIM_ORDER)
+    radar = _build_process_radar_svg(values)
+    missing = ", ".join(
+        f"{axis_id} ({statuses[axis_id]})"
+        for axis_id in DIM_ORDER
+        if values[axis_id] is None
+    )
+    if radar is not None:
+        intro = (
+            "All seven axes are observed ratios on their own denominators. "
+            "This visual is an evidence profile, not a calibrated quality score or aggregate."
+        )
+        radar_section = f'<div class="process-polar-wrap">{radar}</div>'
+    else:
+        intro = (
+            f"{observed}/{total} axes are observed. Missing axes stay null and are not plotted as zero. "
+            f"No seven-axis polar visual is shown because these observations are incomplete: {html.escape(missing or 'unknown')}."
+        )
+        radar_section = ""
+    compact_class = " process-compact" if compact else ""
+    return f'''
+<div class="process-visualization{compact_class}">
+    <h3>Seven-axis process-v2 evidence view</h3>
+    <p>{intro}</p>
+    <div class="process-chart-grid">
+        {radar_section}
+        <div class="process-bars-wrap">{_build_process_evidence_bars_svg(values, statuses)}</div>
+    </div>
+</div>
+'''
+
+
+def _render_process_v2_html(process_result: object | None) -> str:
+    """Render observable process-v2 facts without implying a composite score."""
+
+    if process_result is None or not hasattr(process_result, "axes"):
+        return ""
+    rows = []
+    for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL"):
+        axis = process_result.axes.get(axis_id)
+        if axis is None:
+            continue
+        value = "null" if axis.metric.value is None else f"{axis.metric.value:.3f}"
+        rows.append(
+            "<tr><td>{axis}</td><td>{value}</td><td>{status}</td><td>{reason}</td></tr>".format(
+                axis=html.escape(axis_id),
+                value=html.escape(value),
+                status=html.escape(axis.metric.status),
+                reason=html.escape(axis.metric.reason),
+            )
+        )
+    return """
+<div class="agent-analysis">
+    <h2>Process-v2 observable profile</h2>
+    <p>Ratios are evidence-bounded; null means the axis was not applicable or lacked an observable denominator.</p>
+    <p>Axis ratios use separate denominators and are not calibrated quality scores; no aggregate score is computed.</p>
+    {visualization}
+    <table><thead><tr><th>Axis</th><th>Value</th><th>Status</th><th>Observation</th></tr></thead>
+    <tbody>{rows}</tbody></table>
+</div>
+""".format(rows="".join(rows), visualization=_render_process_visualization(process_result))
+
+
+def _render_process_v2_document(report: SessionReport) -> str:
+    """Render a single process-v2 report without legacy score surfaces."""
+
+    score = report.score
+    sid = html.escape(score.session_id or "unknown")
+    source = html.escape(score.source or "unknown")
+    model = html.escape(score.model or "unknown")
+    diagnostics = html.escape(
+        json.dumps(report.processing_diagnostics, indent=2, ensure_ascii=False)
+    )
+    extra_sections = "".join(
+        [
+            _render_process_v2_html(report.process_v2),
+            render_semantic_html(report.semantic),
+            _render_artifact_sources_html(report.artifact_sources),
+            _render_stage2_html(report.routing, report.postcheck),
+            render_agent_html_section(report.agent_analysis)
+            if report.agent_analysis is not None
+            else "",
+        ]
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Health Process-v2 Report</title>
+<style>
+body {{ font-family: sans-serif; background: #1a1a2e; color: #e8e8e8; line-height: 1.6; padding: 2rem; max-width: 1000px; margin: 0 auto; }}
+.card, .agent-analysis {{ background: #16213e; border: 1px solid #2a2a4a; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+h1, h2 {{ color: #4fc3f7; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ border-bottom: 1px solid #2a2a4a; padding: .75rem; text-align: left; vertical-align: top; }}
+th {{ color: #4fc3f7; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #0f3460; border-radius: 8px; padding: 1rem; }}
+.process-visualization {{ margin: 1rem 0; padding: 1rem; background: #0f3460; border-radius: 8px; }}
+.process-visualization h3 {{ color: #81d4fa; margin-bottom: .35rem; }}
+.process-chart-grid {{ display: grid; grid-template-columns: minmax(280px, 1fr) minmax(440px, 1.4fr); gap: 1rem; align-items: center; }}
+.process-polar-wrap, .process-bars-wrap {{ overflow-x: auto; }}
+.process-polar, .process-bars {{ width: 100%; min-width: 280px; height: auto; }}
+.process-grid, .process-track {{ fill: none; stroke: #49617e; stroke-width: 1; }}
+.process-axis {{ stroke: #49617e; stroke-width: 1; }}
+.process-data {{ fill: #4fc3f7; fill-opacity: .2; stroke: #4fc3f7; stroke-width: 2; }}
+.process-label, .process-axis-name, .process-value {{ fill: #e8e8e8; font-size: 12px; }}
+.process-status, .process-chart-note {{ fill: #9aa8ba; font-size: 11px; }}
+.process-missing .process-value {{ fill: #ffcc80; }}
+@media (max-width: 780px) {{ .process-chart-grid {{ grid-template-columns: 1fr; }} }}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Session Health Process-v2 Report</h1>
+<p>Session: {sid} ｜ Source: {source} ｜ Model: {model} ｜ Turns: {score.turn_count}</p>
+<p>Profile: process-v2 ｜ processing_status: {html.escape(report.processing_status)}</p>
+</div>
+{extra_sections}
+<div class="card">
+<h2>Processing diagnostics</h2>
+<pre>{diagnostics}</pre>
+</div>
+</body>
+</html>
+"""
+
+
+def _format_process_value(value: object) -> str:
+    return "null" if value is None else f"{float(value):.3f}"
+
+
+def _build_legacy_comparison_svg(batch: BatchReport) -> str:
+    """Compare legacy heuristic composites while keeping their caveat visible."""
+
+    reports = [report for report in batch.sessions if report.processing_status != "failed"]
+    width = max(680, 82 * max(1, len(reports)))
+    chart_height = 270
+    left = 56
+    bottom = 52
+    plot_height = 180
+    plot_width = max(1, width - left - 24)
+    slot = plot_width / max(1, len(reports))
+    bars = []
+    for index, report in enumerate(reports):
+        score = max(0.0, min(100.0, float(report.score.composite)))
+        bar_width = min(42.0, slot * 0.62)
+        x = left + index * slot + (slot - bar_width) / 2
+        y = 20 + plot_height - score / 100.0 * plot_height
+        sid = report.score.session_id or f"session-{index + 1}"
+        label = html.escape(sid[:10])
+        bars.append(
+            f'<g class="legacy-bar"><title>{html.escape(sid)}: {score:.1f}</title>'
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{score / 100.0 * plot_height:.1f}" '
+            f'fill="{_score_css_color(score)}" rx="3"/><text x="{x + bar_width / 2:.1f}" y="{y - 6:.1f}" '
+            f'text-anchor="middle" class="legacy-value">{score:.1f}</text>'
+            f'<text x="{x + bar_width / 2:.1f}" y="{20 + plot_height + 20}" text-anchor="middle" '
+            f'class="legacy-label">{label}</text></g>'
+        )
+    grid = []
+    for tick in (0, 25, 50, 75, 100):
+        y = 20 + plot_height - tick / 100.0 * plot_height
+        grid.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{width - 24}" y2="{y:.1f}" class="legacy-grid"/>'
+            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="legacy-tick">{tick}</text>'
+        )
+    note = "No evaluated sessions" if not reports else "legacy heuristic composite (0–100); compatibility view, not process-v2"
+    return (
+        f'<svg class="batch-comparison" viewBox="0 0 {width} {chart_height}" role="img" '
+        'aria-label="Legacy heuristic composite comparison; not process-v2">'
+        f'<title>{html.escape(note)}</title>'
+        f'<text x="{left}" y="14" class="batch-chart-note">{html.escape(note)}</text>'
+        + "".join(grid + bars)
+        + "</svg>"
+    )
+
+
+def _build_process_batch_heatmap_svg(batch: BatchReport) -> str:
+    """Compare saved process-v2 ratios per session without filling null cells."""
+
+    reports = list(batch.sessions)
+    cell_width = 76
+    label_width = 180
+    row_height = 30
+    width = label_width + cell_width * len(DIM_ORDER) + 16
+    height = 54 + row_height * max(1, len(reports))
+    header = []
+    for index, axis_id in enumerate(DIM_ORDER):
+        x = label_width + index * cell_width + cell_width / 2
+        header.append(f'<text x="{x:.1f}" y="38" text-anchor="middle" class="heatmap-header">{axis_id}</text>')
+    rows = []
+    for row_index, report in enumerate(reports):
+        values, statuses = _process_axis_values(report.process_v2)
+        y = 54 + row_index * row_height
+        sid = report.score.session_id or f"session-{row_index + 1}"
+        rows.append(
+            f'<text x="8" y="{y + 19}" class="heatmap-session">{html.escape(sid[:22])}</text>'
+        )
+        for column, axis_id in enumerate(DIM_ORDER):
+            value = values[axis_id]
+            x = label_width + column * cell_width
+            if value is None:
+                rows.append(
+                    f'<g class="heatmap-cell missing" data-axis="{axis_id}" data-status="{html.escape(statuses[axis_id])}">'
+                    f'<rect x="{x}" y="{y}" width="{cell_width - 3}" height="24" class="heatmap-missing"/>'
+                    f'<text x="{x + (cell_width - 3) / 2:.1f}" y="{y + 17}" text-anchor="middle" class="heatmap-value">—</text></g>'
+                )
+                continue
+            opacity = 0.22 + 0.78 * value
+            rows.append(
+                f'<g class="heatmap-cell observed" data-axis="{axis_id}" data-status="observed">'
+                f'<title>{html.escape(sid)} {axis_id}: {value:.3f} observed ratio</title>'
+                f'<rect x="{x}" y="{y}" width="{cell_width - 3}" height="24" fill="#4fc3f7" fill-opacity="{opacity:.3f}" rx="2"/>'
+                f'<text x="{x + (cell_width - 3) / 2:.1f}" y="{y + 17}" text-anchor="middle" class="heatmap-value">{value * 100:.1f}%</text></g>'
+            )
+    return (
+        f'<svg class="batch-heatmap" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Process-v2 observed ratio comparison by session; missing axes remain null">'
+        '<title>Process-v2 observed ratios by session; blank cells are null</title>'
+        '<text x="8" y="16" class="batch-chart-note">process-v2 observed ratios by session; blank cells = null, not zero</text>'
+        + "".join(header + rows)
+        + "</svg>"
+    )
+
+
+def _build_process_coverage_svg(batch: BatchReport) -> str:
+    """Show how many sessions provide an observed value for each axis."""
+
+    total = len(batch.sessions)
+    width = 610
+    bar_x = 174
+    bar_width = 330
+    rows = []
+    for index, axis_id in enumerate(DIM_ORDER):
+        observed = 0
+        for report in batch.sessions:
+            values, _ = _process_axis_values(report.process_v2)
+            observed += values[axis_id] is not None
+        y = 32 + index * 34
+        fraction = observed / total if total else 0.0
+        rows.append(
+            f'<text x="10" y="{y}" class="process-axis-name">{axis_id}</text>'
+            f'<rect x="{bar_x}" y="{y - 13}" width="{bar_width}" height="18" class="process-track"/>'
+            f'<rect x="{bar_x}" y="{y - 13}" width="{bar_width * fraction:.1f}" height="18" fill="{DIM_META[axis_id]["color"]}" rx="3"/>'
+            f'<text x="{bar_x + bar_width + 12}" y="{y}" class="process-value">{observed}/{total}</text>'
+        )
+    height = 52 + 34 * len(DIM_ORDER)
+    return (
+        f'<svg class="process-coverage" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Process-v2 observed axis coverage across sessions">'
+        '<title>Process-v2 observed axis coverage; counts, not quality scores</title>'
+        '<text x="10" y="16" class="process-chart-note">sessions with observed ratio / total sessions</text>'
+        + "".join(rows)
+        + "</svg>"
+    )
+
+
+def _render_batch_visualizations(batch: BatchReport) -> str:
+    if batch.profile == "legacy":
+        radar_cards = []
+        for index, report in enumerate(batch.sessions, 1):
+            sid = report.score.session_id or f"session-{index}"
+            if report.processing_status == "failed":
+                chart = '<p class="text-dim">No chart: processing failed.</p>'
+            else:
+                chart = f'<svg class="legacy-mini-radar" viewBox="-40 -35 480 480" role="img" aria-label="Legacy seven-axis radar for {html.escape(sid)}">{_build_radar_svg(report.score.radar_axes)}</svg>'
+            radar_cards.append(
+                f'<article class="legacy-radar-card"><h3>{html.escape(sid)}</h3>{chart}</article>'
+            )
+        return f'''
+<div class="card batch-visualizations">
+    <h2>📊 Legacy batch visualizations</h2>
+    <p>Each radar is the historical seven-axis compatibility view. The comparison below is a heuristic composite and is not process-v2.</p>
+    <div class="batch-chart-panel">{_build_legacy_comparison_svg(batch)}</div>
+    <div class="legacy-radar-grid">{''.join(radar_cards)}</div>
+</div>
+'''
+    return f'''
+<div class="card batch-visualizations">
+    <h2>📊 Process-v2 batch evidence comparison</h2>
+    <p>Cells and bars show observable ratios on per-axis denominators. Null axes stay blank; these views do not rank sessions or form a quality score.</p>
+    <div class="batch-chart-panel">{_build_process_batch_heatmap_svg(batch)}</div>
+    <div class="batch-chart-panel">{_build_process_coverage_svg(batch)}</div>
+</div>
+'''
+
+
 def _render_batch_html(batch: BatchReport) -> str:
     """Generate a standalone HTML page for a batch report."""
 
@@ -491,32 +922,100 @@ def _render_batch_html(batch: BatchReport) -> str:
             route = report.problemmap.global_fix_route.get("minimal_fix_zh") or report.problemmap.global_fix_route.get("minimal_fix") or json.dumps(
                 report.problemmap.global_fix_route, ensure_ascii=False
             )
+        process_axes = "—"
+        process_coverage = "—"
+        if report.process_v2 is not None:
+            process_axes = " ".join(
+                f"{axis_id}={_format_process_value(report.process_v2.axes.get(axis_id).metric.value if report.process_v2.axes.get(axis_id) else None)}"
+                for axis_id in ("SNR", "STATE", "CTX", "REACT", "DEPTH", "CONV", "TOOL")
+            )
+            coverage = report.process_v2.coverage or {}
+            process_coverage = f"{coverage.get('observed_axis_count', 'unknown')}/{coverage.get('axis_count', 'unknown')}"
+        semantic_status = "—"
+        if report.semantic is not None:
+            semantic_status = f"{report.semantic.status} / {report.semantic.live_status}"
+        legacy_score = "—" if report.processing_status == "failed" else f"{report.score.composite:.1f}"
+        legacy_grade = "—" if report.processing_status == "failed" else report.score.grade
+        diagnostic = "; ".join(
+            str(item.get("message", item.get("kind", "")))
+            for item in report.processing_diagnostics[:3]
+            if isinstance(item, dict)
+        )
+        if batch.profile == "legacy":
+            legacy_cells = f"<td>{html.escape(legacy_score)}</td><td>{html.escape(legacy_grade)}</td>"
+            diagnosis_cells = f"<td>{html.escape(primary)}</td><td>{html.escape(route)}</td>"
+        else:
+            legacy_cells = ""
+            diagnosis_cells = ""
         rows.append(
             """
             <tr>
                 <td>{session_id}</td>
-                <td>{score}</td>
-                <td>{grade}</td>
-                <td>{primary}</td>
-                <td>{route}</td>
+                <td>{status}</td>
+                {legacy_cells}
+                {diagnosis_cells}
+                <td>{semantic_status}</td>
+                <td><code>{process_axes}</code></td>
+                <td>{coverage}</td>
+                <td>{diagnostic}</td>
             </tr>
             """.format(
                 session_id=html.escape(report.score.session_id or "unknown"),
-                score=html.escape(f"{report.score.composite:.1f}"),
-                grade=html.escape(report.score.grade),
-                primary=html.escape(primary),
-                route=html.escape(route),
+                status=html.escape(report.processing_status),
+                legacy_cells=legacy_cells,
+                diagnosis_cells=diagnosis_cells,
+                semantic_status=html.escape(semantic_status),
+                process_axes=html.escape(process_axes),
+                coverage=html.escape(process_coverage),
+                diagnostic=html.escape(diagnostic or "—"),
             )
         )
 
-    evidence_json = html.escape(
-        json.dumps(batch.evidence_summary, indent=2, ensure_ascii=False)
-    )
+    if batch.profile == "legacy":
+        evidence_payload = batch.evidence_summary
+    else:
+        axis_observations = {}
+        for axis_id in DIM_ORDER:
+            axis_observations[axis_id] = {
+                "sessions": sum(
+                    1
+                    for report in batch.sessions
+                    if report.process_v2 is not None and axis_id in report.process_v2.axes
+                ),
+                "observed": sum(
+                    1
+                    for report in batch.sessions
+                    if report.process_v2 is not None
+                    and axis_id in report.process_v2.axes
+                    and report.process_v2.axes[axis_id].metric.status == "observed"
+                ),
+            }
+        evidence_payload = {
+            "session_count": len(batch.sessions),
+            "processing_status": batch.processing_status,
+            "axis_observations": axis_observations,
+        }
+    evidence_json = html.escape(json.dumps(evidence_payload, indent=2, ensure_ascii=False))
     layers = ", ".join(batch.analysis_layers)
     agent_section = ""
     if batch.agent_analysis is not None:
         agent_section = render_agent_html_section(batch.agent_analysis)
-    diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary)
+    semantic_section = "".join(
+        render_semantic_html(report.semantic)
+        for report in batch.sessions
+        if report.semantic is not None
+    )
+    stage2_section = _render_stage2_html(batch.routing, batch.postcheck)
+    diagnosis_section = _render_diagnosis_summary_html(batch.diagnosis_summary) if batch.profile == "legacy" else ""
+    if batch.profile == "legacy":
+        summary_headers = """
+                <th>Score</th>
+                <th>Grade</th>"""
+    else:
+        summary_headers = ""
+    diagnosis_headers = "" if batch.profile != "legacy" else """
+                <th>主家族</th>
+                <th>最小修復動作</th>"""
     return f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -579,12 +1078,40 @@ pre {{
 .agent-content p, .agent-content li {{ margin-bottom: 0.3rem; }}
 .agent-content ul, .agent-content ol {{ padding-left: 1.4rem; }}
 .text-dim {{ color: #8892a4; }}
+.batch-visualizations p {{ color: #b9c4d4; }}
+.batch-chart-panel {{ overflow-x: auto; margin: 1rem 0 1.5rem; padding: .75rem; background: #0f3460; border-radius: 8px; }}
+.batch-comparison, .batch-heatmap, .process-coverage {{ width: 100%; min-width: 640px; height: auto; }}
+.batch-chart-note, .process-chart-note {{ fill: #b9c4d4; font-size: 12px; }}
+.legacy-grid, .heatmap-missing, .process-track {{ stroke: #49617e; stroke-width: 1; }}
+.legacy-grid {{ stroke-dasharray: 3 3; }}
+.legacy-tick, .legacy-label, .legacy-value, .heatmap-header, .heatmap-session, .heatmap-value {{ fill: #e8e8e8; font-size: 11px; }}
+.legacy-radar-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }}
+.legacy-radar-card {{ background: #0f3460; border-radius: 8px; padding: .75rem; overflow: hidden; }}
+.legacy-radar-card h3 {{ color: #81d4fa; font-size: .95rem; overflow-wrap: anywhere; }}
+.legacy-mini-radar {{ width: 100%; height: auto; }}
+.legacy-mini-radar .grid-line {{ fill: none; stroke: #49617e; stroke-width: 1; }}
+.legacy-mini-radar .axis-line {{ stroke: #49617e; stroke-width: 1; stroke-dasharray: 4 4; }}
+.legacy-mini-radar .data-area {{ fill: rgba(79, 195, 247, .15); stroke: #4fc3f7; stroke-width: 2.5; }}
+.legacy-mini-radar .radar-label {{ fill: #e8e8e8; font-size: 14px; font-weight: bold; }}
+.legacy-mini-radar .radar-value {{ fill: #b9c4d4; font-size: 13px; }}
+.process-visualization {{ margin: 1rem 0; padding: 1rem; background: #0f3460; border-radius: 8px; }}
+.process-visualization h3 {{ color: #81d4fa; margin-bottom: .35rem; }}
+.process-chart-grid {{ display: grid; grid-template-columns: minmax(280px, 1fr) minmax(440px, 1.4fr); gap: 1rem; align-items: center; }}
+.process-polar-wrap, .process-bars-wrap {{ overflow-x: auto; }}
+.process-polar, .process-bars {{ width: 100%; min-width: 280px; height: auto; }}
+.process-grid, .process-track {{ fill: none; stroke: #49617e; stroke-width: 1; }}
+.process-axis {{ stroke: #49617e; stroke-width: 1; }}
+.process-data {{ fill: #4fc3f7; fill-opacity: .2; stroke: #4fc3f7; stroke-width: 2; }}
+.process-label, .process-axis-name, .process-value {{ fill: #e8e8e8; font-size: 12px; }}
+.process-status, .process-chart-note {{ fill: #9aa8ba; font-size: 11px; }}
+.process-missing .process-value {{ fill: #ffcc80; }}
+@media (max-width: 780px) {{ .process-chart-grid {{ grid-template-columns: 1fr; }} }}
 </style>
 </head>
 <body>
 <div class="card">
     <h1>⚔ Session Health Batch Report</h1>
-    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Layers: {html.escape(layers)}</p>
+    <p>Sessions: {len(batch.sessions)} ｜ Target: {html.escape(batch.target_kind)} ｜ Profile: {html.escape(batch.profile)} ｜ processing_status: {html.escape(batch.processing_status)} ｜ Layers: {html.escape(layers)}</p>
 </div>
 <div class="card">
     <h2>📋 Batch Summary</h2>
@@ -592,23 +1119,29 @@ pre {{
         <thead>
             <tr>
                 <th>Session</th>
-                <th>Score</th>
-                <th>Grade</th>
-                <th>主家族</th>
-                <th>最小修復動作</th>
+                <th>Status</th>
+                {summary_headers}
+                {diagnosis_headers}
+                <th>Semantic</th>
+                <th>process-v2 axes</th>
+                <th>Coverage</th>
+                <th>Diagnostics</th>
             </tr>
         </thead>
         <tbody>
-            {''.join(rows)}
+{''.join(rows)}
         </tbody>
     </table>
 </div>
+{_render_batch_visualizations(batch)}
 <div class="card">
     <h2>🧪 Batch Evidence</h2>
     <pre>{evidence_json}</pre>
 </div>
 {diagnosis_section}
 {agent_section}
+{stage2_section}
+{semantic_section}
 </body>
 </html>
 """
@@ -618,6 +1151,8 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     """Generate a complete standalone HTML report."""
     if isinstance(item, BatchReport):
         return _render_batch_html(item)
+    if isinstance(item, SessionReport) and item.profile != "legacy":
+        return _render_process_v2_document(item)
 
     score = item.score if isinstance(item, SessionReport) else item
     axes = score.radar_axes
@@ -638,8 +1173,11 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
     if isinstance(item, SessionReport):
         extra_sections = "".join(
             [
+                _render_process_v2_html(item.process_v2),
+                render_semantic_html(item.semantic),
                 _render_diagnosis_summary_html(item.diagnosis_summary),
                 _render_artifact_sources_html(item.artifact_sources),
+                _render_stage2_html(item.routing, item.postcheck),
                 render_agent_html_section(item.agent_analysis)
                 if item.agent_analysis is not None
                 else "",
@@ -667,6 +1205,16 @@ def render_html(item: SessionScore | SessionReport | BatchReport, agent_section:
         composite_stddev=f"{score.composite_stddev:.1f}",
         axes_json=json.dumps({k: round(v, 1) for k, v in axes.items()}, ensure_ascii=False),
     )
+
+
+def render_saved_html(source: str, *, input_kind: str = "auto") -> str:
+    """Render a saved single/batch JSON or per-session JSON directory.
+
+    Loading is intentionally projection-only: no raw session parser, metric,
+    agent, or network call is involved.
+    """
+
+    return render_html(load_saved_report(source, input_kind=input_kind))
 
 
 def _build_radar_svg(axes: Dict[str, float]) -> str:
