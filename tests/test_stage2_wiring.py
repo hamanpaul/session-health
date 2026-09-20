@@ -18,6 +18,7 @@ import eval_session
 from lib.agent_analysis import (
     AgentAnalysis,
     AgentConfig,
+    _build_codex_cmd,
     _build_agy_cmd,
     build_repair_callback,
     operator_catalog,
@@ -64,6 +65,120 @@ def _available_agy() -> AgentConfig:
 
 
 class Stage2WiringTest(unittest.TestCase):
+    def test_builtin_adapters_use_report_only_flags_and_supported_transports(self):
+        codex_argv = _build_codex_cmd("prompt stays on stdin")
+        self.assertEqual(
+            codex_argv,
+            [
+                "codex",
+                "--sandbox",
+                "read-only",
+                "--ask-for-approval",
+                "never",
+                "-c",
+                "model=gpt-5.4",
+                "-c",
+                "model_reasoning_effort=high",
+                "exec",
+                "--skip-git-repo-check",
+                "--json",
+                "-",
+            ],
+        )
+        self.assertNotIn("prompt stays on stdin", codex_argv)
+
+        agy_argv = _build_agy_cmd("bounded prompt")
+        self.assertEqual(agy_argv[:6], ["agy", "--mode", "plan", "--sandbox", "--model", "gemini-3.8-flash-high"])
+        self.assertEqual(agy_argv[-2:], ["--print", "bounded prompt"])
+        configured_agy = operator_catalog(
+            [
+                {
+                    "name": "agy/gemini-3.8-flash-high",
+                    "executor": "agy",
+                    "model_id": "gemini-3.8-flash-high",
+                    "inference_settings": {"effort": "high", "prompt_transport": "argv"},
+                    "status": "available",
+                }
+            ],
+            candidates=[],
+        )[0]
+        self.assertEqual(configured_agy.build_cmd("bounded prompt"), agy_argv)
+
+    def test_codex_native_jsonl_starts_from_non_git_cwd_and_keeps_usage(self):
+        cards = [
+            {
+                "name": "codex/gpt-5.6-luna",
+                "executor": "codex",
+                "provider": "openai",
+                "route": "codex.exec",
+                "model_id": "gpt-5.6-luna",
+                "inference_settings": {"effort": "max", "stdin": True},
+                "status": "available",
+            }
+        ]
+        native_response = json.dumps(
+            {
+                "observations": [
+                    {
+                        "text": "native Codex observation",
+                        "evidence_refs": ["evidence-1"],
+                    }
+                ],
+                "hypotheses": [],
+                "claims": [],
+                "recommendations": [],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty_cwd = root / "empty" / "caller-cwd"
+            empty_cwd.mkdir(parents=True)
+            fake_codex = root / "bin" / "codex"
+            fake_codex.parent.mkdir()
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "argv = sys.argv[1:]\n"
+                "required = ['--sandbox', 'read-only', '--ask-for-approval', 'never', '--skip-git-repo-check', '--json']\n"
+                "if any(flag not in argv for flag in required):\n"
+                "    raise SystemExit(2)\n"
+                "if sys.stdin.read() != 'bounded native prompt':\n"
+                "    raise SystemExit(3)\n"
+                f"events = [\n"
+                f"    {{'type': 'thread.started', 'model': 'codex-native'}},\n"
+                f"    {{'type': 'item.completed', 'item': {{'type': 'agent_message', 'text': {native_response!r}}}}},\n"
+                "    {'type': 'turn.completed', 'usage': {'input_tokens': 11, 'cached_input_tokens': 2, 'output_tokens': 7, 'total_tokens': 18, 'reasoning_output_tokens': 3}},\n"
+                "]\n"
+                "for event in events:\n"
+                "    print(json.dumps(event))\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(empty_cwd)
+                with patch.dict(os.environ, {"PATH": str(fake_codex.parent) + os.pathsep + os.environ.get("PATH", "")}):
+                    candidate = operator_catalog(cards, candidates=[])
+                    result = call_agent(
+                        "bounded native prompt",
+                        agent_chain=candidate,
+                        use_jev=False,
+                        max_retries=0,
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.actual_model, "codex-native")
+        self.assertEqual(result.raw_response, native_response)
+        self.assertEqual(result.claims[0]["text"], "native Codex observation")
+        self.assertEqual(result.native_usage["input_tokens"], 11)
+        self.assertEqual(result.native_usage["cached_tokens"], 2)
+        self.assertEqual(result.native_usage["output_tokens"], 7)
+        self.assertEqual(result.native_usage["reasoning_tokens"], 3)
+        self.assertEqual(result.native_usage["total_tokens"], 18)
+
     def test_single_prompt_contains_independent_stage2_layers_and_redacts(self):
         score = score_session(_session())
         private_ref = "/".join(("", "home", "synthetic-user", "private.jsonl"))
@@ -305,7 +420,21 @@ class Stage2WiringTest(unittest.TestCase):
         self.assertEqual(luna.inference_settings["effort"], "max")
         self.assertEqual(
             luna.build_cmd("ignored because Codex uses stdin"),
-            ["codex", "-c", "model=gpt-5.6-luna", "-c", "model_reasoning_effort=max", "exec", "-"],
+            [
+                "codex",
+                "--sandbox",
+                "read-only",
+                "--ask-for-approval",
+                "never",
+                "-c",
+                "model=gpt-5.6-luna",
+                "-c",
+                "model_reasoning_effort=max",
+                "exec",
+                "--skip-git-repo-check",
+                "--json",
+                "-",
+            ],
         )
         decision = choose_model(
             catalog,

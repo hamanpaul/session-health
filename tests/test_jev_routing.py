@@ -139,6 +139,9 @@ class JevRoutingRegressionTest(unittest.TestCase):
             seen["argv"],
             [
                 "agy",
+                "--mode",
+                "plan",
+                "--sandbox",
                 "--model",
                 "gemini-3.8-flash-high",
                 "--effort",
@@ -171,6 +174,9 @@ class JevRoutingRegressionTest(unittest.TestCase):
         )
         prompt = "bounded prompt marker\nsecond line"
         expected_argv = [
+            "--mode",
+            "plan",
+            "--sandbox",
             "--model",
             "gemini-3.8-flash-high",
             "--effort",

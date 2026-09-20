@@ -213,7 +213,24 @@ class AgentConfig:
 
 
 def _build_codex_cmd(_prompt: str) -> List[str]:
-    return ["codex", "-c", "model=gpt-5.4", "-c", "model_reasoning_effort=high", "exec", "-"]
+    # Codex's report-only invocation must not inherit a caller's repository
+    # trust, write sandbox, or interactive approval defaults.  ``--json`` is
+    # the exec JSONL event stream; the prompt itself remains on stdin.
+    return [
+        "codex",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "-c",
+        "model=gpt-5.4",
+        "-c",
+        "model_reasoning_effort=high",
+        "exec",
+        "--skip-git-repo-check",
+        "--json",
+        "-",
+    ]
 
 
 def _build_copilot_sonnet_cmd(_prompt: str) -> List[str]:
@@ -227,6 +244,9 @@ def _build_agy_cmd(prompt: str) -> List[str]:
     # one argv value.  JSON preserves the native response/usage envelope.
     return [
         "agy",
+        "--mode",
+        "plan",
+        "--sandbox",
         "--model",
         "gemini-3.8-flash-high",
         "--effort",
@@ -290,6 +310,9 @@ def _configured_build_cmd(
         def build_agy(prompt: str) -> List[str]:
             return [
                 "agy",
+                "--mode",
+                "plan",
+                "--sandbox",
                 "--model",
                 model_id,
                 "--effort",
@@ -306,11 +329,17 @@ def _configured_build_cmd(
         def build_codex(_prompt: str) -> List[str]:
             return [
                 "codex",
+                "--sandbox",
+                "read-only",
+                "--ask-for-approval",
+                "never",
                 "-c",
                 f"model={model_id}",
                 "-c",
                 f"model_reasoning_effort={effort}",
                 "exec",
+                "--skip-git-repo-check",
+                "--json",
                 "-",
             ]
 
@@ -651,10 +680,167 @@ def _redact_value(value: Any, depth: int = 0) -> Any:
     return value
 
 
+def _normalized_native_usage(payload: Any) -> Optional[Dict[str, Any]]:
+    """Normalize provider usage keys without estimating omitted values."""
+
+    if not isinstance(payload, Mapping):
+        return None
+    aliases = {
+        "input_tokens": ("input_tokens", "prompt_tokens", "inputTokens"),
+        "output_tokens": ("output_tokens", "completion_tokens", "outputTokens"),
+        "total_tokens": ("total_tokens", "total", "totalTokens"),
+        "cached_tokens": (
+            "cached_tokens",
+            "cached_input_tokens",
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+            "cachedTokens",
+        ),
+        "reasoning_tokens": (
+            "reasoning_tokens",
+            "reasoning_output_tokens",
+            "reasoningTokens",
+        ),
+    }
+    normalized: Dict[str, Any] = {}
+    for target, names in aliases.items():
+        for name in names:
+            if name in payload:
+                normalized[target] = payload[name]
+                break
+    return normalized or None
+
+
+def _native_usage_from_event(event: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Read only CLI-owned usage fields from one native event."""
+
+    for key in ("usage", "native_usage", "token_usage", "tokenUsage"):
+        usage = _normalized_native_usage(event.get(key))
+        if usage:
+            return usage
+    # Some event versions put usage fields directly on turn.completed.
+    return _normalized_native_usage(event)
+
+
+def _native_text(value: Any, *, depth: int = 0) -> str:
+    """Extract text from a native message item without treating tool output as final."""
+
+    if depth > 5:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "output_text", "delta", "response", "analysis", "output"):
+            if key in value:
+                text = _native_text(value[key], depth=depth + 1)
+                if text.strip():
+                    return text
+        content = value.get("content")
+        if isinstance(content, (list, tuple)):
+            parts = [_native_text(item, depth=depth + 1) for item in content]
+            return "".join(part for part in parts if part)
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "".join(_native_text(item, depth=depth + 1) for item in value)
+    return ""
+
+
+def _native_event_message(event: Mapping[str, Any]) -> str:
+    """Return an assistant/final message from one Codex JSONL event."""
+
+    event_type = str(event.get("type", "")).lower()
+    item = event.get("item")
+    if isinstance(item, Mapping):
+        item_type = str(item.get("type", "")).lower()
+        if item_type in {"agent_message", "assistant_message", "message", "output_text"} or "message" in item_type:
+            return _native_text(item)
+    if any(marker in event_type for marker in ("agent_message", "assistant_message", "output_text", "response.completed", "message.completed")):
+        return _native_text(event)
+    return ""
+
+
+def _native_event_identity(event: Mapping[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Capture provider-reported identity/settings, never infer them from text."""
+
+    actual_model = event.get("actual_model", event.get("model", event.get("model_id")))
+    if not isinstance(actual_model, str) or not actual_model.strip():
+        actual_model = None
+    actual_settings = event.get("actual_settings", event.get("settings", {}))
+    if not isinstance(actual_settings, Mapping):
+        actual_settings = {}
+    return actual_model.strip() if actual_model else None, _redact_value(dict(actual_settings))
+
+
+def _parse_native_jsonl_output(
+    output: str,
+) -> Optional[Tuple[str, Dict[str, Any], Optional[str], Dict[str, Any], Dict[str, Optional[int]]]]:
+    """Parse Codex ``exec --json`` JSONL events into the existing result contract."""
+
+    events: List[Mapping[str, Any]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            decoded = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, Mapping):
+            return None
+        events.append(decoded)
+    if not events:
+        return None
+
+    message = ""
+    actual_model: Optional[str] = None
+    actual_settings: Dict[str, Any] = {}
+    usage_payload: Optional[Dict[str, Any]] = None
+    for event in events:
+        event_model, event_settings = _native_event_identity(event)
+        if event_model:
+            actual_model = event_model
+        if event_settings:
+            actual_settings = event_settings
+        event_usage = _native_usage_from_event(event)
+        if event_usage:
+            # The final turn event is authoritative for one invocation.  Do
+            # not add intermediate snapshots or model-authored JSON usage.
+            usage_payload = event_usage
+        event_message = _native_event_message(event)
+        if event_message.strip():
+            message = event_message
+
+    if not message.strip():
+        return None
+
+    # The final assistant text may itself be the requested JSON object.  Parse
+    # that object for claims, but keep usage/identity sourced only from native
+    # CLI events above.
+    inner_payload: Any = None
+    try:
+        inner_payload = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        pass
+    if isinstance(inner_payload, Mapping):
+        text, structured, _ignored_model, _ignored_settings, _ignored_usage = _parse_structured_output(message)
+    else:
+        text = _redact_text(message)
+        structured = {"response": text}
+    if not structured:
+        structured = {"response": text}
+    if usage_payload is None:
+        usage = SemanticUsage().to_dict()
+    else:
+        usage = SemanticUsage.from_payload(usage_payload).to_dict()
+    return text, _redact_value(structured), actual_model, actual_settings, usage
+
+
 def _parse_structured_output(output: str) -> Tuple[str, Dict[str, Any], Optional[str], Dict[str, Any], Dict[str, Optional[int]]]:
     try:
         payload = json.loads(output)
     except (TypeError, json.JSONDecodeError):
+        native = _parse_native_jsonl_output(output)
+        if native is not None:
+            return native
         return output, {}, None, {}, SemanticUsage().to_dict()
     if not isinstance(payload, Mapping):
         return output, {}, None, {}, SemanticUsage().to_dict()
