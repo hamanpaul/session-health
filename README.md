@@ -29,6 +29,15 @@ python3 eval_session.py --list-models --model-catalog-file ./model-catalog.json
 python3 eval_session.py SESSION.jsonl --analyze --jev --model codex/gpt-5.4 --format json
 ```
 
+To render a saved single, batch, or directory report as HTML, use:
+
+```bash
+python3 scripts/render_saved_report.py --input FILE_OR_DIR --output report.html --input-kind auto
+```
+
+`--input-kind` accepts `auto`, `single`, `batch`, or `directory`. Existing
+output files are refused unless `--force` is supplied explicitly.
+
 Use `--analyze` only when an explicit external agent analysis is wanted;
 offline mode never calls a model, network, or agent CLI.
 
