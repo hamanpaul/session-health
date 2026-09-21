@@ -143,7 +143,10 @@ def parse_trigger_analysis(
     provider = payload.get("provider")
     if provider is not None and (not isinstance(provider, str) or len(provider) > 100):
         raise ValueError("provider must be a short string or null")
-    usage = SemanticUsage.from_payload(payload.get("native_usage")).to_dict()
+    usage_payload = payload.get("native_usage")
+    if usage_payload is not None and not isinstance(usage_payload, Mapping):
+        raise ValueError("native_usage must be an object or null")
+    usage = SemanticUsage.from_payload(usage_payload).to_dict()
     claims = list(structured["observations"] + structured["hypotheses"] + structured["claims"])
     return AgentAnalysis(
         agent_name="trigger-agent",

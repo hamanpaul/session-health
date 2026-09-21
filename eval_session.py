@@ -711,6 +711,8 @@ def main() -> None:
         parser.error("trigger-agent stdin/context cannot be combined with --analyze")
     if (args.analysis_stdin or args.analysis_context) and args.analysis_origin != "trigger-agent":
         parser.error("--analysis-stdin and --analysis-context require trigger-agent origin")
+    if (args.analysis_stdin or args.analysis_context) and args.analyze_model:
+        parser.error("trigger-agent stdin/context cannot be combined with --model")
     if args.headless and (args.analysis_stdin or args.analysis_context):
         parser.error("--headless cannot be combined with trigger-agent stdin/context")
     if args.headless and args.analysis_origin not in (None, "headless"):
@@ -719,6 +721,8 @@ def main() -> None:
         parser.error("headless origin requires --headless")
     if args.headless and args.analyze_model:
         parser.error("--headless performs judging and cannot be combined with --model; use explicit-model origin")
+    if args.headless and not args.model_catalog_file:
+        parser.error("--headless requires an operator-confirmed --model-catalog-file")
     if args.analysis_origin == "trigger-agent" and not (args.analysis_stdin or args.analysis_context):
         parser.error("trigger-agent origin requires --analysis-context or --analysis-stdin")
     if args.analysis_origin == "explicit-model" and not args.analyze_model:

@@ -89,13 +89,21 @@ class TriggerAgentContractTest(unittest.TestCase):
                 json.dumps({"observations": [{"text": "x"}], "usage": {"total_tokens": 1}})
             )
 
+    def test_native_usage_must_be_an_object(self):
+        with self.assertRaisesRegex(ValueError, "native_usage must be an object"):
+            parse_trigger_analysis(
+                json.dumps({"observations": [{"text": "x"}], "native_usage": "unknown"})
+            )
+
     def test_cli_rejects_contradictory_mode_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "session.jsonl"
             _session(source)
             cases = [
                 ["--headless", "--analysis-stdin"],
+                ["--headless"],
                 ["--analysis-origin", "headless"],
+                ["--analysis-context", "--model", "fixture"],
                 ["--analysis-context", "--analysis-origin", "explicit-model", "--model", "fixture"],
                 ["--analysis-origin", "explicit-model", "--model", "fixture"],
             ]
