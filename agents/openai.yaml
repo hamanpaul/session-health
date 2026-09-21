@@ -1,0 +1,6 @@
+interface:
+  display_name: "Session Health"
+  short_description: "Seven-axis session diagnostics with current-agent synthesis"
+  default_prompt: "Use $session-health to analyze the requested session. In interactive mode, keep stage 2 on the current model unless I explicitly name another model, and produce an HTML report with the batch-average radar when applicable."
+policy:
+  allow_implicit_invocation: true

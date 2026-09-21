@@ -135,6 +135,11 @@ class SavedReportHtmlTest(unittest.TestCase):
             "diagnostics": [{"kind": "timeout", "status": "failed"}],
             "attempts": [{"status": "failed", "error_kind": "timeout"}],
             "native_usage": {"input_tokens": None, "output_tokens": None},
+            "analysis_origin": "headless",
+            "routing_mode": "authorized_reselection",
+            "judge_receipts": [{"judge_id": "fixture", "status": "valid"}],
+            "fallback_policy": "bounded_reselect",
+            "fallback_reason": "selected_model_execution_failed",
         }
         single = {**_legacy_session("failed-analysis"), "agent_analysis": failure}
         batch = {"report_kind": "batch", "sessions": [single], "agent_analysis": failure}

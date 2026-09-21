@@ -182,6 +182,11 @@ def _agent_analysis(value: Any) -> AgentAnalysis | None:
         postcheck=data.get("postcheck"),
         coverage=dict(_mapping(data.get("coverage"))),
         diagnostics=_list_of_dicts(data.get("diagnostics")),
+        analysis_origin=str(data.get("analysis_origin", "external_model")),
+        routing_mode=str(data.get("routing_mode", "legacy")),
+        judge_receipts=_list_of_dicts(data.get("judge_receipts")),
+        fallback_policy=str(data.get("fallback_policy", "bounded_reselect")),
+        fallback_reason=data.get("fallback_reason"),
     )
 
 

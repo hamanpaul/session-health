@@ -43,6 +43,7 @@ from lib.radar import render_report_terminal, render_table, render_json
 from lib.html_report import render_html
 from lib.agent_analysis import (
     AGENT_CHAIN,
+    AgentAnalysis,
     build_repair_callback,
     build_stage2_context,
     discover_agent_catalog,
@@ -57,6 +58,9 @@ from lib.agent_analysis import (
 from lib.jev_analysis import SemanticEvaluation, evaluate_session_semantic
 from lib.postcheck import freeze_evidence
 from lib.semantic_backend import SemanticBudget, build_default_backend
+from lib.trigger_analysis import collect_evidence_refs, parse_trigger_analysis
+from lib.headless_routing import select_headless_model
+from lib.jev_routing import AnalysisRequest, RoutingBudget, choose_model, candidate_id
 
 
 def detect_source(path: Path) -> str:
@@ -275,6 +279,231 @@ def _stage2_evidence(report: SessionReport) -> dict:
     }
 
 
+def _interactive_context(reports: List[SessionReport]) -> dict:
+    """Build the no-file handoff consumed by the currently running agent."""
+
+    contexts = [
+        build_stage2_context(
+            process_v2=report.process_v2,
+            bundle=report.portable_bundle,
+            semantic=report.semantic,
+        )
+        for report in reports
+    ]
+    summaries = [
+        {
+            "session_id": report.score.session_id or "unknown",
+            "source": report.score.source,
+            "turn_count": report.score.turn_count,
+            "processing_status": report.processing_status,
+            "coverage": report.process_v2.coverage if report.process_v2 is not None else {},
+        }
+        for report in reports
+    ]
+    return {
+        "schema": "session-health.trigger-context",
+        "version": "1.0",
+        "scope": "single" if len(reports) == 1 else "batch",
+        "task_profile": build_session_health_task_profile(
+            scope="single" if len(reports) == 1 else "batch", count=len(reports)
+        ),
+        "sessions": summaries,
+        "stage2_contexts": contexts,
+        "output_contract": {
+            "format": "one JSON object on stdin",
+            "sections": ["observations", "hypotheses", "claims", "recommendations"],
+            "item": {"text": "string", "evidence_refs": [], "counterevidence_refs": []},
+            "optional_metadata": ["actual_model", "provider", "native_usage"],
+            "chain_of_thought": "excluded",
+        },
+    }
+
+
+def _failed_analysis(origin: str, message: str, *, kind: str) -> AgentAnalysis:
+    return AgentAnalysis(
+        agent_name=origin,
+        success=False,
+        error=message[:300],
+        analysis_origin=origin.replace("-", "_"),
+        routing_mode="interactive" if origin == "trigger-agent" else origin,
+        fallback_policy="disabled",
+        diagnostics=[{"kind": kind, "status": "failed", "message": message[:300]}],
+    )
+
+
+def _run_headless_analysis(
+    prompt: str,
+    *,
+    candidates: List[Any],
+    backend: Any,
+    semantic_budget: Any,
+    task_profile: dict,
+    max_output_bytes: int,
+    fallback_policy: Any,
+) -> AgentAnalysis:
+    request = AnalysisRequest(
+        context_bytes=len(prompt.encode("utf-8")),
+        output_bytes=max_output_bytes,
+        task_profile=task_profile,
+        budget=RoutingBudget(max_output_bytes=max_output_bytes, max_reselections=1 if fallback_policy == "bounded-reselect" else 0),
+    )
+    jev_receipt = None
+    if backend is not None:
+        vote = choose_model(candidates, request, backend=backend, budget=semantic_budget, allow_unknown=False, use_jev=True)
+        jev_selected = vote.routing_source in {"jev", "deterministic_tiebreak"} and vote.candidate_id
+        choice = jev_selected or vote.abstention_reason or "insufficient_model_evidence"
+        jev_receipt = {
+            "candidate_id": choice,
+            "confidence": vote.jev_confidence,
+            "reason": vote.abstention_reason or vote.routing_source,
+            "evidence_refs": [vote.choice_question_id] if vote.choice_question_id else [],
+        }
+
+    def judge(candidate: Any, judge_request: str) -> dict:
+        judged = call_agent(
+            judge_request,
+            agent_chain=[candidate],
+            model_override=candidate_id(candidate),
+            use_jev=False,
+            max_retries=0,
+            max_output_bytes=16_384,
+        )
+        if not judged.success:
+            return {"candidate_id": "insufficient_model_evidence", "reason": judged.error}
+        return judged.structured_output
+
+    decision = select_headless_model(candidates, request, judge=judge, jev_receipt=jev_receipt)
+    if decision.selected is None:
+        failed = _failed_analysis("headless", "headless judges selected no suitable analyzer", kind="headless_selection_failed")
+        failed.routing_mode = "multi_judge"
+        failed.judge_receipts = decision.judge_receipts
+        failed.fallback_policy = fallback_policy.replace("-", "_")
+        failed.diagnostics.extend(decision.diagnostics)
+        return failed
+    analysis = call_agent(
+        prompt,
+        agent_chain=[decision.selected],
+        model_override=decision.candidate_id or "",
+        use_jev=False,
+        max_retries=0,
+        max_output_bytes=max_output_bytes,
+    )
+    analysis.analysis_origin = "headless"
+    analysis.routing_mode = "multi_judge"
+    analysis.judge_receipts = decision.judge_receipts
+    analysis.fallback_policy = fallback_policy.replace("-", "_")
+    analysis.diagnostics.extend(decision.diagnostics)
+    if analysis.success or fallback_policy != "bounded-reselect":
+        return analysis
+
+    remaining = [item for item in candidates if candidate_id(item) != decision.candidate_id]
+    if not remaining:
+        analysis.fallback_reason = "selected_model_failed_no_remaining_candidate"
+        return analysis
+    reselection = select_headless_model(remaining, request, judge=judge, jev_receipt=None)
+    analysis.judge_receipts.extend(reselection.judge_receipts)
+    analysis.diagnostics.extend(reselection.diagnostics)
+    if reselection.selected is None:
+        analysis.fallback_reason = "selected_model_failed_reselection_abstained"
+        return analysis
+    fallback = call_agent(
+        prompt,
+        agent_chain=[reselection.selected],
+        model_override=reselection.candidate_id or "",
+        use_jev=False,
+        max_retries=0,
+        max_output_bytes=max_output_bytes,
+    )
+    fallback.analysis_origin = "headless"
+    fallback.routing_mode = "authorized_reselection"
+    fallback.judge_receipts = analysis.judge_receipts
+    fallback.fallback_policy = "bounded_reselect"
+    fallback.fallback_reason = "selected_model_execution_failed"
+    fallback.attempts = list(analysis.attempts) + list(fallback.attempts)
+    fallback.diagnostics = list(analysis.diagnostics) + list(fallback.diagnostics)
+    fallback.diagnostics.insert(
+        0,
+        {"kind": "authorized_model_reselection", "status": "complete" if fallback.success else "failed"},
+    )
+    return fallback
+
+
+def _run_external_analysis(
+    prompt: str,
+    *,
+    candidates: Any,
+    test_mode: bool,
+    backend: Any,
+    semantic_budget: Any,
+    model_override: str,
+    task_profile: dict,
+    use_jev: bool,
+    max_output_bytes: int,
+    origin: Any,
+    fallback_policy: Any,
+) -> AgentAnalysis:
+    """Run legacy/explicit analysis and enforce explicit fallback authority."""
+
+    effective_policy = fallback_policy or (
+        "disabled" if model_override else ("bounded-reselect" if origin is None else "disabled")
+    )
+    retries = 1 if effective_policy == "bounded-reselect" and not model_override else 0
+    analysis = call_agent(
+        prompt,
+        agent_chain=candidates,
+        test_mode=test_mode,
+        routing_backend=backend,
+        routing_budget=semantic_budget,
+        model_override=model_override,
+        task_profile=task_profile,
+        use_jev=use_jev,
+        max_retries=retries,
+        max_output_bytes=max_output_bytes,
+    )
+    analysis.analysis_origin = "explicit_model" if model_override else "external_model"
+    analysis.routing_mode = "explicit" if model_override else "legacy"
+    analysis.fallback_policy = effective_policy.replace("-", "_")
+    if analysis.success or not model_override or effective_policy != "bounded-reselect":
+        return analysis
+
+    source = list(candidates) if candidates is not None else discover_agent_catalog()
+
+    def matches(item: Any) -> bool:
+        return model_override in {
+            candidate_id(item),
+            str(getattr(item, "name", "")),
+            str(getattr(item, "model_id", "")),
+            str(getattr(item, "route", "")),
+        }
+
+    remaining = [item for item in source if not matches(item)]
+    if not remaining:
+        analysis.fallback_reason = "explicit_model_failed_no_remaining_candidate"
+        return analysis
+    fallback = call_agent(
+        prompt,
+        agent_chain=remaining,
+        test_mode=False,
+        routing_backend=backend,
+        routing_budget=semantic_budget,
+        task_profile=task_profile,
+        use_jev=use_jev,
+        max_retries=0,
+        max_output_bytes=max_output_bytes,
+    )
+    fallback.analysis_origin = "explicit_model"
+    fallback.routing_mode = "authorized_reselection"
+    fallback.fallback_policy = "bounded_reselect"
+    fallback.fallback_reason = "explicit_model_execution_failed"
+    fallback.requested_model = model_override
+    fallback.attempts = list(analysis.attempts) + list(fallback.attempts)
+    fallback.diagnostics.insert(
+        0,
+        {"kind": "authorized_model_reselection", "status": "complete" if fallback.success else "failed"},
+    )
+    return fallback
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="eval_session",
@@ -373,6 +602,33 @@ def main() -> None:
         "--analyze", "-a",
         action="store_true",
         help="Run bounded AI agent analysis on the selected session or batch",
+    )
+    parser.add_argument(
+        "--analysis-context",
+        action="store_true",
+        help="Emit bounded stage-2 context for the current interactive agent as JSON",
+    )
+    parser.add_argument(
+        "--analysis-stdin",
+        action="store_true",
+        help="Validate one trigger-agent analysis JSON object from stdin and merge it into the report",
+    )
+    parser.add_argument(
+        "--analysis-origin",
+        choices=["trigger-agent", "explicit-model", "headless"],
+        default=None,
+        help="Record and enforce the stage-2 execution boundary",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Enable active-model discovery and bounded multi-judge model selection",
+    )
+    parser.add_argument(
+        "--fallback-policy",
+        choices=["disabled", "bounded-reselect"],
+        default=None,
+        help="Analyzer failure policy (explicit/headless default: disabled; omitted legacy --analyze keeps one retry)",
     )
     parser.add_argument(
         "--jev",
@@ -481,6 +737,36 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if (args.analysis_stdin or args.analysis_context) and args.analysis_origin is None:
+        args.analysis_origin = "trigger-agent"
+    if args.analysis_stdin and args.analysis_context:
+        parser.error("--analysis-stdin and --analysis-context are separate no-file protocol steps")
+    if (args.analysis_stdin or args.analysis_context) and args.analyze:
+        parser.error("trigger-agent stdin/context cannot be combined with --analyze")
+    if (args.analysis_stdin or args.analysis_context) and args.analysis_origin != "trigger-agent":
+        parser.error("--analysis-stdin and --analysis-context require trigger-agent origin")
+    if (args.analysis_stdin or args.analysis_context) and args.analyze_model:
+        parser.error("trigger-agent stdin/context cannot be combined with --model")
+    if args.headless and (args.analysis_stdin or args.analysis_context):
+        parser.error("--headless cannot be combined with trigger-agent stdin/context")
+    if args.headless and args.analysis_origin not in (None, "headless"):
+        parser.error("--headless requires --analysis-origin headless")
+    if args.analysis_origin == "headless" and not args.headless:
+        parser.error("headless origin requires --headless")
+    if args.headless and args.analyze_model:
+        parser.error("--headless performs judging and cannot be combined with --model; use explicit-model origin")
+    if args.headless and not args.model_catalog_file:
+        parser.error("--headless requires an operator-confirmed --model-catalog-file")
+    if args.analysis_origin == "trigger-agent" and not (args.analysis_stdin or args.analysis_context):
+        parser.error("trigger-agent origin requires --analysis-context or --analysis-stdin")
+    if args.analysis_origin == "explicit-model" and not args.analyze_model:
+        parser.error("explicit-model origin requires --model")
+    if args.analysis_origin == "explicit-model" and not args.analyze:
+        parser.error("explicit-model origin requires --analyze")
+    if args.headless:
+        args.analyze = True
+        args.analysis_origin = "headless"
+
     configured_agent_chain = None
     if args.model_catalog_file:
         try:
@@ -588,7 +874,7 @@ def main() -> None:
                 session = bundle.to_session()
             else:
                 session = parse_session(path, source, input_limits=input_limits)
-            if args.profile == "process-v2" or args.export_bundle or args.offline or args.jev or args.analyze:
+            if args.profile == "process-v2" or args.export_bundle or args.offline or args.jev or args.analyze or args.analysis_context or args.analysis_stdin:
                 if bundle is None:
                     bundle = build_session_bundle(session, limits=bundle_limits)
             sc = score_session(session)
@@ -780,6 +1066,68 @@ def main() -> None:
             if report.processing_status != "complete"
         ]
 
+    interactive_context = None
+    if args.analysis_context or args.analysis_stdin:
+        interactive_context = _interactive_context(reports)
+
+    if args.analysis_context:
+        print(json.dumps(interactive_context, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.analysis_stdin:
+        print(
+            "SESSION_HEALTH_ANALYSIS_CONTEXT "
+            + json.dumps(interactive_context, ensure_ascii=False, separators=(",", ":")),
+            file=sys.stderr,
+            flush=True,
+        )
+        raw_analysis = sys.stdin.buffer.read(128_001)
+        try:
+            trigger_analysis = parse_trigger_analysis(
+                raw_analysis,
+                allowed_refs=collect_evidence_refs(interactive_context),
+            )
+        except ValueError as exc:
+            trigger_analysis = _failed_analysis(
+                "trigger-agent", str(exc), kind="trigger_agent_analysis_invalid"
+            )
+        coverage = {
+            "source_session_count": len(reports),
+            "selected_session_count": len(reports),
+            "excluded_session_count": 0,
+            "status": "complete" if trigger_analysis.success else "failed",
+        }
+        trigger_analysis.coverage = dict(coverage)
+        target = reports[0] if len(reports) == 1 else batch_report
+        target.agent_analysis = trigger_analysis
+        target.analysis_coverage = coverage
+        target.analysis_status = "completed" if trigger_analysis.success else "failed"
+        if trigger_analysis.success:
+            target.analysis_layers.append("agent")
+            if args.jev:
+                frozen = freeze_evidence(
+                    _stage2_evidence(reports[0])
+                    if len(reports) == 1
+                    else {
+                        "sessions": [_stage2_evidence(report) for report in reports],
+                        "coverage": coverage,
+                    }
+                )
+                target.postcheck = postcheck_analysis(
+                    frozen,
+                    trigger_analysis,
+                    backend=semantic_backend,
+                    budget=semantic_budget,
+                    repair=None,
+                )
+                trigger_analysis.postcheck = target.postcheck
+                target.analysis_layers.append("postcheck")
+        else:
+            target.processing_status = "partial" if target.processing_status == "complete" else target.processing_status
+            target.processing_diagnostics.append(
+                {"kind": "trigger_agent_analysis_failed", "status": "failed", "message": trigger_analysis.error}
+            )
+
     if args.analyze and args.offline:
         # Explicit offline mode wins over positional auto-analysis and over an
         # explicit --analyze request.  Keep the reason in the report instead of
@@ -824,17 +1172,31 @@ def main() -> None:
                 semantic=report.semantic,
                 stage2_context=stage2_context,
             )
-            analysis = call_agent(
-                prompt,
-                agent_chain=configured_agent_chain,
-                test_mode=args.test_agent,
-                routing_backend=semantic_backend if args.jev else None,
-                routing_budget=semantic_budget if args.jev else None,
-                model_override=args.analyze_model,
-                task_profile=build_session_health_task_profile(scope="single", count=1),
-                use_jev=args.jev,
-                max_output_bytes=args.analyze_max_output_bytes,
-            )
+            task_profile = build_session_health_task_profile(scope="single", count=1)
+            if args.headless:
+                analysis = _run_headless_analysis(
+                    prompt,
+                    candidates=configured_agent_chain or discover_agent_catalog(),
+                    backend=semantic_backend if args.jev else None,
+                    semantic_budget=semantic_budget if args.jev else None,
+                    task_profile=task_profile,
+                    max_output_bytes=args.analyze_max_output_bytes,
+                    fallback_policy=args.fallback_policy or "disabled",
+                )
+            else:
+                analysis = _run_external_analysis(
+                    prompt,
+                    candidates=configured_agent_chain,
+                    test_mode=args.test_agent,
+                    backend=semantic_backend if args.jev else None,
+                    semantic_budget=semantic_budget if args.jev else None,
+                    model_override=args.analyze_model,
+                    task_profile=task_profile,
+                    use_jev=args.jev,
+                    max_output_bytes=args.analyze_max_output_bytes,
+                    origin=args.analysis_origin,
+                    fallback_policy=args.fallback_policy,
+                )
             report.agent_analysis = analysis
             report.analysis_coverage = {
                 "source_session_count": 1,
@@ -919,17 +1281,31 @@ def main() -> None:
                 diagnosis_summary=asdict(batch_report.diagnosis_summary) if batch_report.diagnosis_summary is not None else None,
                 stage2_contexts=stage2_contexts,
             )
-            batch_report.agent_analysis = call_agent(
-                prompt,
-                agent_chain=configured_agent_chain,
-                test_mode=args.test_agent,
-                routing_backend=semantic_backend if args.jev else None,
-                routing_budget=semantic_budget if args.jev else None,
-                model_override=args.analyze_model,
-                task_profile=build_session_health_task_profile(scope="batch", count=len(reports)),
-                use_jev=args.jev,
-                max_output_bytes=args.analyze_max_output_bytes,
-            )
+            task_profile = build_session_health_task_profile(scope="batch", count=len(reports))
+            if args.headless:
+                batch_report.agent_analysis = _run_headless_analysis(
+                    prompt,
+                    candidates=configured_agent_chain or discover_agent_catalog(),
+                    backend=semantic_backend if args.jev else None,
+                    semantic_budget=semantic_budget if args.jev else None,
+                    task_profile=task_profile,
+                    max_output_bytes=args.analyze_max_output_bytes,
+                    fallback_policy=args.fallback_policy or "disabled",
+                )
+            else:
+                batch_report.agent_analysis = _run_external_analysis(
+                    prompt,
+                    candidates=configured_agent_chain,
+                    test_mode=args.test_agent,
+                    backend=semantic_backend if args.jev else None,
+                    semantic_budget=semantic_budget if args.jev else None,
+                    model_override=args.analyze_model,
+                    task_profile=task_profile,
+                    use_jev=args.jev,
+                    max_output_bytes=args.analyze_max_output_bytes,
+                    origin=args.analysis_origin,
+                    fallback_policy=args.fallback_policy,
+                )
             batch_report.analysis_status = "completed" if batch_report.agent_analysis.success else "failed"
             batch_report.analysis_coverage = {
                 "source_session_count": len(reports),
