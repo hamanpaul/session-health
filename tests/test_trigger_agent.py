@@ -80,6 +80,34 @@ class TriggerAgentContractTest(unittest.TestCase):
                 allowed_refs={"known"},
             )
 
+    def test_undocumented_usage_alias_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported fields"):
+            parse_trigger_analysis(
+                json.dumps({"observations": [{"text": "x"}], "usage": {"total_tokens": 1}})
+            )
+
+    def test_cli_rejects_contradictory_mode_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "session.jsonl"
+            _session(source)
+            cases = [
+                ["--headless", "--analysis-stdin"],
+                ["--analysis-origin", "headless"],
+                ["--analysis-context", "--analysis-origin", "explicit-model", "--model", "fixture"],
+                ["--analysis-origin", "explicit-model", "--model", "fixture"],
+            ]
+            for flags in cases:
+                with self.subTest(flags=flags):
+                    result = subprocess.run(
+                        [sys.executable, str(ROOT / "eval_session.py"), str(source), *flags],
+                        cwd=directory,
+                        input="{}",
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

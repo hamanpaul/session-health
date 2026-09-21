@@ -16,7 +16,7 @@ from .semantic_backend import SemanticUsage
 
 MAX_TRIGGER_ANALYSIS_BYTES = 128_000
 SECTIONS = ("observations", "hypotheses", "claims", "recommendations")
-_ROOT_KEYS = set(SECTIONS) | {"actual_model", "provider", "usage", "native_usage"}
+_ROOT_KEYS = set(SECTIONS) | {"actual_model", "provider", "native_usage"}
 _ITEM_KEYS = {"text", "evidence_refs", "counterevidence_refs"}
 
 
@@ -143,7 +143,7 @@ def parse_trigger_analysis(
     provider = payload.get("provider")
     if provider is not None and (not isinstance(provider, str) or len(provider) > 100):
         raise ValueError("provider must be a short string or null")
-    usage = SemanticUsage.from_payload(payload.get("native_usage", payload.get("usage"))).to_dict()
+    usage = SemanticUsage.from_payload(payload.get("native_usage")).to_dict()
     claims = list(structured["observations"] + structured["hypotheses"] + structured["claims"])
     return AgentAnalysis(
         agent_name="trigger-agent",
