@@ -9,9 +9,10 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import eval_session
-from lib.agent_analysis import AgentAnalysis
+from lib.agent_analysis import AgentAnalysis, AgentConfig
 from lib.trigger_analysis import parse_trigger_analysis
 
 
@@ -141,6 +142,37 @@ class TriggerAgentContractTest(unittest.TestCase):
             disabled = eval_session._run_external_analysis(**common, fallback_policy="disabled")
         self.assertEqual(call.call_args.kwargs["max_retries"], 0)
         self.assertEqual(disabled.fallback_policy, "disabled")
+
+        explicit = dict(common, model_override="fixture-model")
+        with patch.object(eval_session, "call_agent", return_value=AgentAnalysis(success=True)) as call:
+            strict = eval_session._run_external_analysis(**explicit, fallback_policy=None)
+        self.assertEqual(call.call_args.kwargs["max_retries"], 0)
+        self.assertEqual(strict.fallback_policy, "disabled")
+
+    def test_headless_bounded_reselect_executes_one_second_candidate(self):
+        first = AgentConfig(name="first", model_id="first", executor="codex", build_cmd=lambda _p: ["true"])
+        second = AgentConfig(name="second", model_id="second", executor="codex", build_cmd=lambda _p: ["true"])
+        decisions = [
+            SimpleNamespace(selected=first, candidate_id=first.candidate_id, judge_receipts=[{"round": 1}], diagnostics=[]),
+            SimpleNamespace(selected=second, candidate_id=second.candidate_id, judge_receipts=[{"round": 2}], diagnostics=[]),
+        ]
+        failed = AgentAnalysis(success=False, attempts=[{"candidate_id": first.candidate_id}])
+        succeeded = AgentAnalysis(success=True, attempts=[{"candidate_id": second.candidate_id}])
+        with patch.object(eval_session, "select_headless_model", side_effect=decisions), \
+                patch.object(eval_session, "call_agent", side_effect=[failed, succeeded]) as call:
+            result = eval_session._run_headless_analysis(
+                "bounded",
+                candidates=[first, second],
+                backend=None,
+                semantic_budget=None,
+                task_profile={},
+                max_output_bytes=1024,
+                fallback_policy="bounded-reselect",
+            )
+        self.assertEqual(call.call_count, 2)
+        self.assertTrue(result.success)
+        self.assertEqual(result.routing_mode, "authorized_reselection")
+        self.assertEqual(result.fallback_reason, "selected_model_execution_failed")
 
 
 if __name__ == "__main__":

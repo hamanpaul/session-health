@@ -393,7 +393,39 @@ def _run_headless_analysis(
     analysis.judge_receipts = decision.judge_receipts
     analysis.fallback_policy = fallback_policy.replace("-", "_")
     analysis.diagnostics.extend(decision.diagnostics)
-    return analysis
+    if analysis.success or fallback_policy != "bounded-reselect":
+        return analysis
+
+    remaining = [item for item in candidates if candidate_id(item) != decision.candidate_id]
+    if not remaining:
+        analysis.fallback_reason = "selected_model_failed_no_remaining_candidate"
+        return analysis
+    reselection = select_headless_model(remaining, request, judge=judge, jev_receipt=None)
+    analysis.judge_receipts.extend(reselection.judge_receipts)
+    analysis.diagnostics.extend(reselection.diagnostics)
+    if reselection.selected is None:
+        analysis.fallback_reason = "selected_model_failed_reselection_abstained"
+        return analysis
+    fallback = call_agent(
+        prompt,
+        agent_chain=[reselection.selected],
+        model_override=reselection.candidate_id or "",
+        use_jev=False,
+        max_retries=0,
+        max_output_bytes=max_output_bytes,
+    )
+    fallback.analysis_origin = "headless"
+    fallback.routing_mode = "authorized_reselection"
+    fallback.judge_receipts = analysis.judge_receipts
+    fallback.fallback_policy = "bounded_reselect"
+    fallback.fallback_reason = "selected_model_execution_failed"
+    fallback.attempts = list(analysis.attempts) + list(fallback.attempts)
+    fallback.diagnostics = list(analysis.diagnostics) + list(fallback.diagnostics)
+    fallback.diagnostics.insert(
+        0,
+        {"kind": "authorized_model_reselection", "status": "complete" if fallback.success else "failed"},
+    )
+    return fallback
 
 
 def _run_external_analysis(
@@ -408,11 +440,13 @@ def _run_external_analysis(
     use_jev: bool,
     max_output_bytes: int,
     origin: Any,
-    fallback_policy: str,
+    fallback_policy: Any,
 ) -> AgentAnalysis:
     """Run legacy/explicit analysis and enforce explicit fallback authority."""
 
-    effective_policy = fallback_policy or ("bounded-reselect" if origin is None else "disabled")
+    effective_policy = fallback_policy or (
+        "disabled" if model_override else ("bounded-reselect" if origin is None else "disabled")
+    )
     retries = 1 if effective_policy == "bounded-reselect" and not model_override else 0
     analysis = call_agent(
         prompt,
