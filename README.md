@@ -41,6 +41,20 @@ Saved projections retain failed analyzer results and their diagnostics, even
 when the HTML omits the analysis section. Directory source labels use only the
 directory name, keeping local absolute paths out of the generated metadata.
 
+### 批次 HTML 雷達語意
+
+批次 HTML 只呈現一張聚合雷達，並保留逐 session 的比較表／長條圖。
+`legacy` 聚合雷達對每個 `score.radar_axes` 軸在未 failed 的 session 上取算術平均，
+每軸同時顯示納入數 `n/N`；不再把每個 session 的 legacy mini-radar 放進 grid。
+
+`process-v2` 聚合雷達只平均明確 `observed` 且落在有效範圍的 ratio；
+`unknown` 與 `not_applicable` 不會被當成零值。每軸顯示有效觀測的 `n/N`，即使各軸
+分母不同，只要七軸各有至少一筆觀測仍會繪製聚合雷達。任一軸為 `0/N` 時省略聚合
+polygon，並在 coverage 中明示缺口；逐 session heatmap 與 coverage bars 仍保留。
+
+單一 session 的 legacy radar 與完整 `process-v2` polar view 維持原有行為；不完整的
+process-v2 session 仍把缺軸保留為 null 並省略其單一 session polar view。
+
 Use `--analyze` only when an explicit external agent analysis is wanted;
 offline mode never calls a model, network, or agent CLI.
 
