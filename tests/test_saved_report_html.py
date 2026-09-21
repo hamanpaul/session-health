@@ -97,7 +97,7 @@ def _process_session(
             "axes": axes,
             "observed_facts": {},
             "inference": {"correctness_judgment": None},
-        "external_outcome": {"status": "not_requested"},
+            "external_outcome": {"status": "not_requested"},
             "coverage": {"axis_count": 7, "observed_axis_count": observed_axis_count},
             "processing": {"mode": "offline"},
         },
@@ -202,7 +202,7 @@ class SavedReportHtmlTest(unittest.TestCase):
             "CONV": 40,
             "TOOL": 70,
         }.items():
-            _assert_axis_summary(self, aggregate, axis_id, str(mean), "2/3")
+            _assert_axis_summary(self, aggregate, axis_id, str(mean), "2/2")
         self.assertIn("legacy heuristic composite", rendered)
 
     def test_process_single_uses_observed_ratio_polar_view_only_when_complete(self) -> None:
@@ -295,9 +295,9 @@ class SavedReportHtmlTest(unittest.TestCase):
         ):
             _assert_axis_summary(self, aggregate, axis_id, mean, coverage)
         self.assertIn("process-mean-a SNR: 0.200 observed ratio", rendered)
-        self.assertIn("process-v2 observed axis coverage across sessions", rendered)
+        self.assertIn("Process-v2 observed axis coverage across sessions", rendered)
 
-    def test_process_batch_omits_radar_when_axis_has_no_observation(self) -> None:
+    def test_process_batch_omits_polygon_when_axis_has_no_observation(self) -> None:
         sessions = [
             _process_session(
                 "process-gap-a",
@@ -316,7 +316,11 @@ class SavedReportHtmlTest(unittest.TestCase):
             source.write_text(json.dumps(payload), encoding="utf-8")
             rendered = render_saved_html(str(source), input_kind="batch")
 
-        self.assertNotIn('class="process-batch-radar"', rendered)
+        self.assertEqual(rendered.count('class="process-batch-radar"'), 1)
+        aggregate = _visible_svg_text(rendered, "process-batch-radar")
+        self.assertNotIn('class="batch-radar-data"', rendered)
+        _assert_axis_summary(self, aggregate, "CTX", "—", "0/2")
+        self.assertIn("No aggregate polygon is shown", rendered)
         self.assertIn('class="batch-heatmap"', rendered)
         coverage = _visible_svg_text(rendered, "process-coverage")
         self.assertRegex(coverage, r"\bCTX\b.*?0/2")
