@@ -880,30 +880,213 @@ def _build_process_coverage_svg(batch: BatchReport) -> str:
     )
 
 
+def _build_batch_radar_svg(
+    values: Dict[str, float | None],
+    coverage: Dict[str, Tuple[int, int]],
+    *,
+    max_value: float,
+    display_multiplier: float,
+    display_suffix: str,
+    css_class: str,
+    title: str,
+    aria_label: str,
+    note: str,
+) -> str:
+    """Build one accessible batch mean radar with per-axis coverage labels."""
+
+    cx, cy, radius = 220, 205, 150
+    complete = all(values.get(axis_id) is not None for axis_id in DIM_ORDER)
+    grid_lines = []
+    for scale in (0.2, 0.4, 0.6, 0.8, 1.0):
+        points = []
+        for index in range(len(DIM_ORDER)):
+            angle = math.radians(-90 + index * 360.0 / len(DIM_ORDER))
+            points.append(
+                f"{cx + radius * scale * math.cos(angle):.1f},{cy + radius * scale * math.sin(angle):.1f}"
+            )
+        grid_lines.append(f'<polygon points="{" ".join(points)}" class="batch-radar-grid"/>')
+
+    axis_lines = []
+    labels = []
+    data_points = []
+    coverage_summary = []
+    missing_axes = []
+    for index, axis_id in enumerate(DIM_ORDER):
+        angle = math.radians(-90 + index * 360.0 / len(DIM_ORDER))
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        axis_lines.append(
+            f'<line x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" class="batch-radar-axis"/>'
+        )
+        label_x = cx + (radius + 28) * math.cos(angle)
+        label_y = cy + (radius + 28) * math.sin(angle)
+        anchor = "middle"
+        normalized = (-90 + index * 360.0 / len(DIM_ORDER)) % 360
+        if 45 < normalized < 135:
+            anchor = "start"
+        elif 225 < normalized < 315:
+            anchor = "end"
+
+        observed, total = coverage.get(axis_id, (0, 0))
+        coverage_summary.append(f"{axis_id} {observed}/{total}")
+        value = values.get(axis_id)
+        if value is None:
+            value_label = "—"
+            missing_axes.append(f"{axis_id} {observed}/{total}")
+        else:
+            value_label = f"{float(value) * display_multiplier:.1f}{display_suffix}"
+        labels.append(
+            f'<g class="batch-radar-axis-label" data-axis="{html.escape(axis_id)}" '
+            f'data-coverage="{observed}/{total}">'
+            f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" class="batch-radar-label">'
+            f'{html.escape(str(DIM_META[axis_id]["icon"]))} {html.escape(axis_id)}</text>'
+            f'<text x="{label_x:.1f}" y="{label_y + 18:.1f}" text-anchor="{anchor}" class="batch-radar-value">'
+            f'{value_label} ({observed}/{total})</text></g>'
+        )
+
+    data_polygon = ""
+    data_dots = ""
+    if complete:
+        for index, axis_id in enumerate(DIM_ORDER):
+            value = max(0.0, min(1.0, float(values[axis_id]) / max_value))
+            angle = math.radians(-90 + index * 360.0 / len(DIM_ORDER))
+            x = cx + radius * value * math.cos(angle)
+            y = cy + radius * value * math.sin(angle)
+            data_points.append(f"{x:.1f},{y:.1f}")
+            data_dots += (
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" '
+                f'fill="{DIM_META[axis_id]["color"]}" class="batch-radar-point"/>'
+            )
+        data_polygon = f'<polygon points="{" ".join(data_points)}" class="batch-radar-data"/>'
+
+    accessible_label = f"{aria_label}; per-axis coverage: {', '.join(coverage_summary)}"
+    description = note
+    if missing_axes:
+        description += (
+            " No aggregate polygon is shown for axes without observed values: "
+            + ", ".join(missing_axes)
+            + "."
+        )
+    return (
+        f'<svg class="{html.escape(css_class)}" viewBox="0 0 440 410" '
+        f'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{html.escape(accessible_label)}">'
+        f'<title>{html.escape(title)}</title>'
+        f'<desc>{html.escape(description)}</desc>'
+        + "".join(grid_lines + axis_lines)
+        + data_polygon
+        + data_dots
+        + "".join(labels)
+        + "</svg>"
+    )
+
+
+def _legacy_batch_radar_data(batch: BatchReport) -> tuple[Dict[str, float | None], Dict[str, Tuple[int, int]]]:
+    """Average legacy axes independently over non-failed sessions."""
+
+    reports = [report for report in batch.sessions if report.processing_status != "failed"]
+    total = len(reports)
+    values: Dict[str, float | None] = {}
+    coverage: Dict[str, Tuple[int, int]] = {}
+    for axis_id in DIM_ORDER:
+        samples = []
+        for report in reports:
+            raw_value = report.score.radar_axes.get(axis_id)
+            if (
+                isinstance(raw_value, (int, float))
+                and not isinstance(raw_value, bool)
+                and math.isfinite(float(raw_value))
+                and 0.0 <= float(raw_value) <= 100.0
+            ):
+                samples.append(float(raw_value))
+        coverage[axis_id] = (len(samples), total)
+        values[axis_id] = sum(samples) / len(samples) if samples else None
+    return values, coverage
+
+
+def _process_batch_radar_data(batch: BatchReport) -> tuple[Dict[str, float | None], Dict[str, Tuple[int, int]]]:
+    """Average only explicitly observed, valid process-v2 ratios per axis."""
+
+    observations = [_process_axis_values(report.process_v2)[0] for report in batch.sessions]
+    total = len(observations)
+    values: Dict[str, float | None] = {}
+    coverage: Dict[str, Tuple[int, int]] = {}
+    for axis_id in DIM_ORDER:
+        samples = [float(observation[axis_id]) for observation in observations if observation[axis_id] is not None]
+        coverage[axis_id] = (len(samples), total)
+        values[axis_id] = sum(samples) / len(samples) if samples else None
+    return values, coverage
+
+
 def _render_batch_visualizations(batch: BatchReport) -> str:
     if batch.profile == "legacy":
-        radar_cards = []
-        for index, report in enumerate(batch.sessions, 1):
-            sid = report.score.session_id or f"session-{index}"
-            if report.processing_status == "failed":
-                chart = '<p class="text-dim">No chart: processing failed.</p>'
-            else:
-                chart = f'<svg class="legacy-mini-radar" viewBox="-40 -35 480 480" role="img" aria-label="Legacy seven-axis radar for {html.escape(sid)}">{_build_radar_svg(report.score.radar_axes)}</svg>'
-            radar_cards.append(
-                f'<article class="legacy-radar-card"><h3>{html.escape(sid)}</h3>{chart}</article>'
+        values, coverage = _legacy_batch_radar_data(batch)
+        missing = ", ".join(
+            f"{axis_id} {coverage[axis_id][0]}/{coverage[axis_id][1]}"
+            for axis_id in DIM_ORDER
+            if values[axis_id] is None
+        )
+        if missing:
+            radar_note = (
+                "Legacy seven-axis mean uses non-failed sessions and averages each axis independently. "
+                f"No aggregate polygon is shown for axes without valid values: {missing}."
             )
+        else:
+            radar_note = (
+                "Legacy seven-axis mean uses non-failed sessions and averages each axis independently; "
+                "labels show valid axis values n/N on the 0–100 scale."
+            )
+        radar = _build_batch_radar_svg(
+            values,
+            coverage,
+            max_value=100.0,
+            display_multiplier=1.0,
+            display_suffix="",
+            css_class="legacy-batch-radar",
+            title="Legacy seven-axis batch mean radar",
+            aria_label="Legacy seven-axis batch mean radar on a 0 to 100 scale",
+            note=radar_note,
+        )
         return f'''
 <div class="card batch-visualizations">
     <h2>📊 Legacy batch visualizations</h2>
-    <p>Each radar is the historical seven-axis compatibility view. The comparison below is a heuristic composite and is not process-v2.</p>
+    <p>{html.escape(radar_note)}</p>
+    <div class="batch-chart-panel"><h3>Legacy seven-axis mean radar</h3>{radar}</div>
     <div class="batch-chart-panel">{_build_legacy_comparison_svg(batch)}</div>
-    <div class="legacy-radar-grid">{''.join(radar_cards)}</div>
 </div>
 '''
+    values, coverage = _process_batch_radar_data(batch)
+    missing = ", ".join(
+        f"{axis_id} {coverage[axis_id][0]}/{coverage[axis_id][1]}"
+        for axis_id in DIM_ORDER
+        if values[axis_id] is None
+    )
+    if missing:
+        radar_note = (
+            "The mean uses only explicitly observed valid process-v2 ratios; each axis keeps its own denominator. "
+            f"No aggregate polygon is shown because these axes have no observed values: {missing}. "
+            "Unknown and not_applicable values remain missing."
+        )
+    else:
+        radar_note = (
+            "The mean uses only explicitly observed valid process-v2 ratios; axes may have different n/N "
+            "denominators. This is an observed-ratio profile, not a calibrated quality score."
+        )
+    radar = _build_batch_radar_svg(
+        values,
+        coverage,
+        max_value=1.0,
+        display_multiplier=100.0,
+        display_suffix="%",
+        css_class="process-batch-radar",
+        title="Process-v2 seven-axis batch mean observed-ratio profile",
+        aria_label="Process-v2 seven-axis batch mean observed-ratio profile, not calibrated quality",
+        note=radar_note,
+    )
     return f'''
 <div class="card batch-visualizations">
     <h2>📊 Process-v2 batch evidence comparison</h2>
-    <p>Cells and bars show observable ratios on per-axis denominators. Null axes stay blank; these views do not rank sessions or form a quality score.</p>
+    <p>{html.escape(radar_note)}</p>
+    <div class="batch-chart-panel"><h3>Process-v2 seven-axis mean radar</h3>{radar}</div>
     <div class="batch-chart-panel">{_build_process_batch_heatmap_svg(batch)}</div>
     <div class="batch-chart-panel">{_build_process_coverage_svg(batch)}</div>
 </div>
@@ -1080,20 +1263,17 @@ pre {{
 .text-dim {{ color: #8892a4; }}
 .batch-visualizations p {{ color: #b9c4d4; }}
 .batch-chart-panel {{ overflow-x: auto; margin: 1rem 0 1.5rem; padding: .75rem; background: #0f3460; border-radius: 8px; }}
-.batch-comparison, .batch-heatmap, .process-coverage {{ width: 100%; min-width: 640px; height: auto; }}
+.batch-comparison, .batch-heatmap, .process-coverage, .legacy-batch-radar, .process-batch-radar {{ width: 100%; min-width: 560px; height: auto; }}
 .batch-chart-note, .process-chart-note {{ fill: #b9c4d4; font-size: 12px; }}
 .legacy-grid, .heatmap-missing, .process-track {{ stroke: #49617e; stroke-width: 1; }}
 .legacy-grid {{ stroke-dasharray: 3 3; }}
 .legacy-tick, .legacy-label, .legacy-value, .heatmap-header, .heatmap-session, .heatmap-value {{ fill: #e8e8e8; font-size: 11px; }}
-.legacy-radar-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }}
-.legacy-radar-card {{ background: #0f3460; border-radius: 8px; padding: .75rem; overflow: hidden; }}
-.legacy-radar-card h3 {{ color: #81d4fa; font-size: .95rem; overflow-wrap: anywhere; }}
-.legacy-mini-radar {{ width: 100%; height: auto; }}
-.legacy-mini-radar .grid-line {{ fill: none; stroke: #49617e; stroke-width: 1; }}
-.legacy-mini-radar .axis-line {{ stroke: #49617e; stroke-width: 1; stroke-dasharray: 4 4; }}
-.legacy-mini-radar .data-area {{ fill: rgba(79, 195, 247, .15); stroke: #4fc3f7; stroke-width: 2.5; }}
-.legacy-mini-radar .radar-label {{ fill: #e8e8e8; font-size: 14px; font-weight: bold; }}
-.legacy-mini-radar .radar-value {{ fill: #b9c4d4; font-size: 13px; }}
+.batch-radar-grid {{ fill: none; stroke: #49617e; stroke-width: 1; }}
+.batch-radar-axis {{ stroke: #49617e; stroke-width: 1; stroke-dasharray: 4 4; }}
+.batch-radar-data {{ fill: rgba(79, 195, 247, .15); stroke: #4fc3f7; stroke-width: 2.5; }}
+.batch-radar-label {{ fill: #e8e8e8; font-size: 13px; font-weight: bold; }}
+.batch-radar-value {{ fill: #b9c4d4; font-size: 12px; }}
+.batch-radar-point {{ stroke: #fff; stroke-width: 2; }}
 .process-visualization {{ margin: 1rem 0; padding: 1rem; background: #0f3460; border-radius: 8px; }}
 .process-visualization h3 {{ color: #81d4fa; margin-bottom: .35rem; }}
 .process-chart-grid {{ display: grid; grid-template-columns: minmax(280px, 1fr) minmax(440px, 1.4fr); gap: 1rem; align-items: center; }}
