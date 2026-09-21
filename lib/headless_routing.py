@@ -110,7 +110,12 @@ def select_headless_model(
             decision.judge_receipts.append(_receipt(raw, judge_id=candidate_id(item), eligible_ids=eligible_ids))
         except Exception as exc:
             decision.judge_receipts.append(
-                {"judge_id": candidate_id(item), "status": "failed", "candidate_id": None, "reason": f"{type(exc).__name__}: {exc}"[:500]}
+                {
+                    "judge_id": candidate_id(item),
+                    "status": "failed",
+                    "candidate_id": None,
+                    "reason": type(exc).__name__,
+                }
             )
     if jev_receipt is not None and len(decision.judge_receipts) < max_judges:
         decision.judge_receipts.append(_receipt(jev_receipt, judge_id="jev", eligible_ids=eligible_ids))

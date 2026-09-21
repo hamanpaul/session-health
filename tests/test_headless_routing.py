@@ -61,6 +61,21 @@ class HeadlessRoutingTest(unittest.TestCase):
         self.assertEqual(decision.status, "no_suitable_model")
         self.assertEqual(decision.eligible_candidate_ids, [])
 
+    def test_judge_exception_receipt_does_not_persist_exception_message(self):
+        first = _candidate("first")
+
+        def fail(_judge, _prompt):
+            raise RuntimeError("opaque-detail-123")
+
+        decision = select_headless_model(
+            [first],
+            AnalysisRequest(context_bytes=100, output_bytes=100),
+            judge=fail,
+        )
+        receipt = decision.judge_receipts[0]
+        self.assertEqual(receipt["reason"], "RuntimeError")
+        self.assertNotIn("opaque-detail-123", str(receipt))
+
 
 if __name__ == "__main__":
     unittest.main()
