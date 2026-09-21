@@ -822,6 +822,11 @@ class AgentAnalysis:
     postcheck: Any = None
     coverage: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    analysis_origin: str = "external_model"
+    routing_mode: str = "legacy"
+    judge_receipts: List[Dict[str, Any]] = field(default_factory=list)
+    fallback_policy: str = "bounded_reselect"
+    fallback_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -844,6 +849,11 @@ class AgentAnalysis:
             "postcheck": self.postcheck.to_dict() if hasattr(self.postcheck, "to_dict") else self.postcheck,
             "coverage": dict(self.coverage),
             "diagnostics": list(self.diagnostics),
+            "analysis_origin": self.analysis_origin,
+            "routing_mode": self.routing_mode,
+            "judge_receipts": copy.deepcopy(self.judge_receipts),
+            "fallback_policy": self.fallback_policy,
+            "fallback_reason": self.fallback_reason,
         }
 
 
@@ -1694,14 +1704,14 @@ Use Traditional Chinese and keep every item concise."""
 def render_agent_html_section(analysis: AgentAnalysis) -> str:
     if not analysis.success:
         return ""
-    metadata = {"requested_model": analysis.requested_model, "actual_model": analysis.actual_model, "requested_settings": analysis.requested_settings, "actual_settings": analysis.actual_settings, "native_usage": analysis.native_usage, "usage_scope": analysis.usage_scope, "coverage": analysis.coverage, "routing": analysis.routing.to_dict() if analysis.routing else None, "postcheck": analysis.postcheck.to_dict() if hasattr(analysis.postcheck, "to_dict") else analysis.postcheck}
+    metadata = {"analysis_origin": analysis.analysis_origin, "routing_mode": analysis.routing_mode, "fallback_policy": analysis.fallback_policy, "fallback_reason": analysis.fallback_reason, "judge_receipts": analysis.judge_receipts, "requested_model": analysis.requested_model, "actual_model": analysis.actual_model, "requested_settings": analysis.requested_settings, "actual_settings": analysis.actual_settings, "native_usage": analysis.native_usage, "usage_scope": analysis.usage_scope, "coverage": analysis.coverage, "routing": analysis.routing.to_dict() if analysis.routing else None, "postcheck": analysis.postcheck.to_dict() if hasattr(analysis.postcheck, "to_dict") else analysis.postcheck}
     return f"""<div class="agent-analysis"><h2>🤖 AI 分析報告</h2><div class="agent-meta">分析引擎: <strong>{html.escape(analysis.agent_name)}</strong></div><div class="agent-content">{_markdown_to_html(analysis.raw_response)}</div><details><summary>Routing / identity / usage / post-check</summary><pre>{html.escape(json.dumps(metadata, ensure_ascii=False, indent=2))}</pre></details></div>"""
 
 
 def render_agent_terminal(analysis: AgentAnalysis) -> str:
     if not analysis.success:
         return ""
-    lines = ["", "╔════════════════════════════════════════════════════════╗", f"║  🤖 AI Analysis (via {analysis.agent_name})", f"║  requested={analysis.requested_model or 'unknown'} actual={analysis.actual_model or 'unknown'}", f"║  usage(total)={analysis.native_usage.get('total_tokens') if analysis.native_usage else None}", "╠════════════════════════════════════════════════════════╣"]
+    lines = ["", "╔════════════════════════════════════════════════════════╗", f"║  🤖 AI Analysis (via {analysis.agent_name})", f"║  origin={analysis.analysis_origin} route={analysis.routing_mode}", f"║  requested={analysis.requested_model or 'unknown'} actual={analysis.actual_model or 'unknown'}", f"║  usage(total)={analysis.native_usage.get('total_tokens') if analysis.native_usage else None}", "╠════════════════════════════════════════════════════════╣"]
     if analysis.routing:
         lines.append(f"║  route={analysis.routing.routing_source} status={analysis.routing.status}")
     for line in analysis.raw_response.split("\n")[:80]:

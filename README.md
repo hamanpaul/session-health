@@ -1,5 +1,20 @@
 # session-health
 
+Session Health can also run as an interactive skill. Its default interactive
+path keeps stage-2 synthesis on the agent/model that triggered the skill:
+
+```bash
+python3 eval_session.py SESSION.jsonl --analysis-stdin --analysis-origin trigger-agent --format html -o report.html
+```
+
+The process emits a bounded context marker on stderr, waits for the current
+agent's JSON on stdin, then renders the report. It does not require analysis
+handoff files or rerun Jev refinement. Use `--analysis-context` only for a
+read-only preview. Use `--model MODEL --analysis-origin explicit-model --analyze`
+only for a user-selected external model. Use `--headless --analysis-origin
+headless --model-catalog-file CATALOG.json` only when no interactive trigger
+agent exists and bounded multi-judge routing is intended.
+
 > Agent CLI Session 動態 Prompt 品質量化評估工具
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)]()
