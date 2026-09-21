@@ -339,7 +339,7 @@ def _run_headless_analysis(
     semantic_budget: Any,
     task_profile: dict,
     max_output_bytes: int,
-    fallback_policy: str,
+    fallback_policy: Any,
 ) -> AgentAnalysis:
     request = AnalysisRequest(
         context_bytes=len(prompt.encode("utf-8")),
@@ -412,7 +412,8 @@ def _run_external_analysis(
 ) -> AgentAnalysis:
     """Run legacy/explicit analysis and enforce explicit fallback authority."""
 
-    retries = 1 if origin is None else 0
+    effective_policy = fallback_policy or ("bounded-reselect" if origin is None else "disabled")
+    retries = 1 if effective_policy == "bounded-reselect" and not model_override else 0
     analysis = call_agent(
         prompt,
         agent_chain=candidates,
@@ -427,8 +428,8 @@ def _run_external_analysis(
     )
     analysis.analysis_origin = "explicit_model" if model_override else "external_model"
     analysis.routing_mode = "explicit" if model_override else "legacy"
-    analysis.fallback_policy = fallback_policy.replace("-", "_")
-    if analysis.success or not model_override or fallback_policy != "bounded-reselect":
+    analysis.fallback_policy = effective_policy.replace("-", "_")
+    if analysis.success or not model_override or effective_policy != "bounded-reselect":
         return analysis
 
     source = list(candidates) if candidates is not None else discover_agent_catalog()
@@ -592,8 +593,8 @@ def main() -> None:
     parser.add_argument(
         "--fallback-policy",
         choices=["disabled", "bounded-reselect"],
-        default="disabled",
-        help="Analyzer failure policy (default: disabled)",
+        default=None,
+        help="Analyzer failure policy (explicit/headless default: disabled; omitted legacy --analyze keeps one retry)",
     )
     parser.add_argument(
         "--jev",
@@ -1142,7 +1143,7 @@ def main() -> None:
                     semantic_budget=semantic_budget if args.jev else None,
                     task_profile=task_profile,
                     max_output_bytes=args.analyze_max_output_bytes,
-                    fallback_policy=args.fallback_policy,
+                    fallback_policy=args.fallback_policy or "disabled",
                 )
             else:
                 analysis = _run_external_analysis(
@@ -1251,7 +1252,7 @@ def main() -> None:
                     semantic_budget=semantic_budget if args.jev else None,
                     task_profile=task_profile,
                     max_output_bytes=args.analyze_max_output_bytes,
-                    fallback_policy=args.fallback_policy,
+                    fallback_policy=args.fallback_policy or "disabled",
                 )
             else:
                 batch_report.agent_analysis = _run_external_analysis(

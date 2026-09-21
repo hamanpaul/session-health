@@ -8,7 +8,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import eval_session
+from lib.agent_analysis import AgentAnalysis
 from lib.trigger_analysis import parse_trigger_analysis
 
 
@@ -107,6 +110,29 @@ class TriggerAgentContractTest(unittest.TestCase):
                         check=False,
                     )
                     self.assertEqual(result.returncode, 2)
+
+    def test_legacy_default_and_explicit_disabled_report_real_retry_policy(self):
+        common = {
+            "prompt": "bounded",
+            "candidates": [],
+            "test_mode": False,
+            "backend": None,
+            "semantic_budget": None,
+            "model_override": "",
+            "task_profile": {},
+            "use_jev": False,
+            "max_output_bytes": 1024,
+            "origin": None,
+        }
+        with patch.object(eval_session, "call_agent", return_value=AgentAnalysis(success=True)) as call:
+            legacy = eval_session._run_external_analysis(**common, fallback_policy=None)
+        self.assertEqual(call.call_args.kwargs["max_retries"], 1)
+        self.assertEqual(legacy.fallback_policy, "bounded_reselect")
+
+        with patch.object(eval_session, "call_agent", return_value=AgentAnalysis(success=True)) as call:
+            disabled = eval_session._run_external_analysis(**common, fallback_policy="disabled")
+        self.assertEqual(call.call_args.kwargs["max_retries"], 0)
+        self.assertEqual(disabled.fallback_policy, "disabled")
 
 
 if __name__ == "__main__":
